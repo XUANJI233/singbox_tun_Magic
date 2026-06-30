@@ -213,10 +213,10 @@ file_fingerprint() {
 
 core_version() {
   version_bin=""
-  if [ -x "$SING_BOX" ]; then
-    version_bin="$SING_BOX"
-  elif [ -x "$CORE_BIN" ]; then
+  if [ -x "$CORE_BIN" ]; then
     version_bin="$CORE_BIN"
+  elif [ -x "$SING_BOX" ]; then
+    version_bin="$SING_BOX"
   else
     return 0
   fi
@@ -237,6 +237,7 @@ core_version() {
     echo "$version_fp"
     echo "$current_version"
   } > "$tmp" && mv -f "$tmp" "$CORE_VERSION_FILE"
+  chmod 600 "$CORE_VERSION_FILE" 2>/dev/null
   echo "$current_version"
 }
 

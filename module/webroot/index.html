@@ -115,11 +115,37 @@
   .btn.danger { background: var(--bad); }
   .btn.sm { padding: 6px 12px; font-size: 12px; }
   .btn:disabled { opacity: .45; cursor: default; }
+  .hidden { display: none !important; }
 
   .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
   .actions.split { justify-content: space-between; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   .grid2 .col-title { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+
+  .node-switch-grid { display: grid; grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); gap: 12px; }
+  .node-panel { min-width: 0; }
+  .node-panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .node-panel-title { font-size: 12px; color: var(--muted); font-weight: 650; }
+  .node-panel-meta { color: var(--faint); font-size: 11.5px; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+  .node-choice-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 2px; }
+  .node-choice {
+    width: 100%; text-align: left; background: #0a0c11; color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 9px 10px; cursor: pointer; transition: border-color .15s, background .15s, transform .05s;
+    font: inherit; min-height: 52px; display: block; touch-action: manipulation;
+    user-select: none; -webkit-user-select: none;
+  }
+  .node-choice:hover { border-color: rgba(91,140,255,.45); background: rgba(91,140,255,.08); }
+  .node-choice:active { transform: scale(.99); }
+  .node-choice.active { border-color: rgba(91,140,255,.75); background: var(--accent-soft); }
+  .node-choice:disabled { opacity: .55; cursor: default; transform: none; }
+  .node-choice-name { display: block; font-size: 13px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; word-break: break-word; }
+  .node-choice-meta { display: block; color: var(--muted); font-size: 11.5px; margin-top: 3px; line-height: 1.35; overflow-wrap: anywhere; }
+  .node-empty { border: 1px dashed var(--border); border-radius: var(--radius-sm); color: var(--muted); padding: 10px; font-size: 12px; }
+  .node-editor { margin-top: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; background: rgba(10,12,17,.7); }
+  .node-editor-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; margin-bottom: 8px; }
+  .node-editor-title { min-width: 0; }
+  .node-editor textarea { min-height: 260px; }
 
   .kv-list { display: flex; flex-direction: column; }
   .kv { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border-soft); font-size: 13px; }
@@ -170,6 +196,7 @@
     .field-control { width: 100%; }
     .field-control select, .field-control input { width: 100%; }
     .grid2 { grid-template-columns: 1fr; }
+    .node-switch-grid { grid-template-columns: 1fr; }
     .stat-grid { grid-template-columns: 1fr 1fr; }
     .pkglist .app-row { grid-template-columns: minmax(0, 1fr) 88px; }
     .pkglist .app-action { grid-column: 1 / -1; justify-self: start; }
@@ -254,22 +281,41 @@
         <h2>节点选择</h2>
         <p>切换当前出口,不改写 outbounds.json。</p>
       </div>
-      <div class="field-row">
-        <div class="field-main">
-          <label>选择器</label>
-          <div class="field-hint">通常为导入时生成的 proxy。</div>
+      <select id="node-selector-name" class="hidden" aria-hidden="true"></select>
+      <select id="node-target" class="hidden" aria-hidden="true"></select>
+      <div class="node-switch-grid">
+        <div class="node-panel">
+          <div class="node-panel-head">
+            <span class="node-panel-title">配置</span>
+            <span class="node-panel-meta" id="node-selector-summary">尚未加载</span>
+          </div>
+          <div class="node-choice-list" id="node-selector-cards"></div>
         </div>
-        <div class="field-control">
-          <select id="node-selector-name"></select>
+        <div class="node-panel">
+          <div class="node-panel-head">
+            <span class="node-panel-title">出口</span>
+            <span class="node-panel-meta" id="node-current">尚未加载</span>
+          </div>
+          <div class="node-choice-list" id="node-target-cards"></div>
         </div>
       </div>
-      <div class="field-row">
-        <div class="field-main">
-          <label>当前出口</label>
-          <div class="field-hint" id="node-current">尚未加载</div>
+      <div class="node-editor hidden" id="node-editor">
+        <div class="node-editor-head">
+          <div class="node-editor-title">
+            <div class="node-panel-title">编辑配置</div>
+            <div class="node-panel-meta" id="node-edit-tag">-</div>
+          </div>
+          <button class="btn ghost sm" id="btn-node-edit-close">关闭</button>
         </div>
-        <div class="field-control">
-          <select id="node-target"></select>
+        <textarea id="node-edit-text" spellcheck="false"></textarea>
+        <div class="actions split">
+          <div class="actions">
+            <span class="field-hint" id="node-edit-status"></span>
+          </div>
+          <div class="actions">
+            <button class="btn secondary" id="btn-node-edit-save">保存</button>
+            <button class="btn" id="btn-node-edit-check">保存并校验</button>
+          </div>
         </div>
       </div>
       <div class="actions split">
@@ -278,7 +324,6 @@
         </div>
         <div class="actions">
           <button class="btn secondary" id="btn-node-load">加载当前节点</button>
-          <button class="btn" id="btn-node-switch">切换节点</button>
         </div>
       </div>
     </div>
@@ -702,8 +747,11 @@ const KV_LABELS = {
 
 // ---------- 状态 / 故障恢复 ----------
 let statusRefreshPromise = null;
-async function refreshStatus() {
-  if (statusRefreshPromise) return statusRefreshPromise;
+async function refreshStatus(force = false) {
+  if (statusRefreshPromise && !force) return statusRefreshPromise;
+  if (statusRefreshPromise) {
+    try { await statusRefreshPromise; } catch (e) {}
+  }
   statusRefreshPromise = refreshStatusInner().finally(() => { statusRefreshPromise = null; });
   return statusRefreshPromise;
 }
@@ -777,27 +825,27 @@ document.getElementById("btn-refresh").addEventListener("click", refreshStatus);
 document.getElementById("btn-restart").addEventListener("click", async () => {
   toast("正在校验并应用...");
   try { await ctl("reload"); toast("已应用并重启"); } catch (e) { toast("配置校验失败,已保持原进程运行:" + e.message); }
-  refreshStatus();
+  refreshStatus(true);
 });
 document.getElementById("btn-start").addEventListener("click", async () => {
   try { await ctl("start"); toast("已启动"); } catch (e) { toast(e.message); }
-  refreshStatus();
+  refreshStatus(true);
 });
 document.getElementById("btn-stop").addEventListener("click", async () => {
   try { await ctl("stop"); toast("已停止"); } catch (e) { toast(e.message); }
-  refreshStatus();
+  refreshStatus(true);
 });
 document.getElementById("btn-ruleset-refresh").addEventListener("click", async () => {
   if (!confirm("清除规则集缓存并安全重启?这会让 geosite/geoip 规则重新下载。")) return;
   toast("正在更新规则集...");
   try { await ctl("ruleset-refresh"); toast("规则集已刷新并应用"); } catch (e) { toast(e.message); }
-  refreshStatus();
+  refreshStatus(true);
 });
 document.getElementById("btn-rollback").addEventListener("click", async () => {
   if (!confirm("回退到上次确认可用的配置并重启?当前未保存到 last-good 的改动不会丢失文件,但本次运行会被覆盖。")) return;
   toast("正在回退...");
   try { await ctl("rollback"); toast("已回退并启动"); } catch (e) { toast(e.message); }
-  refreshStatus();
+  refreshStatus(true);
 });
 async function flushCache(path, label) {
   try {
@@ -809,7 +857,7 @@ document.getElementById("btn-flush-dns").addEventListener("click", () => flushCa
 document.getElementById("btn-flush-fakeip").addEventListener("click", () => flushCache("/cache/fakeip/flush", "fake-ip 缓存"));
 
 // ---------- 节点 ----------
-const nodeSelectState = { proxies: {}, selectors: [] };
+const nodeSelectState = { proxies: {}, selectors: [], selectedSelector: "", editingTag: "" };
 
 function nodeSelectStatus(msg, warn) {
   const el = document.getElementById("node-select-status");
@@ -817,10 +865,16 @@ function nodeSelectStatus(msg, warn) {
   el.className = "field-hint" + (warn ? " warn" : "");
 }
 
+function nodeEditStatus(msg, warn) {
+  const el = document.getElementById("node-edit-status");
+  el.textContent = msg || "";
+  el.className = "field-hint" + (warn ? " warn" : "");
+}
+
 function setNodeSelectEnabled(enabled) {
   document.getElementById("node-selector-name").disabled = !enabled;
   document.getElementById("node-target").disabled = !enabled;
-  document.getElementById("btn-node-switch").disabled = !enabled;
+  document.querySelectorAll(".node-choice").forEach(btn => { btn.disabled = !enabled; });
 }
 
 function setSelectOptions(selectEl, values, emptyLabel) {
@@ -843,7 +897,11 @@ function setSelectOptions(selectEl, values, emptyLabel) {
 function resetNodeSelectUi(message, warn) {
   setSelectOptions(document.getElementById("node-selector-name"), [], "无可用选择器");
   setSelectOptions(document.getElementById("node-target"), [], "无可用节点");
+  nodeSelectState.selectedSelector = "";
+  document.getElementById("node-selector-summary").textContent = "尚未加载";
   document.getElementById("node-current").textContent = "-";
+  renderNodeEmpty("node-selector-cards", "暂无配置");
+  renderNodeEmpty("node-target-cards", "暂无出口");
   setNodeSelectEnabled(false);
   nodeSelectStatus(message, warn);
 }
@@ -864,9 +922,72 @@ function selectorSort(a, b) {
   return a.localeCompare(b, "zh-Hans-CN");
 }
 
+function renderNodeEmpty(id, text) {
+  const wrap = document.getElementById(id);
+  wrap.innerHTML = "";
+  const empty = document.createElement("div");
+  empty.className = "node-empty";
+  empty.textContent = text;
+  wrap.appendChild(empty);
+}
+
+function bindNodeChoicePress(btn, onClick, onLongPress) {
+  let timer = 0;
+  let longPressed = false;
+  const clearTimer = () => {
+    if (timer) clearTimeout(timer);
+    timer = 0;
+  };
+  btn.addEventListener("pointerdown", e => {
+    if (btn.disabled) return;
+    longPressed = false;
+    clearTimer();
+    timer = setTimeout(() => {
+      longPressed = true;
+      if (onLongPress) onLongPress(e);
+    }, 560);
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(type => btn.addEventListener(type, clearTimer));
+  btn.addEventListener("click", e => {
+    if (longPressed) {
+      e.preventDefault();
+      e.stopPropagation();
+      longPressed = false;
+      return;
+    }
+    onClick(e);
+  });
+  btn.addEventListener("contextmenu", e => {
+    e.preventDefault();
+    if (!btn.disabled && onLongPress) onLongPress(e);
+  });
+}
+
+function createNodeChoice(name, meta, active, onClick, onLongPress) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "node-choice" + (active ? " active" : "");
+  btn.dataset.nodeTag = name;
+  btn.title = name;
+  const title = document.createElement("span");
+  title.className = "node-choice-name";
+  title.textContent = name;
+  btn.appendChild(title);
+  if (meta) {
+    const sub = document.createElement("span");
+    sub.className = "node-choice-meta";
+    sub.textContent = meta;
+    btn.appendChild(sub);
+  }
+  bindNodeChoicePress(btn, onClick, onLongPress);
+  return btn;
+}
+
 function renderNodeSelector(preferredSelector) {
   const selectorEl = document.getElementById("node-selector-name");
   const targetEl = document.getElementById("node-target");
+  const selectorCards = document.getElementById("node-selector-cards");
+  const targetCards = document.getElementById("node-target-cards");
   const selectors = nodeSelectState.selectors;
   if (!selectors.length) {
     resetNodeSelectUi("没有可切换的选择器。导入节点后点“应用并重启”再加载。", true);
@@ -877,14 +998,46 @@ function renderNodeSelector(preferredSelector) {
   const selectedSelector = selectors.includes(preferredSelector) ? preferredSelector :
     (selectors.includes(selectorEl.value) ? selectorEl.value : selectors[0]);
   selectorEl.value = selectedSelector;
+  nodeSelectState.selectedSelector = selectedSelector;
 
   const info = nodeSelectState.proxies[selectedSelector] || {};
   const targets = Array.from(new Set([...(info.all || []), info.now].filter(Boolean)));
   setSelectOptions(targetEl, targets, "无可用节点");
   if (info.now && targets.includes(info.now)) targetEl.value = info.now;
 
+  selectorCards.innerHTML = "";
+  selectors.forEach(name => {
+    const selectorInfo = nodeSelectState.proxies[name] || {};
+    const selectorTargets = Array.from(new Set([...(selectorInfo.all || []), selectorInfo.now].filter(Boolean)));
+    selectorCards.appendChild(createNodeChoice(
+      name,
+      "当前: " + (selectorInfo.now || "-") + " · " + selectorTargets.length + " 个出口",
+      name === selectedSelector,
+      () => {
+        renderNodeSelector(name);
+        nodeSelectStatus("");
+      },
+      () => openNodeEditor(name)
+    ));
+  });
+  targetCards.innerHTML = "";
+  if (!targets.length) {
+    renderNodeEmpty("node-target-cards", "这个配置没有可切换出口");
+  } else {
+    targets.forEach(target => {
+      const active = target === info.now;
+      targetCards.appendChild(createNodeChoice(
+        target,
+        active ? "当前出口 · 长按编辑" : "点击切换 · 长按编辑",
+        active,
+        () => switchNodeTo(selectedSelector, target),
+        () => openNodeEditor(target)
+      ));
+    });
+  }
+  document.getElementById("node-selector-summary").textContent = selectors.length + " 个配置";
   document.getElementById("node-current").textContent = info.now || "-";
-  setNodeSelectEnabled(targets.length > 0);
+  setNodeSelectEnabled(true);
 }
 
 async function loadNodeSelectors(preferredSelector) {
@@ -901,15 +1054,17 @@ async function loadNodeSelectors(preferredSelector) {
   }
 }
 
-async function switchNode() {
-  const selector = document.getElementById("node-selector-name").value;
-  const target = document.getElementById("node-target").value;
+async function switchNodeTo(selector, target) {
   if (!selector || !target) {
     nodeSelectStatus("请选择选择器和节点", true);
     return;
   }
-  const btn = document.getElementById("btn-node-switch");
-  btn.disabled = true;
+  const info = nodeSelectState.proxies[selector] || {};
+  if (info.now === target) {
+    nodeSelectStatus("已是当前出口");
+    return;
+  }
+  setNodeSelectEnabled(false);
   nodeSelectStatus("正在切换...");
   try {
     await apiPutJson("/proxies/" + encodeURIComponent(selector), { name: target });
@@ -918,8 +1073,103 @@ async function switchNode() {
   } catch (e) {
     nodeSelectStatus("切换失败:" + e.message, true);
   } finally {
-    btn.disabled = false;
+    setNodeSelectEnabled(true);
   }
+}
+
+function switchNode() {
+  return switchNodeTo(
+    document.getElementById("node-selector-name").value,
+    document.getElementById("node-target").value
+  );
+}
+
+function parseOutboundsArray(text) {
+  const parsed = JSON.parse(text);
+  if (!Array.isArray(parsed)) throw new Error("outbounds.json 必须是数组");
+  return parsed;
+}
+
+async function readOutboundsForNodeEdit() {
+  if (!outboundsLoaded) {
+    document.getElementById("outbounds-text").value = await ctl("config", "get", "outbounds");
+    outboundsLoaded = true;
+  }
+  return parseOutboundsArray(document.getElementById("outbounds-text").value);
+}
+
+function findOutboundIndex(outbounds, tag) {
+  return outbounds.findIndex(o => o && o.tag === tag);
+}
+
+async function openNodeEditor(tag) {
+  if (!tag || tag === "GLOBAL") {
+    nodeSelectStatus("这个运行时条目不能直接编辑", true);
+    return;
+  }
+  nodeEditStatus("正在读取配置...");
+  try {
+    const outbounds = await readOutboundsForNodeEdit();
+    const idx = findOutboundIndex(outbounds, tag);
+    if (idx < 0) {
+      nodeSelectStatus("outbounds.json 里没有找到 " + tag, true);
+      nodeEditStatus("");
+      return;
+    }
+    nodeSelectState.editingTag = tag;
+    document.getElementById("node-edit-tag").textContent = tag;
+    document.getElementById("node-edit-text").value = JSON.stringify(outbounds[idx], null, 2);
+    document.getElementById("node-editor").classList.remove("hidden");
+    nodeEditStatus("");
+    document.getElementById("node-editor").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    document.getElementById("node-edit-text").focus();
+  } catch (e) {
+    nodeEditStatus("读取失败:" + e.message, true);
+  }
+}
+
+function closeNodeEditor() {
+  nodeSelectState.editingTag = "";
+  document.getElementById("node-editor").classList.add("hidden");
+  document.getElementById("node-edit-text").value = "";
+  document.getElementById("node-edit-tag").textContent = "-";
+  nodeEditStatus("");
+}
+
+async function saveNodeEditor(check) {
+  const tag = nodeSelectState.editingTag;
+  if (!tag) {
+    nodeEditStatus("没有正在编辑的配置", true);
+    return;
+  }
+  let edited;
+  try {
+    edited = JSON.parse(document.getElementById("node-edit-text").value);
+    if (!edited || typeof edited !== "object" || Array.isArray(edited)) throw new Error("必须是单个 outbound 对象");
+    if (edited.tag !== tag) throw new Error("快速编辑不支持修改 tag,请在 outbounds.json 里整体调整引用");
+  } catch (e) {
+    nodeEditStatus("JSON 格式错误:" + e.message, true);
+    return;
+  }
+
+  let outbounds;
+  try {
+    outbounds = parseOutboundsArray(document.getElementById("outbounds-text").value);
+  } catch (e) {
+    nodeEditStatus("当前 outbounds.json 无法合并:" + e.message, true);
+    return;
+  }
+  const idx = findOutboundIndex(outbounds, tag);
+  if (idx < 0) {
+    nodeEditStatus("当前 outbounds.json 里已找不到 " + tag, true);
+    return;
+  }
+  outbounds[idx] = edited;
+  document.getElementById("outbounds-text").value = JSON.stringify(outbounds, null, 2);
+  outboundsLoaded = true;
+  nodeEditStatus("正在保存...");
+  const ok = await saveOutbounds(check);
+  if (ok) nodeEditStatus(check ? "已保存并通过校验,重启后生效" : "已保存,重启后生效");
 }
 
 document.getElementById("node-selector-name").addEventListener("change", () => {
@@ -927,7 +1177,9 @@ document.getElementById("node-selector-name").addEventListener("change", () => {
   nodeSelectStatus("");
 });
 document.getElementById("btn-node-load").addEventListener("click", () => loadNodeSelectors());
-document.getElementById("btn-node-switch").addEventListener("click", switchNode);
+document.getElementById("btn-node-edit-close").addEventListener("click", closeNodeEditor);
+document.getElementById("btn-node-edit-save").addEventListener("click", () => saveNodeEditor(false));
+document.getElementById("btn-node-edit-check").addEventListener("click", () => saveNodeEditor(true));
 resetNodeSelectUi("点击“加载当前节点”读取运行状态", false);
 
 let outboundsLoaded = false;
@@ -948,7 +1200,7 @@ async function saveOutbounds(check) {
     JSON.parse(text);
   } catch (e) {
     toast("JSON 格式错误: " + e.message);
-    return;
+    return false;
   }
   try {
     await ctlWithStdin(text, "config", "set", "outbounds");
@@ -958,7 +1210,11 @@ async function saveOutbounds(check) {
     } else {
       toast("已保存,记得去状态页点\"应用并重启\"生效");
     }
-  } catch (e) { toast(e.message); }
+    return true;
+  } catch (e) {
+    toast(e.message);
+    return false;
+  }
 }
 document.getElementById("btn-outbounds-load").addEventListener("click", loadOutbounds);
 document.getElementById("btn-outbounds-save").addEventListener("click", () => saveOutbounds(false));
