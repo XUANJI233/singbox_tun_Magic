@@ -701,7 +701,14 @@ const KV_LABELS = {
 };
 
 // ---------- 状态 / 故障恢复 ----------
+let statusRefreshPromise = null;
 async function refreshStatus() {
+  if (statusRefreshPromise) return statusRefreshPromise;
+  statusRefreshPromise = refreshStatusInner().finally(() => { statusRefreshPromise = null; });
+  return statusRefreshPromise;
+}
+
+async function refreshStatusInner() {
   try {
     const raw = await ctl("status");
     const kv = parseKv(raw);

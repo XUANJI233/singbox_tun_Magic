@@ -29,11 +29,15 @@ START_LOCK_DIR="$RUNTIME_DIR/start.lock"
 CONFIG_LOCK_DIR="$RUNTIME_DIR/config.lock"
 RUN_LOG="$LOG_DIR/sing-box.log"
 CONTROL_LOG="$LOG_DIR/control.log"
+CORE_VERSION_FILE="$RUNTIME_DIR/core.version"
 
 # Consecutive watchdog-detected crashes within this many restart cycles
 # before we give up restarting the rendered config and try last-good /
 # disable instead. See watchdog() and rollback_service().
 FAIL_THRESHOLD=3
+API_CONNECT_TIMEOUT=1
+API_MAX_TIME=3
+API_RETRIES=2
 
 mkdirs() {
   mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"
@@ -205,6 +209,35 @@ same_file() {
 
 file_fingerprint() {
   stat -c '%s:%Y' "$1" 2>/dev/null
+}
+
+core_version() {
+  version_bin=""
+  if [ -x "$SING_BOX" ]; then
+    version_bin="$SING_BOX"
+  elif [ -x "$CORE_BIN" ]; then
+    version_bin="$CORE_BIN"
+  else
+    return 0
+  fi
+  version_fp="$(file_fingerprint "$version_bin")"
+  [ -n "$version_fp" ] || return 0
+  if [ -f "$CORE_VERSION_FILE" ]; then
+    cached_fp="$(sed -n '1p' "$CORE_VERSION_FILE" 2>/dev/null)"
+    cached_version="$(sed -n '2p' "$CORE_VERSION_FILE" 2>/dev/null)"
+    if [ "$cached_fp" = "$version_fp" ] && [ -n "$cached_version" ]; then
+      echo "$cached_version"
+      return 0
+    fi
+  fi
+  current_version="$("$version_bin" version 2>/dev/null | head -1)"
+  [ -n "$current_version" ] || return 0
+  tmp="$CORE_VERSION_FILE.$$"
+  {
+    echo "$version_fp"
+    echo "$current_version"
+  } > "$tmp" && mv -f "$tmp" "$CORE_VERSION_FILE"
+  echo "$current_version"
 }
 
 same_file_fingerprint() {
@@ -1191,11 +1224,7 @@ status() {
     echo "last_good=none"
   fi
   echo "fail_count=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)"
-  if [ -x "$SING_BOX" ]; then
-    "$SING_BOX" version 2>/dev/null | head -1
-  elif [ -x "$CORE_BIN" ]; then
-    "$CORE_BIN" version 2>/dev/null | head -1
-  fi
+  core_version
 }
 
 logs() {
@@ -1208,6 +1237,14 @@ logs() {
     *) file="$RUN_LOG" ;;
   esac
   tail -n "$lines" "$file" 2>/dev/null || true
+}
+
+nc_with_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$API_MAX_TIME" nc "$@"
+  else
+    nc "$@"
+  fi
 }
 
 api_call_nc() {
@@ -1225,14 +1262,14 @@ api_call_nc() {
       printf 'Content-Length: %s\r\n' "${#body}"
       printf 'Connection: close\r\n\r\n'
       printf '%s' "$body"
-    } | nc "$SBMAGIC_API_HOST" "$SBMAGIC_API_PORT" > "$api_response_file"
+    } | nc_with_timeout "$SBMAGIC_API_HOST" "$SBMAGIC_API_PORT" > "$api_response_file"
   else
     {
       printf '%s %s HTTP/1.1\r\n' "$method" "$path"
       printf 'Host: %s:%s\r\n' "$SBMAGIC_API_HOST" "$SBMAGIC_API_PORT"
       printf 'Authorization: Bearer %s\r\n' "$SBMAGIC_API_SECRET"
       printf 'Connection: close\r\n\r\n'
-    } | nc "$SBMAGIC_API_HOST" "$SBMAGIC_API_PORT" > "$api_response_file"
+    } | nc_with_timeout "$SBMAGIC_API_HOST" "$SBMAGIC_API_PORT" > "$api_response_file"
   fi
   api_status="$(head -1 "$api_response_file" 2>/dev/null | awk '{print $2}')"
   sed '1,/^\r$/d' "$api_response_file"
@@ -1249,13 +1286,13 @@ api_call_once() {
   body="$3"
   if [ -n "$body" ]; then
     if command -v curl >/dev/null 2>&1; then
-      curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer $SBMAGIC_API_SECRET" -H "Content-Type: application/json" -d "$body" "http://$SBMAGIC_API_HOST:$SBMAGIC_API_PORT$path"
+      curl -fsS --connect-timeout "$API_CONNECT_TIMEOUT" --max-time "$API_MAX_TIME" -X "$method" -H "Authorization: Bearer $SBMAGIC_API_SECRET" -H "Content-Type: application/json" -d "$body" "http://$SBMAGIC_API_HOST:$SBMAGIC_API_PORT$path"
     else
       api_call_nc "$method" "$path" "$body"
     fi
   else
     if command -v curl >/dev/null 2>&1; then
-      curl -fsS --max-time 10 -X "$method" -H "Authorization: Bearer $SBMAGIC_API_SECRET" "http://$SBMAGIC_API_HOST:$SBMAGIC_API_PORT$path"
+      curl -fsS --connect-timeout "$API_CONNECT_TIMEOUT" --max-time "$API_MAX_TIME" -X "$method" -H "Authorization: Bearer $SBMAGIC_API_SECRET" "http://$SBMAGIC_API_HOST:$SBMAGIC_API_PORT$path"
     else
       api_call_nc "$method" "$path" ""
     fi
@@ -1270,18 +1307,19 @@ api_call() {
   ensure_api_env
   [ -n "$method" ] && [ -n "$path" ] || die "usage: api METHOD PATH [JSON]"
   case "$path" in /*) ;; *) die "api path must start with /" ;; esac
+  pid_alive || die "sing-box API is not running"
 
   api_call_out="$RUNTIME_DIR/api-call.$$"
   api_call_err="$RUNTIME_DIR/api-call.$$.err"
   i=0
-  while [ "$i" -lt 6 ]; do
+  while [ "$i" -lt "$API_RETRIES" ]; do
     if api_call_once "$method" "$path" "$body" > "$api_call_out" 2> "$api_call_err"; then
       cat "$api_call_out"
       rm -f "$api_call_out" "$api_call_err"
       return 0
     fi
     i=$((i + 1))
-    sleep 1
+    [ "$i" -lt "$API_RETRIES" ] && sleep 1
   done
   cat "$api_call_out" 2>/dev/null
   cat "$api_call_err" >&2 2>/dev/null

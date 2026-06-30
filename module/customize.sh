@@ -34,6 +34,17 @@ cp -f "$MODPATH/bin/$SBMAGIC_ABI/sing-box" "$BIN_DIR/.core"
 # applist.dex is ABI-independent dalvik bytecode (app-label dumper run via app_process)
 [ -f "$MODPATH/bin/applist.dex" ] && cp -f "$MODPATH/bin/applist.dex" "$BIN_DIR/applist.dex"
 cp -f "$MODPATH/common/magicctl" "$DATA_DIR/magicctl"
+chmod 755 "$BIN_DIR/.core" "$BIN_DIR/magic-fetch" "$DATA_DIR/magicctl" 2>/dev/null
+
+core_fp="$(stat -c '%s:%Y' "$BIN_DIR/.core" 2>/dev/null)"
+core_version="$("$BIN_DIR/.core" version 2>/dev/null | head -1)"
+if [ -n "$core_fp" ] && [ -n "$core_version" ]; then
+  {
+    echo "$core_fp"
+    echo "$core_version"
+  } > "$RUNTIME_DIR/core.version"
+  chmod 600 "$RUNTIME_DIR/core.version" 2>/dev/null
+fi
 
 for name in settings.env outbounds.json packages.exclude packages.include packages.proxy packages.free-flow dns-direct-domains.txt; do
   if [ ! -f "$CONFIG_DIR/$name" ]; then
@@ -46,7 +57,6 @@ done
 cp -f "$MODPATH/defaults/outbounds.example.json" "$CONFIG_DIR/outbounds.example.json"
 echo "$MODPATH" > "$RUNTIME_DIR/module.path"
 
-chmod 755 "$BIN_DIR/.core" "$BIN_DIR/magic-fetch" "$DATA_DIR/magicctl" 2>/dev/null
 chmod 700 "$DATA_DIR" "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"
 chmod 600 "$CONFIG_DIR"/* 2>/dev/null
 chmod 644 "$CONFIG_DIR/outbounds.example.json" "$CONFIG_DIR"/*.default 2>/dev/null
