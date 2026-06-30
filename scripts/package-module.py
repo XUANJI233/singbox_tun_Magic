@@ -77,13 +77,13 @@ def main() -> None:
 
     if abi:
         required_bins = [f"bin/{abi}/sing-box", f"bin/{abi}/magic-fetch"]
-        default_name = f"SingBox_Tun_Magic_{abi}.zip"
+        default_name = f"星盘_{abi}.zip"
     else:
         required_bins = [
             "bin/arm64-v8a/sing-box", "bin/x86_64/sing-box",
             "bin/arm64-v8a/magic-fetch", "bin/x86_64/magic-fetch",
         ]
-        default_name = "SingBox_Tun_Magic.zip"
+        default_name = "星盘.zip"
 
     missing = ["module.prop", "customize.sh", "common/magicctl", "bin/applist.dex"] + required_bins
     for rel in missing:

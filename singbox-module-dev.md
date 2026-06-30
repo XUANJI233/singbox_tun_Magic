@@ -104,6 +104,14 @@ APP 流量 + DNS 查询
 - **白名单模式(`SBMAGIC_PACKAGE_MODE=white`)**:默认全部直连,只有 `packages.include` 里的 APP 走代理。省电收益最大(代理流量最小),长期常驻用户推荐切换。
 - 默认排除列表 `module/defaults/packages.exclude` 已包含 root/模块管理类应用(`com.topjohnwu.magisk`、`me.weishu.kernelsu` 等)和 `com.termux`,避免管理工具自身被绕进隧道导致连不上自己。
 
+进入 TUN 之后还有第二层"应用策略",和黑/白名单不是同一个概念:
+
+- `packages.proxy`:这些应用进入 TUN 后只展开代理策略规则。
+- `packages.free-flow`:这些应用进入 TUN 后只展开免流策略规则。
+- 两个文件都没有列出的应用使用自动/混合策略,按 `SBMAGIC_MIXED_RULE_PRIORITY` 决定代理规则和免流规则的展开顺序。
+- 同一个包名同时出现在 `packages.proxy` 与 `packages.free-flow` 会被 `magicctl render/check/start/reload` 拒绝。WebUI 保存应用策略时用 `magicctl config set-strategies` 原子写入两个文件,避免从"代理"切"免流"时出现中间态冲突。
+- `packages.proxy/free-flow` 只对已经进入 TUN 的应用生效;白名单模式下没加入 `packages.include` 的应用即使设置了策略也不会进入模块。
+
 ---
 
 ## 4. DNS 设计
@@ -166,6 +174,7 @@ APP 流量 + DNS 查询
 
 - **不再有"是否配 tun"的争议**——当前架构下 tun 就是唯一入口,`module/common/magicctl` 的 `render_config` 直接生成 `inbounds: [{"type":"tun", ...}]`。
 - route 引擎用 1.13+ 的 action 式语法(`sniff`/`hijack-dns`/`reject`),避免已废弃字段。**特别注意**:`block` 和 `dns` 两种特殊出站在 sing-box **1.13 已移除**,所以默认 `outbounds.json` 里**不再有** `{"type":"block"}`/`{"type":"dns"}`,拦截一律用路由 `action: reject`、DNS 接管用 `action: hijack-dns`。装在 1.13 二进制上若带着这两个旧出站会直接 `check` 失败、服务起不来。
+- 路由顺序固定为:DNS 接管 → sniff → IPv6 禁用时 reject → 私网/LAN 恒直连 → clash Direct/Global → 强制代理应用规则 → 强制免流应用规则 → 自动/混合应用规则 → `final: direct`。`SBMAGIC_PROXY_RULE_MODE` 控制代理策略(`off/global/bypass-cn`),`SBMAGIC_FREE_FLOW_RULE_MODE` 控制免流策略(`off/global`),不要再用布尔式 `SBMAGIC_FREE_FLOW` 或把"国内直连"和"免流出口"混在一个开关里。私网恒直连是全局规则,不会被 `global` 代理或免流策略覆盖,避免路由器后台、局域网设备、强制门户被送进远端出口。
 - tun inbound 显式写了几个"显式优于隐式"的字段,不依赖版本默认值:
   - `endpoint_independent_nat: true` 只在 `SBMAGIC_STACK=gvisor` 时写入(官方说明该字段仅 gvisor 可用;其他 stack 默认就是 endpoint-independent NAT)。
   - `udp_timeout: "5m"`(UDP NAT 映射超时,避免大量短连接 UDP 把 NAT 表撑大,行为可预期)。
@@ -271,8 +280,8 @@ APP 流量 + DNS 查询
 - 页面结构:深色主题 + 顶部 sticky header(状态点 + pill 式 Tab),五个 Tab——**状态 / 节点 / 应用 / 设置 / 日志**:
   - **状态**:运行概览(running/pid/版本/API/模式…)、实时流量(走 clash API,含"清空 DNS / fake-ip 缓存"按钮,见 §8.4)、故障恢复(last-good 时间、失败计数、"立即回退"按钮 → `magicctl rollback`)。
   - **节点**:节点导入(见 §8.4)+ `outbounds.json` 编辑(保存前本地 JSON 校验,写入时再做 `outbounds` 语义校验)+ "撤销上次保存"(`config rollback outbounds`)。
-  - **应用**:per-app 黑/白名单模式 + 全部应用选择器(默认显示全部应用,可筛用户/系统;点击加入/移除当前模式名单,新安装应用同步后置顶) + 高级包名文件编辑 + 撤销。
-  - **设置**:`settings.env` 按"基础/网络与TUN/DNS/本机控制面/维护"分组成 5 张卡片,数据驱动渲染,IPv6 开关旁带依赖提示;每张可"保存/撤销上次保存"。
+  - **应用**:per-app 黑/白名单模式 + 全部应用选择器(进入应用页时同步一次,可手动刷新;可筛用户/系统;点击行加入/移除当前模式名单,右侧下拉选择 自动/代理/免流,新安装应用同步后置顶) + 高级包名文件编辑 + 撤销。
+  - **设置**:`settings.env` 按"基础/网络与TUN/免流/DNS/本机控制面/维护"分组成 6 张卡片,数据驱动渲染,IPv6 开关旁带依赖提示;每张可"保存/撤销上次保存"。
   - **日志**:`magicctl logs run|box|control`。
 - 改配置后统一走"应用并重启"按钮 → `exec("magicctl reload")`(先校验再重启,见 §7.4)。
 
@@ -305,11 +314,15 @@ APP 流量 + DNS 查询
 - TLS:开关、SNI、ALPN、证书校验、uTLS 指纹
 - 多节点管理 + `urltest` 自动选优(参考 `outbounds.example.json`)
 
-### 9.2 per-app(`packages.exclude` / `packages.include`)
+### 9.2 per-app 与应用策略
 - 黑/白名单模式切换(`SBMAGIC_PACKAGE_MODE`)
 - APP 列表勾选(WebUI 默认显示全部已安装应用,按应用名/包名搜索,点击行加入/移除当前模式名单)
+- 应用策略下拉:自动/代理/免流,分别落到 `packages.proxy` / `packages.free-flow` / 两者都不写。保存时原子写入两个策略文件。
 
 ### 9.3 分流
+- `SBMAGIC_PROXY_RULE_MODE`: `off` / `global` / `bypass-cn`
+- `SBMAGIC_FREE_FLOW_RULE_MODE`: `off` / `global`
+- `SBMAGIC_MIXED_RULE_PRIORITY`: `proxy` / `free-flow`
 - 规则集订阅源 + 更新间隔(`SBMAGIC_RULE_UPDATE_INTERVAL`,默认 168h;按间隔自动重下,无强制立即更新端点,见 §8.4)
 - 自定义直连域名(`dns-direct-domains.txt`)
 - `clash_mode` 全局/规则/直连切换(走 clash API `default_mode` / `PATCH /configs`,这个 PATCH 改 mode 是真实现)
@@ -400,18 +413,24 @@ APP 流量 + DNS 查询
 - 时间不准 → TLS 校验失败 → 代理全挂且报错难懂。
 
 ### 14.6 默认配置不会真正代理
-- 全新安装时 `outbounds.json` 的 `proxy` selector 只有 `direct` 一个选项(`module/defaults/outbounds.json`),刻意做成"装上不出错但也不代理"的安全默认值。用户必须参考 `outbounds.example.json` 填真实节点信息到 `outbounds.json` 才会真正代理。`customize.sh` 安装时会打印提示。
+- 全新安装时 `outbounds.json` 的 `proxy` selector 只有 `direct` 一个选项(`module/defaults/outbounds.json`),刻意做成"能保存草稿但不会误以为已经代理"的安全默认值。由于默认 `SBMAGIC_PROXY_RULE_MODE=bypass-cn`,真正 `start/reload/check` 会拒绝这个空代理,提示用户先导入真实节点。用户可参考 `outbounds.example.json` 填真实 `proxy` 节点;如果启用免流规则,还必须提供可用的 `free-flow` 出站。
+- `outbounds.example.json` 同时给出 `proxy` 和 `free-flow` 两个出口的示例。WebUI 的普通节点导入只重建 `proxy/auto/direct` 代理分支,会保留现有 `free-flow` 出站及其引用节点,避免导入普通代理时误删免流配置。
 
 ### 14.7 开机竞速
 - tun 创建与系统网络初始化打架。`service.sh` 已等 `sys.boot_completed` + 5 秒缓冲,如果某些 ROM 仍偶发失败,可以加重试逻辑。
 
-### 14.8 以为能"热重载 / 强制更新规则集"
+### 14.8 坏 settings.env 不能把停机路径打瘫
+- `magicctl start/reload/render/check` 仍使用严格 `load_settings` 校验,坏配置会被拒绝。
+- `magicctl status` 走降级读取:能展示 `config_valid=false` 与错误原因,同时仍尽量显示 PID/API/当前运行状态。
+- `magicctl stop/disable` 不依赖 `validate_settings` 成功,只要 PID 文件还在就能清理进程、watchdog 和本机控制端口防火墙。对接管全网的模块来说,"配置坏了还能关"优先级高于严格失败。
+
+### 14.9 以为能"热重载 / 强制更新规则集"
 - sing-box 的 clash API `PUT /configs` 是空桩、rule-provider 更新被注释掉(见 §8.4),所以**没有**进程内热重载、也**没有**强制立即更新规则集的接口。配置改动一律走 `reload`(校验后重启,§7.4),规则集靠 `update_interval` 自动更新。能即时生效的只有 `POST /cache/*/flush` 清缓存。
 
-### 14.9 升到 sing-box 1.14 前注意
+### 14.10 升到 sing-box 1.14 前注意
 - 当前 DNS 已用 1.12+ 新 server 格式(§4.1),但 `route` 里若残留任何 1.14 才移除的旧字段需提前迁移;升级二进制后务必先 `magicctl check` 再 `reload`。`block`/`dns` 旧出站已在 1.13 清除(§5.1),不要在 `outbounds.json` 里加回来。
 
-### 14.10 `system` / `mixed` TUN stack
+### 14.11 `system` / `mixed` TUN stack
 - sing-box 官方定义里,`system` 使用系统网络栈做 L3→L4 转换,`gvisor` 使用 gVisor 虚拟网络栈,`mixed` 是 system TCP + gVisor UDP。理论上 `system` 可能更省 CPU/内存,但当前 AVD root shell 测试显示它没有接管 TCP 连接,表现为客户端 `dial tcp ... i/o timeout`,日志里没有 inbound connection。
 - 因为 `mixed` 的 TCP 半边也是 `system`,它在同一测试里也失败。当前默认固定为 `gvisor`;除非在目标真机上完成 `magicctl check`、实际连通性和吞吐测试,否则不要为了理论性能切到 `system`/`mixed`。
 
@@ -432,7 +451,7 @@ APP 流量 + DNS 查询
 - [ ] sing-box 单进程持有 tun + DNS + 路由 + 出站,不依赖第二个常驻二进制
 - [ ] per-app 用 `include_package`/`exclude_package`,不是 nft/iptables
 - [ ] route 引擎做目的地分流(域名/IP/rule-set),`hijack-dns` 接管 DNS
-- [ ] 配置渲染管线:`settings.env` + `outbounds.json` + packages 列表 + dns-direct 列表 → `runtime/config.json`
+- [ ] 配置渲染管线:`settings.env` + `outbounds.json` + packages 列表(`include/exclude/proxy/free-flow`) + dns-direct 列表 → `runtime/config.json`
 
 **省电**
 - [ ] 架构默认黑名单(可用性优先);白名单模式给长期常驻用户作为更省电选项

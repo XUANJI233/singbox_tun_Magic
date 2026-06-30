@@ -145,6 +145,7 @@
   .pkglist .app-badge { flex: none; font-size: 10px; color: var(--ok); border: 1px solid rgba(54,211,153,.35); border-radius: 999px; padding: 0 5px; line-height: 16px; }
   .pkglist .app-action { flex: none; font-size: 11.5px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; white-space: nowrap; }
   .pkglist .app-row.selected .app-action { color: var(--accent); border-color: rgba(91,140,255,.45); }
+  .pkglist .app-strategy { width: 88px; flex: none; padding: 5px 7px; font-size: 12px; }
   .pkglist .app-empty { padding: 10px; color: var(--muted); font-size: 12px; cursor: default; }
   .pkg-tools { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
   .pkg-tools #pkg-filter { flex: 1; width: auto; }
@@ -361,7 +362,7 @@
     <div class="card">
       <div class="card-head">
         <h2>应用选择器</h2>
-        <p id="pkg-picker-hint">正在同步应用列表。</p>
+        <p id="pkg-picker-hint">点击同步应用列表后可点选应用。</p>
       </div>
       <div class="pkg-tools" id="pkg-tools">
         <input type="text" id="pkg-filter" placeholder="搜索应用名 / 包名" autocomplete="off" />
@@ -373,7 +374,7 @@
         <button class="btn secondary sm" id="btn-pkg-list">同步应用列表</button>
       </div>
       <div class="pkg-count" id="pkg-selection-count">已选择 0 个</div>
-      <div id="pkg-installed" class="pkglist"><div class="app-empty">正在同步应用列表…</div></div>
+      <div id="pkg-installed" class="pkglist"><div class="app-empty">暂无应用列表</div></div>
     </div>
 
     <details class="card">
@@ -386,6 +387,14 @@
         <div>
           <div class="col-title">白名单成员(include,代理)</div>
           <textarea id="include-text" spellcheck="false" placeholder="一行一个包名"></textarea>
+        </div>
+        <div>
+          <div class="col-title">强制代理策略(packages.proxy)</div>
+          <textarea id="proxy-packages-text" spellcheck="false" placeholder="一行一个包名"></textarea>
+        </div>
+        <div>
+          <div class="col-title">强制免流策略(packages.free-flow)</div>
+          <textarea id="free-flow-packages-text" spellcheck="false" placeholder="一行一个包名"></textarea>
         </div>
       </div>
     </details>
@@ -411,6 +420,9 @@
 
     <div class="group-title">网络与 TUN</div>
     <div class="card" id="group-network"></div>
+
+    <div class="group-title">免流</div>
+    <div class="card" id="group-freeflow"></div>
 
     <div class="group-title">DNS</div>
     <div class="card" id="group-dns"></div>
@@ -647,12 +659,14 @@ function switchTab(name) {
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   if (name === "status") refreshStatus();
   if (name === "perapp") {
-    loadPerApp();
+    ensurePerAppLoaded();
     ensureAppListLoaded();
   }
   if (name === "outbounds") {
+    ensureOutboundsLoaded();
     loadNodeSelectors();
   }
+  if (name === "settings") ensureSettingsLoaded();
 }
 document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
 
@@ -674,9 +688,12 @@ function fmtBytes(n) {
 }
 
 const KV_LABELS = {
-  enabled: "启用", running: "运行中", pid: "进程 PID", data_dir: "数据目录",
+  enabled: "启用", config_valid: "配置有效", config_error: "配置错误",
+  running: "运行中", pid: "进程 PID", data_dir: "数据目录",
   config: "运行配置", process_name: "进程名", tun_interface: "TUN 接口名", api: "控制面地址",
-  mode: "Clash 模式", package_mode: "per-app 模式", dns_mode: "DNS 模式", ipv6: "IPv6",
+  mode: "Clash 模式", boot_start: "开机自启", package_mode: "TUN 名单模式",
+  proxy_rule_mode: "代理规则", free_flow_rule_mode: "免流规则",
+  mixed_rule_priority: "混合优先级", dns_mode: "DNS 模式", ipv6: "IPv6",
 };
 
 // ---------- 状态 / 故障恢复 ----------
@@ -694,11 +711,18 @@ async function refreshStatus() {
 
     const wrap = document.getElementById("status-kv");
     wrap.innerHTML = "";
-    ["enabled", "running", "pid", "process_name", "tun_interface", "package_mode", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
+    ["enabled", "config_valid", "config_error", "running", "pid", "process_name", "tun_interface", "boot_start", "package_mode", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
       if (!(k in kv)) return;
       const row = document.createElement("div");
       row.className = "kv";
-      row.innerHTML = "<span class=\"k\">" + (KV_LABELS[k] || k) + "</span><span class=\"v\">" + kv[k] + "</span>";
+      const key = document.createElement("span");
+      key.className = "k";
+      key.textContent = KV_LABELS[k] || k;
+      const value = document.createElement("span");
+      value.className = "v";
+      value.textContent = kv[k];
+      row.appendChild(key);
+      row.appendChild(value);
       wrap.appendChild(row);
     });
 
@@ -895,10 +919,17 @@ document.getElementById("btn-node-load").addEventListener("click", () => loadNod
 document.getElementById("btn-node-switch").addEventListener("click", switchNode);
 resetNodeSelectUi("点击“加载当前节点”读取运行状态", false);
 
+let outboundsLoaded = false;
+
 async function loadOutbounds() {
   try {
     document.getElementById("outbounds-text").value = await ctl("config", "get", "outbounds");
+    outboundsLoaded = true;
   } catch (e) { toast(e.message); }
+}
+
+function ensureOutboundsLoaded() {
+  if (!outboundsLoaded) loadOutbounds();
 }
 async function saveOutbounds(check) {
   const text = document.getElementById("outbounds-text").value;
@@ -1097,6 +1128,7 @@ function parseLink(line) {
 }
 
 const SPECIAL_OUT = ["selector", "urltest", "direct", "block", "dns"];
+const PROXY_MANAGED_TAGS = new Set(["proxy", "auto", "direct"]);
 function extractExportedOutbounds(text) {
   try {
     const data = JSON.parse(text);
@@ -1127,8 +1159,55 @@ function parseManyLinks(text) {
   return nodes;
 }
 
-function dedupeTags(nodes) {
+function outboundMap(outbounds) {
+  const map = new Map();
+  outbounds.forEach(o => {
+    if (o && typeof o.tag === "string") map.set(o.tag, o);
+  });
+  return map;
+}
+
+function collectOutboundTags(outbounds, roots) {
+  const map = outboundMap(outbounds);
   const seen = new Set();
+  const stack = roots.filter(tag => map.has(tag));
+  while (stack.length) {
+    const tag = stack.pop();
+    if (seen.has(tag)) continue;
+    seen.add(tag);
+    const o = map.get(tag);
+    (Array.isArray(o && o.outbounds) ? o.outbounds : []).forEach(ref => {
+      if (typeof ref === "string" && map.has(ref)) stack.push(ref);
+    });
+  }
+  return seen;
+}
+
+function preservedFreeFlowOutbounds(outbounds) {
+  const tags = collectOutboundTags(outbounds, ["free-flow"]);
+  return outbounds.filter(o => o && tags.has(o.tag) && !PROXY_MANAGED_TAGS.has(o.tag));
+}
+
+function proxyImportNodes(outbounds) {
+  const preservedTags = collectOutboundTags(outbounds, ["free-flow"]);
+  return outbounds.filter(o =>
+    o && o.type && o.tag &&
+    !SPECIAL_OUT.includes(o.type) &&
+    !PROXY_MANAGED_TAGS.has(o.tag) &&
+    !preservedTags.has(o.tag));
+}
+
+async function readOutboundsConfig() {
+  try {
+    const arr = JSON.parse(await ctl("config", "get", "outbounds"));
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function dedupeTags(nodes, reservedTags = new Set()) {
+  const seen = new Set(reservedTags);
   for (const n of nodes) {
     let t = (n.tag || "node").trim() || "node", base = t, i = 2;
     while (seen.has(t)) t = base + "-" + (i++);
@@ -1136,29 +1215,28 @@ function dedupeTags(nodes) {
   }
   return nodes;
 }
-function assembleOutbounds(nodes) {
-  dedupeTags(nodes);
+function assembleOutbounds(nodes, preservedOutbounds = []) {
+  const reservedTags = new Set(PROXY_MANAGED_TAGS);
+  preservedOutbounds.forEach(o => { if (o && o.tag) reservedTags.add(o.tag); });
+  dedupeTags(nodes, reservedTags);
   const tags = nodes.map(n => n.tag);
   return [
     { type: "selector", tag: "proxy", outbounds: ["auto", ...tags, "direct"] },
     { type: "urltest", tag: "auto", outbounds: tags.slice(), url: "https://www.gstatic.com/generate_204", interval: "10m", tolerance: 50 },
     ...nodes,
+    ...preservedOutbounds,
     { type: "direct", tag: "direct" },
   ];
 }
-async function existingProxyNodes() {
-  try {
-    const arr = JSON.parse(await ctl("config", "get", "outbounds"));
-    return Array.isArray(arr) ? arr.filter(o => o && o.type && !SPECIAL_OUT.includes(o.type)) : [];
-  } catch (e) { return []; }
-}
 async function doImport(nodes) {
   if (!nodes.length) { toast("没有解析到有效节点(协议不支持或格式错误)"); return; }
+  const existingOutbounds = await readOutboundsConfig();
+  const preserved = preservedFreeFlowOutbounds(existingOutbounds);
   let all = nodes;
   if (document.getElementById("import-mode").value === "append") {
-    all = [...await existingProxyNodes(), ...nodes];
+    all = [...proxyImportNodes(existingOutbounds), ...nodes];
   }
-  const text = JSON.stringify(assembleOutbounds(all), null, 2);
+  const text = JSON.stringify(assembleOutbounds(all, preserved), null, 2);
   document.getElementById("outbounds-text").value = text;
   try {
     await ctlWithStdin(text, "config", "set", "outbounds");
@@ -1183,18 +1261,29 @@ document.getElementById("btn-import-sub").addEventListener("click", async () => 
 });
 
 // ---------- 应用 ----------
+let perAppLoaded = false;
+
 async function loadPerApp() {
   try {
     const settings = parseKv(await ctl("config", "get", "settings"));
     document.getElementById("package-mode").value = settings.SBMAGIC_PACKAGE_MODE || "black";
     document.getElementById("exclude-text").value = await ctl("config", "get", "exclude");
     document.getElementById("include-text").value = await ctl("config", "get", "include");
+    document.getElementById("proxy-packages-text").value = await ctl("config", "get", "proxy-packages");
+    document.getElementById("free-flow-packages-text").value = await ctl("config", "get", "free-flow-packages");
+    perAppLoaded = true;
     updatePackageModeUi();
-    renderAppList();
+    scheduleRenderAppList();
   } catch (e) { toast(e.message); }
 }
+
+function ensurePerAppLoaded() {
+  if (!perAppLoaded) loadPerApp();
+}
+
 async function savePerApp() {
   try {
+    await ctlWithStdin(strategyPackagesPayload(), "config", "set-strategies");
     await ctlWithStdin(document.getElementById("exclude-text").value, "config", "set", "exclude");
     await ctlWithStdin(document.getElementById("include-text").value, "config", "set", "include");
     await setSettingValue("SBMAGIC_PACKAGE_MODE", document.getElementById("package-mode").value);
@@ -1205,8 +1294,10 @@ document.getElementById("btn-pkg-load").addEventListener("click", loadPerApp);
 document.getElementById("btn-pkg-save").addEventListener("click", savePerApp);
 document.getElementById("btn-pkg-undo").addEventListener("click", async () => {
   try {
-    await ctl("config", "rollback", "exclude");
-    await ctl("config", "rollback", "include");
+    for (const key of ["exclude", "include", "proxy-packages", "free-flow-packages"]) {
+      try { await ctl("config", "rollback", key); }
+      catch (e) { if (!String(e.message).includes("no backup")) throw e; }
+    }
     toast("已撤销");
     loadPerApp();
   } catch (e) { toast(e.message); }
@@ -1236,6 +1327,23 @@ function readActivePackageSet() {
   return new Set(readPackageEntries(activePackageTextArea().value).filter(v => !v.startsWith("#")));
 }
 
+function readPackageSetFrom(id) {
+  return new Set(readPackageEntries(document.getElementById(id).value).filter(v => !v.startsWith("#")));
+}
+
+function writePackageSetTo(id, set) {
+  const ta = document.getElementById(id);
+  const comments = readPackageEntries(ta.value).filter(v => v.startsWith("#"));
+  const packages = [...set].sort();
+  ta.value = [...comments, ...packages].join("\n") + (comments.length || packages.length ? "\n" : "");
+}
+
+function strategyPackagesPayload() {
+  return document.getElementById("proxy-packages-text").value.replace(/\r\n/g, "\n") +
+    "\n__SBMAGIC_FREE_FLOW_PACKAGES__\n" +
+    document.getElementById("free-flow-packages-text").value.replace(/\r\n/g, "\n");
+}
+
 function writeActivePackageSet(set) {
   const ta = activePackageTextArea();
   const comments = readPackageEntries(ta.value).filter(v => v.startsWith("#"));
@@ -1247,8 +1355,8 @@ function updatePackageModeUi() {
   const hint = document.getElementById("pkg-picker-hint");
   if (!hint) return;
   hint.textContent = activePackageMode() === "white"
-    ? "当前是白名单:点击应用加入/移除代理名单。"
-    : "当前是黑名单:点击应用加入/移除直连例外。";
+    ? "当前是白名单:只有已加入名单的应用进入 TUN;右侧策略只对这些应用生效。"
+    : "当前是黑名单:点击应用加入/移除直连例外;未排除应用进入 TUN 后再应用右侧策略。";
 }
 
 function updateSelectionCount(selectedPackages) {
@@ -1309,14 +1417,40 @@ function togglePackage(pkg, label) {
     selected = true;
   }
   writeActivePackageSet(set);
-  renderAppList();
+  scheduleRenderAppList();
   toast(`${label || pkg} 已${selected ? "加入" : "移出"}${modeActionLabel()}名单`);
 }
+
+function setAppStrategy(pkg, strategy) {
+  const proxySet = readPackageSetFrom("proxy-packages-text");
+  const freeFlowSet = readPackageSetFrom("free-flow-packages-text");
+  proxySet.delete(pkg);
+  freeFlowSet.delete(pkg);
+  if (strategy === "proxy") proxySet.add(pkg);
+  if (strategy === "free-flow") freeFlowSet.add(pkg);
+  writePackageSetTo("proxy-packages-text", proxySet);
+  writePackageSetTo("free-flow-packages-text", freeFlowSet);
+  scheduleRenderAppList();
+}
+
+const MAX_VISIBLE_APPS = 160;
+let appListRenderTimer = null;
+
+function scheduleRenderAppList() {
+  if (appListRenderTimer) clearTimeout(appListRenderTimer);
+  appListRenderTimer = setTimeout(() => {
+    appListRenderTimer = null;
+    renderAppList();
+  }, 60);
+}
+
 function renderAppList() {
   const wrap = document.getElementById("pkg-installed");
   const q = (document.getElementById("pkg-filter").value || "").toLowerCase().trim();
   const scope = document.getElementById("pkg-scope-filter").value;
   const selectedPackages = readActivePackageSet();
+  const proxyStrategyPackages = readPackageSetFrom("proxy-packages-text");
+  const freeFlowStrategyPackages = readPackageSetFrom("free-flow-packages-text");
   updateSelectionCount(selectedPackages);
   wrap.innerHTML = "";
   wrap.style.display = "block";
@@ -1339,7 +1473,7 @@ function renderAppList() {
     const byLabel = a.label.localeCompare(b.label, "zh-Hans-CN", { sensitivity: "base" });
     return byLabel || a.pkg.localeCompare(b.pkg);
   });
-  visibleApps.forEach(a => {
+  visibleApps.slice(0, MAX_VISIBLE_APPS).forEach(a => {
     const selected = selectedPackages.has(a.pkg);
     const row = document.createElement("div");
     row.className = "app-row" + (a.isNew ? " new" : "") + (selected ? " selected" : "");
@@ -1355,12 +1489,39 @@ function renderAppList() {
     main.appendChild(title); main.appendChild(p);
     const action = document.createElement("span");
     action.className = "app-action";
-    action.textContent = selected ? "移除" : "加入" + modeActionLabel();
-    row.appendChild(main); row.appendChild(action);
+    action.textContent = selected ? `移出${modeActionLabel()}名单` : `加入${modeActionLabel()}名单`;
+    const strategy = document.createElement("select");
+    strategy.className = "app-strategy";
+    [
+      ["auto", "自动"],
+      ["proxy", "代理"],
+      ["free-flow", "免流"],
+    ].forEach(([value, text]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      const currentStrategy = proxyStrategyPackages.has(a.pkg) ? "proxy" : (freeFlowStrategyPackages.has(a.pkg) ? "free-flow" : "auto");
+      if (currentStrategy === value) option.selected = true;
+      strategy.appendChild(option);
+    });
+    strategy.addEventListener("click", e => e.stopPropagation());
+    strategy.addEventListener("change", e => {
+      e.stopPropagation();
+      setAppStrategy(a.pkg, strategy.value);
+      toast(`${a.label || a.pkg} 策略已设为 ${strategy.options[strategy.selectedIndex].textContent}`);
+    });
+    row.appendChild(main); row.appendChild(strategy); row.appendChild(action);
     row.addEventListener("click", () => togglePackage(a.pkg, a.label));
     wrap.appendChild(row);
   });
-  if (!visibleApps.length) { const e = document.createElement("div"); e.className = "app-empty"; e.textContent = "无匹配应用"; wrap.appendChild(e); }
+  if (!visibleApps.length) {
+    const e = document.createElement("div"); e.className = "app-empty"; e.textContent = "无匹配应用"; wrap.appendChild(e);
+  } else if (visibleApps.length > MAX_VISIBLE_APPS) {
+    const e = document.createElement("div");
+    e.className = "app-empty";
+    e.textContent = `已显示前 ${MAX_VISIBLE_APPS} 个,可搜索缩小范围`;
+    wrap.appendChild(e);
+  }
 }
 
 async function loadAppList(options = {}) {
@@ -1373,7 +1534,7 @@ async function loadAppList(options = {}) {
     appListCache = parseAppList(raw, previousPackages);
     writeSeenPackages(appListCache);
     appListLoaded = true;
-    renderAppList();
+    scheduleRenderAppList();
     if (!options.silent) {
       const newCount = appListCache.filter(a => a.isNew).length;
       toast(newCount ? `已同步应用列表,新增 ${newCount} 个` : "已同步应用列表");
@@ -1394,14 +1555,16 @@ function ensureAppListLoaded() {
   if (!appListLoaded) loadAppList({ silent: true });
 }
 document.getElementById("btn-pkg-list").addEventListener("click", () => loadAppList());
-document.getElementById("pkg-filter").addEventListener("input", renderAppList);
-document.getElementById("pkg-scope-filter").addEventListener("change", renderAppList);
+document.getElementById("pkg-filter").addEventListener("input", scheduleRenderAppList);
+document.getElementById("pkg-scope-filter").addEventListener("change", scheduleRenderAppList);
 document.getElementById("package-mode").addEventListener("change", () => {
   updatePackageModeUi();
-  renderAppList();
+  scheduleRenderAppList();
 });
-document.getElementById("exclude-text").addEventListener("input", renderAppList);
-document.getElementById("include-text").addEventListener("input", renderAppList);
+document.getElementById("exclude-text").addEventListener("input", scheduleRenderAppList);
+document.getElementById("include-text").addEventListener("input", scheduleRenderAppList);
+document.getElementById("proxy-packages-text").addEventListener("input", scheduleRenderAppList);
+document.getElementById("free-flow-packages-text").addEventListener("input", scheduleRenderAppList);
 
 // ---------- 设置(分组渲染) ----------
 const SETTINGS_GROUPS = [
@@ -1409,6 +1572,7 @@ const SETTINGS_GROUPS = [
     id: "group-basic",
     fields: [
       { key: "SBMAGIC_ENABLED", label: "启用模块", type: "bool" },
+      { key: "SBMAGIC_BOOT_START", label: "开机自启动", type: "bool", hint: "默认关闭;允许手动启动但刷入后不自动接管网络。" },
       { key: "SBMAGIC_WATCHDOG", label: "看门狗", type: "bool", hint: "关闭后不再自动重启,也不会有崩溃回退/last-good 快照能力。" },
       { key: "SBMAGIC_WATCHDOG_INTERVAL", label: "看门狗轮询间隔(秒)", type: "number", hint: "默认 300 秒,不建议调到更短(短间隔轮询是隐形耗电源)。" },
     ],
@@ -1426,6 +1590,14 @@ const SETTINGS_GROUPS = [
         key: "SBMAGIC_IPV6", label: "IPv6", type: "bool",
         hint: "关闭时不是\"不管 IPv6\",而是接管 IPv6 路由后整体拦截,防止真机有 v6 出口时绕过代理泄漏。开启后还需要在下面 DNS 卡片里把\"DNS 策略\"从 ipv4_only 改掉,否则不会真正解析到 IPv6 地址。",
       },
+    ],
+  },
+  {
+    id: "group-freeflow",
+    fields: [
+      { key: "SBMAGIC_PROXY_RULE_MODE", label: "代理规则模式", type: "select", options: ["off", "global", "bypass-cn"], hint: "bypass-cn:私网/CN 直连,其余走 proxy;global:全部走 proxy;off:不生成代理规则。" },
+      { key: "SBMAGIC_FREE_FLOW_RULE_MODE", label: "免流规则模式", type: "select", options: ["off", "global"], hint: "免流规则只决定是否走 free-flow 出口;free-flow 出站本身仍要在 outbounds.json 里配置。" },
+      { key: "SBMAGIC_MIXED_RULE_PRIORITY", label: "混合优先级", type: "select", options: ["proxy", "free-flow"], hint: "仅影响策略为“自动”的应用;强制代理/免流应用不受这个顺序影响。" },
     ],
   },
   {
@@ -1464,6 +1636,7 @@ const SETTINGS_GROUPS = [
 ];
 
 let settingsRawText = "";
+let settingsLoaded = false;
 
 function buildFieldRow(f, current) {
   const row = document.createElement("div");
@@ -1541,7 +1714,12 @@ async function loadSettings() {
   try {
     settingsRawText = await ctl("config", "get", "settings");
     renderSettingsForm(parseKv(settingsRawText));
+    settingsLoaded = true;
   } catch (e) { toast(e.message); }
+}
+
+function ensureSettingsLoaded() {
+  if (!settingsLoaded) loadSettings();
 }
 
 async function saveSettings() {
@@ -1582,10 +1760,6 @@ document.getElementById("btn-logs-load").addEventListener("click", loadLogs);
 
 // ---------- init ----------
 refreshStatus();
-loadOutbounds();
-loadPerApp();
-ensureAppListLoaded();
-loadSettings();
 </script>
 </body>
 </html>

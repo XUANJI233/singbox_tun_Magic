@@ -16,8 +16,13 @@ import (
 const maxBodyBytes = 32 << 20
 
 func main() {
-	if len(os.Args) == 3 && os.Args[1] == "--validate-outbounds" {
-		if err := validateOutbounds(os.Args[2]); err != nil {
+	if len(os.Args) >= 3 && os.Args[1] == "--validate-outbounds" {
+		opts, err := parseValidateOptions(os.Args[3:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if err := validateOutbounds(os.Args[2], opts); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -26,7 +31,7 @@ func main() {
 
 	if len(os.Args) < 2 || len(os.Args) > 3 {
 		fmt.Fprintln(os.Stderr, "usage: magic-fetch URL [USER_AGENT]")
-		fmt.Fprintln(os.Stderr, "       magic-fetch --validate-outbounds FILE")
+		fmt.Fprintln(os.Stderr, "       magic-fetch --validate-outbounds FILE [--need-proxy] [--need-free-flow]")
 		os.Exit(2)
 	}
 
@@ -97,7 +102,27 @@ func dnsDialer() *net.Dialer {
 	}
 }
 
-func validateOutbounds(path string) error {
+type validateOptions struct {
+	needProxy    bool
+	needFreeFlow bool
+}
+
+func parseValidateOptions(args []string) (validateOptions, error) {
+	var opts validateOptions
+	for _, arg := range args {
+		switch arg {
+		case "--need-proxy":
+			opts.needProxy = true
+		case "--need-free-flow":
+			opts.needFreeFlow = true
+		default:
+			return opts, fmt.Errorf("unknown validate option: %s", arg)
+		}
+	}
+	return opts, nil
+}
+
+func validateOutbounds(path string, opts validateOptions) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -112,6 +137,8 @@ func validateOutbounds(path string) error {
 	}
 
 	tags := map[string]bool{}
+	types := map[string]string{}
+	refs := map[string][]string{}
 	for i, outbound := range outbounds {
 		tag, _ := outbound["tag"].(string)
 		typ, _ := outbound["type"].(string)
@@ -125,6 +152,8 @@ func validateOutbounds(path string) error {
 			return fmt.Errorf("duplicate outbound tag: %s", tag)
 		}
 		tags[tag] = true
+		types[tag] = typ
+		refs[tag] = stringList(outbound["outbounds"])
 	}
 
 	for _, required := range []string{"proxy", "direct"} {
@@ -135,7 +164,7 @@ func validateOutbounds(path string) error {
 
 	for _, outbound := range outbounds {
 		tag, _ := outbound["tag"].(string)
-		for _, ref := range stringList(outbound["outbounds"]) {
+		for _, ref := range refs[tag] {
 			if !tags[ref] {
 				return fmt.Errorf("outbound[%s] references missing tag: %s", tag, ref)
 			}
@@ -145,7 +174,40 @@ func validateOutbounds(path string) error {
 		}
 	}
 
+	if opts.needProxy && !usableOutbound("proxy", types, refs, map[string]bool{}) {
+		return fmt.Errorf("proxy outbound is required but has no real node")
+	}
+	if opts.needFreeFlow && !usableOutbound("free-flow", types, refs, map[string]bool{}) {
+		return fmt.Errorf("free-flow outbound is required but has no real node")
+	}
+
 	return nil
+}
+
+func usableOutbound(tag string, types map[string]string, refs map[string][]string, visiting map[string]bool) bool {
+	typ, ok := types[tag]
+	if !ok || visiting[tag] {
+		return false
+	}
+	switch typ {
+	case "direct", "block", "dns":
+		return false
+	case "selector", "urltest", "fallback", "loadbalance":
+		if len(refs[tag]) == 0 {
+			return false
+		}
+	}
+	if len(refs[tag]) == 0 {
+		return true
+	}
+	visiting[tag] = true
+	defer delete(visiting, tag)
+	for _, ref := range refs[tag] {
+		if usableOutbound(ref, types, refs, visiting) {
+			return true
+		}
+	}
+	return false
 }
 
 func stringList(value any) []string {

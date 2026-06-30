@@ -15,6 +15,8 @@ SETTINGS_FILE="$CONFIG_DIR/settings.env"
 OUTBOUNDS_FILE="$CONFIG_DIR/outbounds.json"
 EXCLUDE_FILE="$CONFIG_DIR/packages.exclude"
 INCLUDE_FILE="$CONFIG_DIR/packages.include"
+PROXY_PACKAGES_FILE="$CONFIG_DIR/packages.proxy"
+FREE_FLOW_PACKAGES_FILE="$CONFIG_DIR/packages.free-flow"
 DNS_DIRECT_FILE="$CONFIG_DIR/dns-direct-domains.txt"
 CONFIG_FILE="$RUNTIME_DIR/config.json"
 LAST_GOOD_FILE="$RUNTIME_DIR/config.last-good.json"
@@ -48,8 +50,9 @@ die() {
   exit 1
 }
 
-load_settings() {
+load_settings_values() {
   SBMAGIC_ENABLED=true
+  SBMAGIC_BOOT_START=false
   SBMAGIC_WATCHDOG=true
   SBMAGIC_WATCHDOG_INTERVAL=300
   SBMAGIC_STACK=gvisor
@@ -60,6 +63,9 @@ load_settings() {
   SBMAGIC_AUTO_ROUTE=true
   SBMAGIC_STRICT_ROUTE=true
   SBMAGIC_PACKAGE_MODE=black
+  SBMAGIC_PROXY_RULE_MODE=bypass-cn
+  SBMAGIC_FREE_FLOW_RULE_MODE=off
+  SBMAGIC_MIXED_RULE_PRIORITY=proxy
   SBMAGIC_DNS_MODE=real-ip
   SBMAGIC_DNS_STRATEGY=ipv4_only
   SBMAGIC_DNS_LOCAL_TYPE=https
@@ -79,6 +85,10 @@ load_settings() {
     # shellcheck disable=SC1090
     . "$SETTINGS_FILE"
   fi
+}
+
+load_settings() {
+  load_settings_values
   set_process_binary_path
   validate_interface_name
   validate_settings
@@ -91,6 +101,18 @@ set_process_binary_path() {
       ;;
   esac
   SING_BOX="$BIN_DIR/$SBMAGIC_PROCESS_NAME"
+}
+
+set_process_binary_path_relaxed() {
+  case "$SBMAGIC_PROCESS_NAME" in
+    ""|"."|".."|*/*|*\\*|*[!A-Za-z0-9._-]*)
+      saved_process="$(cat "$PROCESS_FILE" 2>/dev/null)"
+      SING_BOX="${saved_process:-$BIN_DIR/netd-helper}"
+      return 1
+      ;;
+  esac
+  SING_BOX="$BIN_DIR/$SBMAGIC_PROCESS_NAME"
+  return 0
 }
 
 validate_interface_name() {
@@ -135,6 +157,7 @@ validate_dns_server_literal() {
 
 validate_settings() {
   json_bool "$SBMAGIC_ENABLED" >/dev/null
+  json_bool "$SBMAGIC_BOOT_START" >/dev/null
   json_bool "$SBMAGIC_WATCHDOG" >/dev/null
   json_bool "$SBMAGIC_IPV6" >/dev/null
   json_bool "$SBMAGIC_AUTO_ROUTE" >/dev/null
@@ -145,6 +168,9 @@ validate_settings() {
   validate_uint_range "$SBMAGIC_MTU" SBMAGIC_MTU 1200 9000
   validate_one_of "$SBMAGIC_STACK" SBMAGIC_STACK gvisor system mixed
   validate_one_of "$SBMAGIC_PACKAGE_MODE" SBMAGIC_PACKAGE_MODE black white
+  validate_one_of "$SBMAGIC_PROXY_RULE_MODE" SBMAGIC_PROXY_RULE_MODE off global bypass-cn
+  validate_one_of "$SBMAGIC_FREE_FLOW_RULE_MODE" SBMAGIC_FREE_FLOW_RULE_MODE off global
+  validate_one_of "$SBMAGIC_MIXED_RULE_PRIORITY" SBMAGIC_MIXED_RULE_PRIORITY proxy free-flow
   validate_one_of "$SBMAGIC_DNS_MODE" SBMAGIC_DNS_MODE real-ip fake-ip
   validate_one_of "$SBMAGIC_DNS_STRATEGY" SBMAGIC_DNS_STRATEGY ipv4_only prefer_ipv4 prefer_ipv6 ipv6_only
   validate_one_of "$SBMAGIC_DNS_LOCAL_TYPE" SBMAGIC_DNS_LOCAL_TYPE https tls quic h3 udp tcp
@@ -162,13 +188,35 @@ cleanup_stale_process_binaries() {
     case "$candidate" in
       "$CORE_BIN"|"$SING_BOX"|"$FETCHER"|"$APPLIST_DEX")
         continue
-        ;;
+      ;;
     esac
     [ -f "$candidate" ] || continue
-    if cmp -s "$CORE_BIN" "$candidate" 2>/dev/null; then
+    if same_file "$CORE_BIN" "$candidate" || same_file_fingerprint "$CORE_BIN" "$candidate"; then
       rm -f "$candidate"
     fi
   done
+}
+
+same_file() {
+  [ "$1" -ef "$2" ] 2>/dev/null
+}
+
+file_fingerprint() {
+  stat -c '%s:%Y' "$1" 2>/dev/null
+}
+
+same_file_fingerprint() {
+  fp_a="$(file_fingerprint "$1")"
+  fp_b="$(file_fingerprint "$2")"
+  [ -n "$fp_a" ] && [ "$fp_a" = "$fp_b" ]
+}
+
+process_binary_fresh() {
+  [ -x "$SING_BOX" ] || return 1
+  same_file "$CORE_BIN" "$SING_BOX" && return 0
+  core_fp="$(file_fingerprint "$CORE_BIN")"
+  process_fp="$(file_fingerprint "$SING_BOX")"
+  [ -n "$core_fp" ] && [ "$core_fp" = "$process_fp" ]
 }
 
 prepare_process_binary() {
@@ -176,10 +224,10 @@ prepare_process_binary() {
   set_process_binary_path
   [ -x "$CORE_BIN" ] || die "core binary missing: $CORE_BIN"
   if [ "$SING_BOX" != "$CORE_BIN" ]; then
-    if [ ! -x "$SING_BOX" ] || ! cmp -s "$CORE_BIN" "$SING_BOX" 2>/dev/null; then
+    if ! process_binary_fresh; then
       tmp="$RUNTIME_DIR/process-bin.$$"
       rm -f "$tmp"
-      ln "$CORE_BIN" "$tmp" 2>/dev/null || cp -f "$CORE_BIN" "$tmp" || {
+      ln "$CORE_BIN" "$tmp" 2>/dev/null || cp -p "$CORE_BIN" "$tmp" 2>/dev/null || cp -f "$CORE_BIN" "$tmp" || {
         rm -f "$tmp"
         die "failed to prepare process binary: $SING_BOX"
       }
@@ -262,6 +310,137 @@ json_array_from_file() {
     }
     END { printf "]" }
   ' "$file"
+}
+
+package_file_has_entries() {
+  file="$1"
+  awk '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[ \t]+/, "", line)
+      sub(/[ \t]+$/, "", line)
+      if (line != "" && line !~ /^#/) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$file" 2>/dev/null
+}
+
+first_package_conflict_files() {
+  proxy_file="$1"
+  free_flow_file="$2"
+  awk '
+    FNR == NR {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[ \t]+/, "", line)
+      sub(/[ \t]+$/, "", line)
+      if (line != "" && line !~ /^#/) seen[line] = 1
+      next
+    }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[ \t]+/, "", line)
+      sub(/[ \t]+$/, "", line)
+      if (line != "" && line !~ /^#/ && seen[line]) {
+        print line
+        exit
+      }
+    }
+  ' "$proxy_file" "$free_flow_file" 2>/dev/null
+}
+
+first_package_conflict() {
+  first_package_conflict_files "$PROXY_PACKAGES_FILE" "$FREE_FLOW_PACKAGES_FILE"
+}
+
+ensure_no_strategy_conflicts() {
+  conflict="$(first_package_conflict)"
+  [ -z "$conflict" ] || die "package exists in both packages.proxy and packages.free-flow: $conflict"
+}
+
+ensure_no_strategy_conflicts_files() {
+  conflict="$(first_package_conflict_files "$1" "$2")"
+  [ -z "$conflict" ] || die "package exists in both packages.proxy and packages.free-flow: $conflict"
+}
+
+route_package_field() {
+  package_arr="$1"
+  [ -n "$package_arr" ] || return 0
+  printf ',\n        "package_name": %s' "$package_arr"
+}
+
+route_proxy_rules() {
+  package_arr="$1"
+  [ "$package_arr" = "[]" ] && return 0
+  pkg_json="$(route_package_field "$package_arr")"
+  case "$SBMAGIC_PROXY_RULE_MODE" in
+    off)
+      return 0
+      ;;
+    global)
+      cat <<EOF
+,
+      {
+        "outbound": "proxy"$pkg_json
+      }
+EOF
+      ;;
+    bypass-cn)
+      cat <<EOF
+,
+      {
+        "domain_suffix": [
+          "cn"
+        ],
+        "outbound": "direct"$pkg_json
+      },
+      {
+        "rule_set": [
+          "geosite-cn",
+          "geoip-cn"
+        ],
+        "outbound": "direct"$pkg_json
+      },
+      {
+        "outbound": "proxy"$pkg_json
+      }
+EOF
+      ;;
+  esac
+}
+
+route_free_flow_rules() {
+  package_arr="$1"
+  [ "$package_arr" = "[]" ] && return 0
+  pkg_json="$(route_package_field "$package_arr")"
+  case "$SBMAGIC_FREE_FLOW_RULE_MODE" in
+    off)
+      return 0
+      ;;
+    global)
+      cat <<EOF
+,
+      {
+        "outbound": "free-flow"$pkg_json
+      }
+EOF
+      ;;
+  esac
+}
+
+route_mixed_rules() {
+  case "$SBMAGIC_MIXED_RULE_PRIORITY" in
+    free-flow)
+      route_free_flow_rules ""
+      route_proxy_rules ""
+      ;;
+    *)
+      route_proxy_rules ""
+      route_free_flow_rules ""
+      ;;
+  esac
 }
 
 random_token() {
@@ -392,6 +571,7 @@ render_config() {
 
   [ -x "$SING_BOX" ] || die "sing-box binary missing: $SING_BOX"
   [ -f "$OUTBOUNDS_FILE" ] || die "outbounds file missing: $OUTBOUNDS_FILE"
+  ensure_no_strategy_conflicts
 
   auto_route="$(json_bool "$SBMAGIC_AUTO_ROUTE")"
   strict_route="$(json_bool "$SBMAGIC_STRICT_ROUTE")"
@@ -399,6 +579,11 @@ render_config() {
   package_json="$(package_field)"
   tun_stack_json="$(tun_stack_fields)"
   dns_direct_domains="$(json_array_from_file "$DNS_DIRECT_FILE")"
+  proxy_packages="$(json_array_from_file "$PROXY_PACKAGES_FILE")"
+  free_flow_packages="$(json_array_from_file "$FREE_FLOW_PACKAGES_FILE")"
+  forced_proxy_rules="$(route_proxy_rules "$proxy_packages")"
+  forced_free_flow_rules="$(route_free_flow_rules "$free_flow_packages")"
+  mixed_rules="$(route_mixed_rules)"
 
   # The tun interface always claims a (non-routable ULA) IPv6 address so
   # auto_route grabs the IPv6 default route too -- even when SBMAGIC_IPV6 is
@@ -567,6 +752,10 @@ EOF
         "action": "sniff",
         "timeout": "300ms"
       },
+      $route_ipv6_guard{
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
       {
         "clash_mode": "Direct",
         "outbound": "direct"
@@ -574,26 +763,9 @@ EOF
       {
         "clash_mode": "Global",
         "outbound": "proxy"
-      },
-      {
-        "ip_is_private": true,
-        "outbound": "direct"
-      },
-      $route_ipv6_guard{
-        "domain_suffix": [
-          "cn"
-        ],
-        "outbound": "direct"
-      },
-      {
-        "rule_set": [
-          "geosite-cn",
-          "geoip-cn"
-        ],
-        "outbound": "direct"
-      }
+      }$forced_proxy_rules$forced_free_flow_rules$mixed_rules
     ],
-    "final": "proxy",
+    "final": "direct",
     "auto_detect_interface": true,
     "default_domain_resolver": {
       "server": "local"
@@ -620,7 +792,37 @@ EOF
 
 check_config() {
   render_config >/dev/null || return 1
+  validate_runtime_ready || return 1
   "$SING_BOX" check -D "$DATA_DIR" -c "$CONFIG_FILE"
+}
+
+validate_runtime_ready() {
+  ensure_no_strategy_conflicts
+
+  need_proxy=false
+  need_free_flow=false
+
+  if package_file_has_entries "$PROXY_PACKAGES_FILE" && [ "$SBMAGIC_PROXY_RULE_MODE" = "off" ]; then
+    die "packages.proxy is not empty but SBMAGIC_PROXY_RULE_MODE=off"
+  fi
+  if package_file_has_entries "$FREE_FLOW_PACKAGES_FILE" && [ "$SBMAGIC_FREE_FLOW_RULE_MODE" = "off" ]; then
+    die "packages.free-flow is not empty but SBMAGIC_FREE_FLOW_RULE_MODE=off"
+  fi
+
+  [ "$SBMAGIC_PROXY_RULE_MODE" != "off" ] && need_proxy=true
+  [ "$SBMAGIC_API_MODE" = "Global" ] && need_proxy=true
+  [ "$SBMAGIC_FREE_FLOW_RULE_MODE" != "off" ] && need_free_flow=true
+
+  if [ "$need_proxy" != "true" ] && [ "$need_free_flow" != "true" ]; then
+    die "no proxy/free-flow rule is enabled; refusing to start an all-direct service"
+  fi
+
+  [ -x "$FETCHER" ] || die "magic-fetch missing: $FETCHER"
+  args=""
+  $need_proxy && args="$args --need-proxy"
+  $need_free_flow && args="$args --need-free-flow"
+  # shellcheck disable=SC2086
+  "$FETCHER" --validate-outbounds "$OUTBOUNDS_FILE" $args || die "outbounds are not ready for selected routing modes"
 }
 
 check_config_scratch() {
@@ -722,9 +924,36 @@ start_service() {
   return "$rc"
 }
 
+stop_pid_file() {
+  [ -f "$PID_FILE" ] || return 1
+  pid="$(cat "$PID_FILE" 2>/dev/null)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmdline="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+  saved_process="$(cat "$PROCESS_FILE" 2>/dev/null)"
+  if [ -n "$cmdline" ]; then
+    module_pid=false
+    case "$cmdline" in *"$DATA_DIR"*) module_pid=true ;; esac
+    if [ -n "$saved_process" ]; then
+      case "$cmdline" in *"$saved_process"*) module_pid=true ;; esac
+    fi
+    if [ "$module_pid" != "true" ]; then
+      log "refusing to stop stale pid=$pid cmdline=$cmdline"
+      rm -f "$PID_FILE" "$PROCESS_FILE"
+      return 1
+    fi
+  fi
+  kill "$pid" 2>/dev/null
+  sleep 1
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+  fi
+  log "stopped sing-box pid=$pid"
+  return 0
+}
+
 stop_service_locked() {
-  load_settings
-  if pid_alive; then
+  if ! stop_pid_file && pid_alive; then
     pid="$(cat "$PID_FILE")"
     kill "$pid" 2>/dev/null
     sleep 1
@@ -861,23 +1090,50 @@ enable_service() {
 }
 
 disable_service() {
-  load_settings
+  mkdirs
   if [ -f "$SETTINGS_FILE" ]; then
     if grep -q '^SBMAGIC_ENABLED=' "$SETTINGS_FILE"; then
       sed -i 's/^SBMAGIC_ENABLED=.*/SBMAGIC_ENABLED=false/' "$SETTINGS_FILE"
     else
       echo 'SBMAGIC_ENABLED=false' >> "$SETTINGS_FILE"
     fi
+  else
+    echo 'SBMAGIC_ENABLED=false' > "$SETTINGS_FILE"
   fi
   stop_all_service
   echo "disabled"
 }
 
 status() {
-  load_settings
-  prepare_process_binary
-  ensure_api_env
+  mkdirs
+  status_config_error=""
+  if ( load_settings ) >/dev/null 2>"$RUNTIME_DIR/status-settings.err"; then
+    load_settings
+  else
+    status_config_error="$(cat "$RUNTIME_DIR/status-settings.err" 2>/dev/null)"
+    load_settings_values
+    set_process_binary_path_relaxed >/dev/null 2>&1 || true
+  fi
+  configured_port="$SBMAGIC_API_PORT"
+  if [ -f "$API_ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$API_ENV_FILE" 2>/dev/null || true
+  fi
+  case "$configured_port" in
+    auto|AUTO|"") ;;
+    *)
+      if valid_port "$configured_port"; then
+        SBMAGIC_API_PORT="$configured_port"
+      fi
+      ;;
+  esac
   echo "enabled=$SBMAGIC_ENABLED"
+  if [ -n "$status_config_error" ]; then
+    echo "config_valid=false"
+    echo "config_error=$status_config_error"
+  else
+    echo "config_valid=true"
+  fi
   if pid_alive; then
     echo "running=true"
     echo "pid=$(cat "$PID_FILE")"
@@ -890,7 +1146,11 @@ status() {
   echo "tun_interface=$SBMAGIC_INTERFACE"
   echo "api=http://$SBMAGIC_API_HOST:$SBMAGIC_API_PORT"
   echo "mode=$SBMAGIC_API_MODE"
+  echo "boot_start=$SBMAGIC_BOOT_START"
   echo "package_mode=$SBMAGIC_PACKAGE_MODE"
+  echo "proxy_rule_mode=$SBMAGIC_PROXY_RULE_MODE"
+  echo "free_flow_rule_mode=$SBMAGIC_FREE_FLOW_RULE_MODE"
+  echo "mixed_rule_priority=$SBMAGIC_MIXED_RULE_PRIORITY"
   echo "dns_mode=$SBMAGIC_DNS_MODE"
   echo "ipv6=$SBMAGIC_IPV6"
   if [ -f "$LAST_GOOD_FILE" ]; then
@@ -899,7 +1159,11 @@ status() {
     echo "last_good=none"
   fi
   echo "fail_count=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)"
-  "$SING_BOX" version 2>/dev/null | head -1
+  if [ -x "$SING_BOX" ]; then
+    "$SING_BOX" version 2>/dev/null | head -1
+  elif [ -x "$CORE_BIN" ]; then
+    "$CORE_BIN" version 2>/dev/null | head -1
+  fi
 }
 
 logs() {
@@ -1022,6 +1286,8 @@ config_file_for() {
     outbounds) echo "$OUTBOUNDS_FILE" ;;
     exclude) echo "$EXCLUDE_FILE" ;;
     include) echo "$INCLUDE_FILE" ;;
+    proxy-packages|packages-proxy) echo "$PROXY_PACKAGES_FILE" ;;
+    free-flow-packages|packages-free-flow) echo "$FREE_FLOW_PACKAGES_FILE" ;;
     dns-direct) echo "$DNS_DIRECT_FILE" ;;
     *) return 1 ;;
   esac
@@ -1062,9 +1328,55 @@ config_set() {
   echo "ok"
 }
 
+config_set_strategy_packages() {
+  marker="__SBMAGIC_FREE_FLOW_PACKAGES__"
+  acquire_config_lock || die "another config operation is already in progress"
+  tmp_proxy=""
+  tmp_free_flow=""
+  old_proxy_packages_file=""
+  old_free_flow_packages_file=""
+  trap '[ -n "$tmp_proxy" ] && rm -f "$tmp_proxy"; [ -n "$tmp_free_flow" ] && rm -f "$tmp_free_flow"; release_config_lock' EXIT INT TERM HUP
+  mkdirs
+  tmp_proxy="$PROXY_PACKAGES_FILE.tmp.$$"
+  tmp_free_flow="$FREE_FLOW_PACKAGES_FILE.tmp.$$"
+  : > "$tmp_proxy"
+  : > "$tmp_free_flow"
+  awk -v marker="$marker" -v proxy="$tmp_proxy" -v free_flow="$tmp_free_flow" '
+    BEGIN { out = proxy }
+    $0 == marker { out = free_flow; seen_marker = 1; next }
+    { print > out }
+    END { if (!seen_marker) exit 2 }
+  ' || { rm -f "$tmp_proxy" "$tmp_free_flow"; die "strategy package payload missing marker"; }
+
+  ensure_no_strategy_conflicts_files "$tmp_proxy" "$tmp_free_flow"
+
+  old_proxy_packages_file="$PROXY_PACKAGES_FILE"
+  old_free_flow_packages_file="$FREE_FLOW_PACKAGES_FILE"
+  PROXY_PACKAGES_FILE="$tmp_proxy"
+  FREE_FLOW_PACKAGES_FILE="$tmp_free_flow"
+  if ! ( check_config_scratch ) >/dev/null 2>&1; then
+    PROXY_PACKAGES_FILE="$old_proxy_packages_file"
+    FREE_FLOW_PACKAGES_FILE="$old_free_flow_packages_file"
+    rm -f "$tmp_proxy" "$tmp_free_flow"
+    die "rendered config check failed for strategy packages; kept previous files"
+  fi
+  PROXY_PACKAGES_FILE="$old_proxy_packages_file"
+  FREE_FLOW_PACKAGES_FILE="$old_free_flow_packages_file"
+
+  cp -f "$PROXY_PACKAGES_FILE" "$PROXY_PACKAGES_FILE.bak" 2>/dev/null
+  cp -f "$FREE_FLOW_PACKAGES_FILE" "$FREE_FLOW_PACKAGES_FILE.bak" 2>/dev/null
+  mv -f "$tmp_proxy" "$PROXY_PACKAGES_FILE"
+  mv -f "$tmp_free_flow" "$FREE_FLOW_PACKAGES_FILE"
+  chmod 600 "$PROXY_PACKAGES_FILE" "$FREE_FLOW_PACKAGES_FILE"
+  log "config set strategy packages"
+  trap - EXIT INT TERM HUP
+  release_config_lock
+  echo "ok"
+}
+
 config_requires_check() {
   case "$1" in
-    settings|outbounds|exclude|include|dns-direct) return 0 ;;
+    settings|outbounds|exclude|include|proxy-packages|packages-proxy|free-flow-packages|packages-free-flow|dns-direct) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1182,6 +1494,11 @@ ensure_watchdog() {
 boot() {
   mkdirs
   load_settings
+  if [ "$SBMAGIC_BOOT_START" != "true" ]; then
+    log "boot start disabled"
+    echo "boot start disabled"
+    return 0
+  fi
   start_service
 }
 
@@ -1205,8 +1522,9 @@ Commands:
   api METHOD PATH [JSON]
   fetch URL              Fetch a subscription URL and print the body
   ruleset-refresh        Clear cached remote rule-sets and safe-reload
-  config get KEY        Print a config file (settings|outbounds|exclude|include|dns-direct)
+  config get KEY        Print a config file (settings|outbounds|exclude|include|proxy-packages|free-flow-packages|dns-direct)
   config set KEY        Overwrite a config file from stdin (keeps KEY.bak)
+  config set-strategies Overwrite proxy/free-flow package strategy files atomically
   config rollback KEY    Swap a config file with its .bak (toggle)
   applist [user|system]  List installed apps as "package\tlabel\tuser|system"
   watchdog             Long-interval watchdog loop with crash-loop guard
@@ -1238,6 +1556,7 @@ case "$cmd" in
     case "$sub" in
       get) config_get "$1" ;;
       set) config_set "$1" ;;
+      set-strategies) config_set_strategy_packages ;;
       rollback) config_rollback "$1" ;;
       *) usage; exit 1 ;;
     esac

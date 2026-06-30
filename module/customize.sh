@@ -35,7 +35,7 @@ cp -f "$MODPATH/bin/$SBMAGIC_ABI/sing-box" "$BIN_DIR/.core"
 [ -f "$MODPATH/bin/applist.dex" ] && cp -f "$MODPATH/bin/applist.dex" "$BIN_DIR/applist.dex"
 cp -f "$MODPATH/common/magicctl" "$DATA_DIR/magicctl"
 
-for name in settings.env outbounds.json packages.exclude packages.include dns-direct-domains.txt; do
+for name in settings.env outbounds.json packages.exclude packages.include packages.proxy packages.free-flow dns-direct-domains.txt; do
   if [ ! -f "$CONFIG_DIR/$name" ]; then
     cp -f "$MODPATH/defaults/$name" "$CONFIG_DIR/$name"
   else

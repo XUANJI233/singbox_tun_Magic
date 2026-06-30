@@ -45,13 +45,15 @@ jobs:
       - name: Package modules
         run: |
           set -euo pipefail
-          python3 scripts/package-module.py --abi arm64-v8a --output dist/SingBox_Tun_Magic_arm64-v8a.zip
-          python3 scripts/package-module.py --abi x86_64 --output dist/SingBox_Tun_Magic_x86_64.zip
+          python3 scripts/package-module.py --output "dist/星盘.zip"
+          python3 scripts/package-module.py --abi arm64-v8a --output "dist/星盘_arm64-v8a.zip"
+          python3 scripts/package-module.py --abi x86_64 --output "dist/星盘_x86_64.zip"
           python3 scripts/write-update-json.py \
             --repository "${{ github.repository }}" \
-            --zip-name "SingBox_Tun_Magic_arm64-v8a.zip"
-          test -f dist/SingBox_Tun_Magic_arm64-v8a.zip
-          test -f dist/SingBox_Tun_Magic_x86_64.zip
+            --zip-name "星盘.zip"
+          test -f "dist/星盘.zip"
+          test -f "dist/星盘_arm64-v8a.zip"
+          test -f "dist/星盘_x86_64.zip"
           test -f dist/update.json
           ls -lh dist/
 
@@ -87,22 +89,18 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
             --title "星盘 ${tag}" \
-            --notes "初版发布。" \
+            --notes "实现 sing-box TUN 免流/代理分层路由模型。" \
             --latest \
-            "dist/SingBox_Tun_Magic_arm64-v8a.zip#星盘_arm64-v8a.zip" \
-            "dist/SingBox_Tun_Magic_x86_64.zip#星盘_x86_64.zip" \
+            "dist/星盘.zip" \
+            "dist/星盘_arm64-v8a.zip" \
+            "dist/星盘_x86_64.zip" \
             "dist/update.json"
 
           names="$(gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
-          echo "${names}" | grep -Fx "SingBox_Tun_Magic_arm64-v8a.zip"
-          echo "${names}" | grep -Fx "SingBox_Tun_Magic_x86_64.zip"
+          echo "${names}" | grep -Fx "星盘.zip"
+          echo "${names}" | grep -Fx "星盘_arm64-v8a.zip"
+          echo "${names}" | grep -Fx "星盘_x86_64.zip"
           echo "${names}" | grep -Fx "update.json"
-          gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json assets \
-            --jq '.assets[] | select(.name == "SingBox_Tun_Magic_arm64-v8a.zip" and .label == "星盘_arm64-v8a.zip") | .name' \
-            | grep -Fx "SingBox_Tun_Magic_arm64-v8a.zip"
-          gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json assets \
-            --jq '.assets[] | select(.name == "SingBox_Tun_Magic_x86_64.zip" and .label == "星盘_x86_64.zip") | .name' \
-            | grep -Fx "SingBox_Tun_Magic_x86_64.zip"
 
           gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
             --jq '.assets[] | {name, label, size}'

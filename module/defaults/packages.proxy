@@ -1,0 +1,2 @@
+# Apps forced to use proxy strategy after they enter TUN.
+# One package name per line.
