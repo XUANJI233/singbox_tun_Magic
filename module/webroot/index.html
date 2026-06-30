@@ -286,7 +286,7 @@
     <div class="card">
       <div class="card-head">
         <h2>导入节点</h2>
-        <p>兼容分享链接、base64 订阅正文、sing-box JSON/outbounds 导出,支持 UTF-8 中文/emoji 节点名,自动转换成 sing-box 出站并写入下方 outbounds.json。支持 vmess / vless / trojan / ss / hysteria2 / tuic / anytls。</p>
+        <p>兼容分享链接、base64 订阅正文、sing-box JSON/outbounds 导出,支持 UTF-8 中文/emoji 节点名,自动转换成 sing-box 出站并写入下方 outbounds.json。支持 vmess / vless / trojan / ss / hysteria2 / tuic / anytls,以及 sing-box-extended 的 XHTTP。</p>
       </div>
       <textarea id="import-text" spellcheck="false" placeholder="粘贴分享链接(可多行)、base64 订阅正文、sing-box JSON/outbounds;或粘贴单个订阅链接(http/https),用右侧“拉取订阅”导入"></textarea>
       <div class="field-row">
@@ -1007,6 +1007,60 @@ function splitHostPort(hp) {
 }
 function splitAlpn(v) { return dec(v).split(",").map(s => s.trim()).filter(Boolean); }
 function truthy(v) { return v === "1" || v === "true"; }
+function parseJsonObject(value, label = "JSON") {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(dec(value));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  } catch (e) {
+    throw new Error(`invalid ${label}: ${e.message}`);
+  }
+  throw new Error(`invalid ${label}: expected object`);
+}
+function setIfPresent(target, key, value) {
+  if (value === undefined || value === null || value === "") return;
+  target[key] = value;
+}
+function copyMappedFields(source, target, mapping) {
+  mapping.forEach(([from, to]) => {
+    if (Object.prototype.hasOwnProperty.call(source, from)) setIfPresent(target, to, source[from]);
+  });
+}
+const XHTTP_EXTRA_FIELD_MAP = [
+  ["xPaddingBytes", "x_padding_bytes"],
+  ["xPaddingObfsMode", "x_padding_obfs_mode"],
+  ["xPaddingKey", "x_padding_key"],
+  ["xPaddingHeader", "x_padding_header"],
+  ["xPaddingPlacement", "x_padding_placement"],
+  ["xPaddingMethod", "x_padding_method"],
+  ["noGRPCHeader", "no_grpc_header"],
+  ["noSSEHeader", "no_sse_header"],
+  ["scMaxEachPostBytes", "sc_max_each_post_bytes"],
+  ["scMinPostsIntervalMs", "sc_min_posts_interval_ms"],
+  ["scMaxBufferedPosts", "sc_max_buffered_posts"],
+  ["scStreamUpServerSecs", "sc_stream_up_server_secs"],
+  ["serverMaxHeaderBytes", "server_max_header_bytes"],
+  ["uplinkHTTPMethod", "uplink_http_method"],
+  ["uplinkChunkSize", "uplink_chunk_size"],
+  ["uplinkDataPlacement", "uplink_data_placement"],
+  ["uplinkDataKey", "uplink_data_key"],
+  ["sessionPlacement", "session_placement"],
+  ["sessionKey", "session_key"],
+  ["seqPlacement", "seq_placement"],
+  ["seqKey", "seq_key"],
+  ["sessionIDTable", "session_id_table"],
+  ["sessionIDLength", "session_id_length"],
+  ["congestionController", "congestion_controller"],
+  ["cwnd", "cwnd"],
+];
+const XHTTP_XMUX_FIELD_MAP = [
+  ["maxConcurrency", "max_concurrency"],
+  ["maxConnections", "max_connections"],
+  ["cMaxReuseTimes", "c_max_reuse_times"],
+  ["hMaxRequestTimes", "h_max_request_times"],
+  ["hMaxReusableSecs", "h_max_reusable_secs"],
+  ["hKeepAlivePeriod", "h_keep_alive_period"],
+];
 
 function vmessTransport(net, host, path) {
   net = (net || "tcp").toLowerCase();
@@ -1014,6 +1068,30 @@ function vmessTransport(net, host, path) {
   if (net === "grpc") return { type: "grpc", service_name: path || host || "" };
   if (net === "h2" || net === "http") return { type: "http", ...(host ? { host: [host] } : {}), path: path || "/" };
   return null;
+}
+function xhttpTransport(params, host) {
+  const extra = parseJsonObject(params.extra, "xhttp extra");
+  const transport = {
+    type: "xhttp",
+    mode: params.mode || extra.mode || "auto",
+    path: params.path ? dec(params.path) : (extra.path || "/"),
+    x_padding_bytes: "100-1000",
+  };
+  setIfPresent(transport, "host", host || params.authority || extra.host);
+  copyMappedFields(extra, transport, XHTTP_EXTRA_FIELD_MAP);
+  if (extra.headers && typeof extra.headers === "object" && !Array.isArray(extra.headers)) {
+    const headers = {};
+    Object.entries(extra.headers).forEach(([k, v]) => {
+      if (String(k).toLowerCase() !== "host") setIfPresent(headers, k, String(v));
+    });
+    if (Object.keys(headers).length) transport.headers = headers;
+  }
+  if (extra.xmux && typeof extra.xmux === "object" && !Array.isArray(extra.xmux)) {
+    const xmux = {};
+    copyMappedFields(extra.xmux, xmux, XHTTP_XMUX_FIELD_MAP);
+    if (Object.keys(xmux).length) transport.xmux = xmux;
+  }
+  return transport;
 }
 function parseVmess(line) {
   const j = JSON.parse(b64ToStr(line.slice(8)));
@@ -1040,8 +1118,10 @@ function parseVless(line) {
     server: u.hostname, server_port: Number(u.port || 443), uuid: dec(u.username), packet_encoding: "xudp",
   };
   if (p.flow) o.flow = p.flow;
+  if (p.encryption && p.encryption !== "none") o.encryption = p.encryption;
   const tr = vmessTransport(net === "h2" ? "http" : net, host, p.path ? dec(p.path) : "");
   if (net === "grpc") o.transport = { type: "grpc", service_name: p.serviceName || dec(p.path || "") };
+  else if (net === "xhttp") o.transport = xhttpTransport(p, host);
   else if (tr) o.transport = tr;
   if (security === "tls") {
     o.tls = { enabled: true, server_name: p.sni || p.peer || host || u.hostname, insecure: truthy(p.allowInsecure), utls: { enabled: true, fingerprint: p.fp || "chrome" } };
@@ -1063,6 +1143,7 @@ function parseTrojan(line) {
   if (p.fp) o.tls.utls = { enabled: true, fingerprint: p.fp };
   if (net === "ws") o.transport = { type: "ws", path: p.path ? dec(p.path) : "/", ...(host ? { headers: { Host: host } } : {}) };
   else if (net === "grpc") o.transport = { type: "grpc", service_name: p.serviceName || dec(p.path || "") };
+  else if (net === "xhttp") o.transport = xhttpTransport(p, host);
   return o;
 }
 function parseSS(line) {

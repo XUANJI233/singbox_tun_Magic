@@ -6,7 +6,7 @@
 > **不再使用** hev-socks5-tunnel + 本机 loopback SOCKS 的三层拆分方案。该方案的完整设计记录在 [singbox-module-dev.legacy-hev-design.md](singbox-module-dev.legacy-hev-design.md),仅作**未来 fork/对比实验**的参考,不是当前实现的一部分(见第 17 节)。
 
 > ⚠️ 本文档分**架构层**(模块固有设计,写死)与**配置层**(用户经 UI 设置,不硬编码)。
-> 文中出现的具体协议(VLESS/gRPC 等)、伪装策略、CDN 等**均为配置示例**,非模块要求。模块协议无关。
+> 文中出现的具体协议(VLESS/gRPC/XHTTP 等)、伪装策略、CDN 等**均为配置示例**,非模块要求。模块协议无关。
 
 ---
 
@@ -184,7 +184,8 @@ APP 流量 + DNS 查询
 
 ### 5.2 版本
 
-- 官方 sing-box **1.13.x 或更高 arm64/x86_64**,二进制放在 `module/bin/<abi>/sing-box`,按架构在 `customize.sh` 里选择拷贝。
+- 核心目标切换为 **shtorm-7/sing-box-extended** 的 `extended` 分支 Android arm64/x86_64 二进制,放在 `module/bin/<abi>/sing-box`,按架构在 `customize.sh` 里选择拷贝。当前打包核心来自 revision `a27453e4f7d179585436862d7cadfcef7b518aa6`,构建标签记录在 `module/core-source.txt`。原因是它在 sing-box 1.13+ 配置模型基础上额外提供 VLESS `encryption` 与 XHTTP transport,能承接 v2rayN/Xray extended 分享链接。
+- 当前模块不再承诺兼容官方主线 sing-box 二进制。官方主线缺少 `transport.type: "xhttp"`、VLESS `encryption` 等扩展字段时,导入的 extended 节点会在 `sing-box check` 阶段失败,这是预期保护。
 - 配置语法与二进制版本匹配,不可错配。
 
 ---
@@ -289,7 +290,8 @@ APP 流量 + DNS 查询
 
 **节点导入(对标 v2rayN 的"导入"体验)**——在 WebUI 的"节点"Tab:
 - 解析在**页面 JS** 里完成(JS 自带 base64/URL/JSON 能力,比 sh 干净可靠),把分享链接转成 sing-box 原生 outbound,再 `config set outbounds` 写入。
-- 支持协议:`vmess` / `vless`(含 reality、flow、ws/grpc/http 传输、uTLS 指纹)/ `trojan` / `ss`(SIP002 与旧版全 base64 两种写法,含 plugin)/ `hysteria2`(含 salamander obfs)/ `tuic` / `anytls`。
+- 支持协议:`vmess` / `vless`(含 reality、flow、`encryption`、ws/grpc/http/xhttp 传输、uTLS 指纹)/ `trojan` / `ss`(SIP002 与旧版全 base64 两种写法,含 plugin)/ `hysteria2`(含 salamander obfs)/ `tuic` / `anytls`。
+- VLESS XHTTP 导入按 sing-box-extended 的字段落盘:`type=xhttp` 会生成 `transport.type: "xhttp"`;`extra` 内的 `xPadding*`、`sc*`、`session*`、`seq*`、`uplink*` 字段走白名单转换为 snake_case。未提供 `xPaddingBytes` 时默认写 `"100-1000"`,避免 extended 核心校验拒绝空 padding。
 - 支持**订阅链接/导出配置**:WebUI 调模块自带 `magic-fetch` 拉取 URL(UA 用 `v2rayN/...` 以拿到通用的 base64 分享链接列表),再按行解析。缺少 `magic-fetch` 视为安装不完整,不再退回 curl/wget/nc 这类设备环境不稳定的后端。订阅正文是单段 base64 时自动解码;也可直接粘贴 sing-box JSON/outbounds 导出。
 - 不支持 Clash YAML 订阅(需 YAML 解析器,暂不引入);这类订阅请先转换成分享链接列表或 sing-box outbounds JSON。
 - 写入方式两种:**替换**(整体替换节点)/ **追加**(保留已有节点再并入,同名自动改名 `-2`/`-3`…)。组装结果 = `selector(proxy)` + `urltest(auto)` + 各节点 + `direct`。导入后会立刻做 `outbounds` 语义校验(`proxy/direct` 必需、tag 不重复、selector/urltest 引用必须存在)和整配置 `check`,通过后仍需点"应用并重启"。
@@ -307,10 +309,10 @@ APP 流量 + DNS 查询
 > 设计:几乎所有 sing-box/per-app 参数都经 `settings.env` + WebUI 表单设置,模块不硬编码。改完点"应用并重启"生效(`magicctl reload`:先渲染/check,通过后重启;失败保持原进程)。
 
 ### 9.1 节点 / 上游(协议无关)
-- **分享链接/订阅/sing-box JSON 导入**(vmess/vless/trojan/ss/hysteria2/tuic/anytls,见 §8.4)——对标 v2rayN 的导入,无需手写 JSON;节点名/路径等文本按 UTF-8 解码,并对老中文订阅尝试 GB18030 兜底
+- **分享链接/订阅/sing-box JSON 导入**(vmess/vless/trojan/ss/hysteria2/tuic/anytls,见 §8.4;VLESS 支持 sing-box-extended 的 XHTTP/encryption)——对标 v2rayN 的导入,无需手写 JSON;节点名/路径等文本按 UTF-8 解码,并对老中文订阅尝试 GB18030 兜底
 - 协议类型(VLESS/VMess/Trojan/Shadowsocks/Hysteria2/TUIC/AnyTLS… 由 sing-box 支持的全集),编辑 `outbounds.json`
 - 服务器地址、端口、UUID/密码等凭据
-- 传输层(TCP/WS/gRPC/HTTPUpgrade/HTTP2…)及其参数
+- 传输层(TCP/WS/gRPC/HTTPUpgrade/HTTP2/XHTTP…)及其参数
 - TLS:开关、SNI、ALPN、证书校验、uTLS 指纹
 - 多节点管理 + `urltest` 自动选优(参考 `outbounds.example.json`)
 
@@ -466,7 +468,7 @@ APP 流量 + DNS 查询
 - [ ] 控制面凭据 root-only(600),Bearer 校验,`127.0.0.1` only,端口默认 `auto` 随机高端口,默认 owner 防火墙阻断普通 UID 扫描
 
 **配置版本**
-- [ ] 官方 sing-box 1.13.x+,配置语法与版本匹配
+- [ ] sing-box-extended `extended` 分支核心,配置语法与版本匹配
 - [ ] DNS 用 1.12+ 新 server 格式(type+server)、规则用 action 式;旧字段(`address` URL、顶层 `fakeip`、`reverse_mapping`、`independent_cache`)不下发
 - [ ] `block`/`dns` 旧特殊出站已移除(1.13 删除),拦截用 `action: reject`、DNS 用 `hijack-dns`
 - [ ] `route.default_domain_resolver` 已设(多 DNS server 时解析节点域名必需,见 §4.6)
