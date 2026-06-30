@@ -186,14 +186,71 @@ validate_duration_literal() {
   esac
 }
 
+validate_ipv4_literal() {
+  value="$1"
+  case "$value" in
+    *..*|.*|*.|*[!0-9.]*)
+      return 1
+      ;;
+  esac
+
+  old_ifs="$IFS"
+  IFS=.
+  # shellcheck disable=SC2086
+  set -- $value
+  IFS="$old_ifs"
+  [ "$#" -eq 4 ] || return 1
+
+  for octet in "$@"; do
+    case "$octet" in
+      ''|*[!0-9]*)
+        return 1
+        ;;
+    esac
+    [ "$octet" -le 255 ] || return 1
+  done
+}
+
+validate_ipv6_literal() {
+  value="$1"
+  printf '%s\n' "$value" | awk '
+    function fail() { exit 1 }
+    {
+      s = $0
+      if (s !~ /^[0-9A-Fa-f:]+$/) fail()
+      if (s !~ /:/) fail()
+      if (s ~ /:::/) fail()
+      if (s ~ /^:[^:]/ || s ~ /[^:]:$/) fail()
+      t = s
+      compressed = gsub(/::/, "", t)
+      if (compressed > 1) fail()
+      count = split(s, parts, ":")
+      groups = 0
+      for (i = 1; i <= count; i++) {
+        if (parts[i] == "") continue
+        if (parts[i] !~ /^[0-9A-Fa-f][0-9A-Fa-f]?[0-9A-Fa-f]?[0-9A-Fa-f]?$/) fail()
+        groups++
+      }
+      if (compressed == 0 && groups != 8) fail()
+      if (compressed == 1 && (groups == 0 || groups >= 8)) fail()
+      ok = 1
+    }
+    END { exit ok ? 0 : 1 }
+  '
+}
+
 validate_dns_server_literal() {
   value="$1"
   name="$2"
   case "$value" in
-    ''|*://*|*/*|*[!0-9A-Fa-f:.]*)
+    ''|*://*|*/*|*\\*|*\"*|*\[*|*\]*|*%*|*,*|*" "*)
       die "invalid $name '$value': use an IP literal, not a hostname or URL"
       ;;
   esac
+  if validate_ipv4_literal "$value" || validate_ipv6_literal "$value"; then
+    return 0
+  fi
+  die "invalid $name '$value': use an IP literal, not a hostname or URL"
 }
 
 validate_settings() {
@@ -745,10 +802,10 @@ EOF
   fi
 
   # fake-ip is expressed as a DNS *server* of type "fakeip" in the 1.12+
-  # format (the old top-level dns.fakeip object was removed in 1.14). When
-  # enabled we add that server and point dns.final at it so every non-direct
-  # domain gets a fake address; direct/CN domains are still routed to the
-  # real "local" resolver by the rules below.
+  # format (the old top-level dns.fakeip object was removed in 1.14). dns.final
+  # stays local/remote because sing-box rejects fakeip as the default server;
+  # instead, a catch-all A/AAAA rule routes non-direct queries to fakeip after
+  # the direct/CN rules below.
   fakeip_server=""
   fakeip_rule=""
   # store_fakeip persists fake-ip<->domain mappings across restarts. Its
@@ -2004,7 +2061,24 @@ initd() {
   echo "$(date '+%Y-%m-%d %H:%M:%S')" > "$INITD_SEEN_FILE"
   chmod 600 "$INITD_SEEN_FILE" 2>/dev/null
   log "init service entry"
-  boot
+  load_settings
+  if [ "$SBMAGIC_BOOT_START" != "true" ]; then
+    log "init service exiting: boot start disabled"
+    echo "boot start disabled"
+    return 0
+  fi
+  if [ "$SBMAGIC_ENABLED" != "true" ]; then
+    log "init service exiting: module disabled"
+    echo "module disabled in $SETTINGS_FILE"
+    return 0
+  fi
+  if [ "$SBMAGIC_WATCHDOG" = "true" ]; then
+    log "init service running watchdog in foreground"
+    watchdog
+    return $?
+  fi
+  log "init service running one-shot core in foreground"
+  initd_direct
 }
 
 boot() {
@@ -2016,6 +2090,25 @@ boot() {
     return 0
   fi
   start_service
+}
+
+initd_direct() {
+  acquire_start_lock || { echo "another service operation is already in progress"; return 1; }
+  trap 'release_start_lock' EXIT INT TERM HUP
+  start_service_locked
+  rc=$?
+  trap - EXIT INT TERM HUP
+  release_start_lock
+  [ "$rc" -eq 0 ] || return "$rc"
+
+  pid="$(cat "$PID_FILE" 2>/dev/null)"
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  wait "$pid" 2>/dev/null
+  current_pid="$(cat "$PID_FILE" 2>/dev/null)"
+  if [ "$current_pid" = "$pid" ]; then
+    rm -f "$PID_FILE" "$PROCESS_FILE"
+    remove_api_firewall
+  fi
 }
 
 boot_dispatch() {

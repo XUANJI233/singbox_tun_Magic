@@ -130,7 +130,7 @@ APP 流量 + DNS 查询
 
 ### 4.3 可选:fake-ip 高级模式(`SBMAGIC_DNS_MODE=fake-ip`)
 
-- `magicctl` 渲染时会加一个 `{"type":"fakeip","tag":"fakeip",...}` DNS server(1.12+ 新格式,不再用顶层 `dns.fakeip` 对象),并在直连/CN 规则之后追加 `query_type: A/AAAA -> server: fakeip` 的 DNS 规则。**不能**把 `dns.final` 设成 `fakeip`;sing-box 1.13 会拒绝启动(`default server cannot be fakeip`)。
+- `magicctl` 渲染时会加一个 `{"type":"fakeip","tag":"fakeip",...}` DNS server(1.12+ 新格式,不再用顶层 `dns.fakeip` 对象),并在直连/CN 规则之后追加 `query_type: A/AAAA -> server: fakeip` 的 DNS 规则。`dns.final` 仍保持 `remote`/`local`。**不能**把 `dns.final` 设成 `fakeip`;sing-box 1.13 会拒绝启动(`default server cannot be fakeip`)。
 - fake-ip 模式下渲染会显式写 `cache_file.store_fakeip: true`,把 fake-ip↔域名映射持久化到 `cache.db`,避免重启后旧映射失效导致正在用 fake-ip 的连接断开(该字段默认值在不同 sing-box 版本间不一致,所以显式写死)。
 - 因为所有流量都在 tun 内(没有"排除 APP 拿到假 IP 但流量不进 tun"的问题——排除的 APP 本来就不查这个 DNS),fake-ip 在当前架构下**不存在旧文档里 per-app 冲突的那套顾虑**,可以放心用来恢复域名级分流精度。
 - IPv6 关闭时(`SBMAGIC_IPV6=false`,默认),AAAA 已被 DNS 规则最前面的 `reject` 全局拦掉(见 §4.4),所以 fake-ip 自然只产出 v4,不会下发 fake v6 段。
@@ -143,13 +143,13 @@ APP 流量 + DNS 查询
 - 如果不这么做,在一台真有 IPv6 出口的设备上,被代理的 APP 的 IPv6 流量会**完全绕过 tun**,直接走运营商网络的 IPv6 通路出去——这是一个会直接暴露真实 IP 的"代理穿透"问题,比"没适配 IPv6"更糟。
 - `SBMAGIC_IPV6=false`(默认)时,渲染管线额外加两条防线:
   1. **DNS 层**:在 DNS 规则最前面插入 `{"query_type": ["AAAA"], "action": "reject"}`,任何域名的 AAAA 查询直接被拒绝,不管 `SBMAGIC_DNS_STRATEGY` 设的是什么——这是兜底,不依赖用户没改错别的设置。
-  2. **路由层**:在 `ip_is_private` 规则之后插入 `{"ip_version": 6, "action": "reject"}`,即便某个 APP 拿到了硬编码的 IPv6 地址(没走 DNS),数据面也直接拒绝,不会泄漏、也不会误判成"直连"。(用 `action: reject` 而不是旧的 `outbound: block`——`block` 特殊出站在 sing-box 1.13 已移除。)
+  2. **路由层**:在 `ip_is_private` 规则之前插入 `{"ip_version": 6, "action": "reject"}`,即便某个 APP 拿到了硬编码的 IPv6 地址(没走 DNS),数据面也直接拒绝,不会泄漏、也不会误判成"直连"。(用 `action: reject` 而不是旧的 `outbound: block`——`block` 特殊出站在 sing-box 1.13 已移除。)
 - `SBMAGIC_IPV6=true` 时,上面两条防线不插入,IPv6 数据可以正常走 fake-ip/真实解析 + 域名/规则集分流,和 IPv4 走一样的 route 引擎逻辑。**但**默认的 `SBMAGIC_DNS_STRATEGY=ipv4_only` 不会因为这个开关自动改变——开 IPv6 只是"允许"接管,要真正解析到 AAAA,还需要把 DNS 策略换成 `prefer_ipv4`(双栈优先 v4)之类的值。WebUI 的设置表单在这两个字段之间加了提示文案,避免用户以为开了 IPv6 开关就立刻生效。
 
 ### 4.5 DNS 鸡生蛋
 
 - DNS server 拆成 `SBMAGIC_DNS_LOCAL_TYPE`/`SBMAGIC_DNS_LOCAL_SERVER` 与 `SBMAGIC_DNS_REMOTE_TYPE`/`SBMAGIC_DNS_REMOTE_SERVER` 两组(协议 + 地址),默认本地 `udp` + `223.5.5.5`,远程 `https` + `1.1.1.1`。本地解析器负责 bootstrap/直连域名,优先低延迟和空闲后快速恢复;远程解析器经 `proxy` 出口处理普通代理域名,避免 DNS 泄漏。`SERVER` 是 IP 时不需要再解析,天然避免"远程 DNS 走代理但落地域名要解析"的死循环。
-- 如果把 `SERVER` 改成域名(如 `dns.alidns.com`),sing-box 1.12+ 要求该 server 配 `domain_resolver` 指定用谁解析它,否则会死循环;`sing-box check` 不会报语法错(`domain_resolver` 是可选字段),但运行时解不出来。**所以默认坚持填 IP 字面量**,WebUI 输入框也写了"填 IP"的提示。
+- 如果把 `SERVER` 改成域名(如 `dns.alidns.com`),sing-box 1.12+ 要求该 server 配 `domain_resolver` 指定用谁解析它,否则会变成 DNS 鸡生蛋;当前 `magicctl` 会拒绝域名、URL、端口和伪 IP 字符串,只允许 IPv4/IPv6 字面量。**所以默认坚持填 IP 字面量**,WebUI 输入框也写了"填 IP"的提示。
 - `dns-direct-domains.txt` 只接受**域名**,渲染成 sing-box 的 `domain` DNS 规则,写 IP 字面量进去不会生效。
 
 ### 4.6 出站/节点域名解析(`route.default_domain_resolver`)
@@ -205,6 +205,7 @@ APP 流量 + DNS 查询
 
 - `post-fs-data.sh`:只创建 `runtime/` 目录、记录模块路径,不做网络相关操作(此阶段网络栈未就绪)。
 - `module/system/etc/init/netd-helper.rc`:提供可选 Android init service `netd_helper`,在 `sys.boot_completed=1` 后调用 `magicctl initd`。rc 里设置 `oom_score_adjust -900`,等价于把 init 拉起的 native 进程放到接近 Android `SYSTEM_ADJ` 的 low-memory killer 档位;这不是 framework `ProcessRecord#setPersistent(true)`。
+- `magicctl initd` 必须以前台方式持有 supervisor:默认 `SBMAGIC_WATCHDOG=true` 时直接在 init service 进程里运行 `watchdog`;如果用户关闭 watchdog,则前台启动核心并 `wait` 一次。不能在 init service 里后台 fork 后立刻退出,因为 Android init 对 oneshot service 的进程组可能会清理额外子进程,导致 watchdog/core 被一起杀掉。
 - `service.sh`(late_start):等待 `sys.boot_completed=1`,再 sleep 5 秒缓冲,然后调用 `magicctl boot-dispatch`。若 `SBMAGIC_BOOT_START=false`(默认)会直接退出,不接管网络;若已开启开机自启且 `SBMAGIC_INIT_SERVICE=true`,先尝试 `setprop ctl.start netd_helper`;若 ROM/模块管理器不支持 systemless rc 注入,或 init service 8 秒内没有进入,自动回退到直接 `magicctl boot`。
 
 ### 7.2 守护:无轮询 supervisor(当前实现)
@@ -469,7 +470,7 @@ APP 流量 + DNS 查询
 - [ ] 默认优先 Android init service 托管启动,失败自动回退 late_start 直接启动
 - [ ] 守护用事件式 supervisor,正常运行不做周期性存活轮询;`SBMAGIC_WATCHDOG_INTERVAL` 只作为 last-good 提升延迟
 - [ ] 网络恢复用 `ip monitor` 事件触发,不做固定外网测速/常规轮询
-- [ ] 直连 APP(per-app 排除)不进 tun/出站代理数据转发路径;DNS 53 劫持是全局规则,不按 uid 区分
+- [ ] 直连 APP(per-app 排除)不进 tun;数据和 DNS 都走系统默认网络,不存在全局 53 劫持或 uid 级 DNS 分叉
 - [ ] 日志 warn、规则集更新 ≥7d、cache_file 开
 - [ ] 电池白名单(Doze 对抗,需 WebUI 引导)
 
