@@ -248,6 +248,40 @@
   <section id="tab-outbounds">
     <div class="card">
       <div class="card-head">
+        <h2>节点选择</h2>
+        <p>切换当前出口,不改写 outbounds.json。</p>
+      </div>
+      <div class="field-row">
+        <div class="field-main">
+          <label>选择器</label>
+          <div class="field-hint">通常为导入时生成的 proxy。</div>
+        </div>
+        <div class="field-control">
+          <select id="node-selector-name"></select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field-main">
+          <label>当前出口</label>
+          <div class="field-hint" id="node-current">尚未加载</div>
+        </div>
+        <div class="field-control">
+          <select id="node-target"></select>
+        </div>
+      </div>
+      <div class="actions split">
+        <div class="actions">
+          <span class="field-hint" id="node-select-status"></span>
+        </div>
+        <div class="actions">
+          <button class="btn secondary" id="btn-node-load">加载当前节点</button>
+          <button class="btn" id="btn-node-switch">切换节点</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
         <h2>导入节点</h2>
         <p>兼容分享链接、base64 订阅正文、sing-box JSON/outbounds 导出,支持 UTF-8 中文/emoji 节点名,自动转换成 sing-box 出站并写入下方 outbounds.json。支持 vmess / vless / trojan / ss / hysteria2 / tuic / anytls。</p>
       </div>
@@ -416,21 +450,26 @@
 
 <div class="toast" id="toast"></div>
 
-<script type="module">
-// Dynamic (catchable) import: a STATIC `import { exec } from "kernelsu"` aborts
-// the whole module script when the "kernelsu" module is absent (any plain
-// browser / preview), which would silently kill every tab click handler below.
-// With this preview guard the page stays fully navigable everywhere; only the
-// privileged (root) actions are unavailable outside the KernelSU WebUI.
-let exec;
-try {
-  ({ exec } = await import("kernelsu"));
-} catch (e) {
-  exec = async () => { throw new Error("此操作仅在 KernelSU 管理器 / KsuWebUI 内可用"); };
-}
-
+<script>
 const DATA_DIR = "/data/adb/singbox_tun_Magic";
 const CTL = DATA_DIR + "/magicctl";
+let execBridgePromise;
+
+function setLoadError(message) {
+  const dot = document.getElementById("brand-dot");
+  const sub = document.getElementById("sub-line");
+  if (dot) dot.className = "brand-dot off";
+  if (sub) sub.textContent = message;
+}
+
+window.addEventListener("error", e => {
+  setLoadError("WebUI 脚本错误: " + (e.message || "unknown"));
+});
+window.addEventListener("unhandledrejection", e => {
+  const reason = e.reason && (e.reason.message || String(e.reason));
+  setLoadError("WebUI 执行失败: " + (reason || "unknown"));
+});
+
 
 function toast(msg) {
   const el = document.getElementById("toast");
@@ -444,8 +483,122 @@ function shQuote(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
 }
 
+function normalizeExecResult(value) {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch (e) {
+      return { errno: 0, stdout: value, stderr: "" };
+    }
+    return { errno: 0, stdout: value, stderr: "" };
+  }
+  if (value && typeof value === "object") return value;
+  return { errno: 0, stdout: value == null ? "" : String(value), stderr: "" };
+}
+
+function resultFromCallbackArgs(args) {
+  if (args.length >= 3) {
+    return { errno: Number(args[0]) || 0, stdout: args[1] || "", stderr: args[2] || "" };
+  }
+  if (args.length === 2) {
+    return { errno: Number(args[0]) || 0, stdout: args[1] || "", stderr: "" };
+  }
+  return normalizeExecResult(args[0]);
+}
+
+function wrapInjectedExec(owner, fn, name) {
+  return {
+    name,
+    exec: cmd => new Promise((resolve, reject) => {
+      const callbackName = "__sbmagic_exec_" + Date.now() + "_" + Math.random().toString(16).slice(2);
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { delete window[callbackName]; } catch (e) { window[callbackName] = undefined; }
+        reject(new Error(name + " timed out"));
+      }, 120000);
+
+      function settle(value) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { delete window[callbackName]; } catch (e) { window[callbackName] = undefined; }
+        resolve(normalizeExecResult(value));
+      }
+
+      window[callbackName] = function() {
+        settle(resultFromCallbackArgs(Array.prototype.slice.call(arguments)));
+      };
+
+      try {
+        const ret = fn.call(owner, cmd, callbackName);
+        if (ret !== undefined && ret !== null) settle(ret);
+      } catch (e) {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          try { delete window[callbackName]; } catch (cleanupError) { window[callbackName] = undefined; }
+          reject(e);
+        }
+      }
+    }),
+  };
+}
+
+function findInjectedExec() {
+  const candidates = [
+    ["ksu.exec", window.ksu],
+    ["KernelSU.exec", window.KernelSU],
+    ["kernelSU.exec", window.kernelSU],
+    ["KsuWebUI.exec", window.KsuWebUI],
+    ["Android.exec", window.Android],
+  ];
+  for (const item of candidates) {
+    const owner = item[1];
+    if (owner && typeof owner.exec === "function") {
+      return wrapInjectedExec(owner, owner.exec, item[0]);
+    }
+  }
+  return null;
+}
+
+async function loadExecBridge() {
+  const injected = findInjectedExec();
+  if (injected) return injected;
+
+  let importError = "";
+  try {
+    const mod = await import("kernelsu");
+    if (mod && typeof mod.exec === "function") {
+      return { name: "kernelsu", exec: mod.exec };
+    }
+    importError = "kernelsu.exec missing";
+  } catch (e) {
+    importError = e && e.message ? e.message : String(e);
+  }
+
+  const lateInjected = findInjectedExec();
+  if (lateInjected) return lateInjected;
+
+  const globals = Object.keys(window).filter(k => /ksu|kernel/i.test(k)).slice(0, 8).join(", ") || "none";
+  throw new Error("KernelSU WebUI 桥接不可用; import=" + importError + "; globals=" + globals);
+}
+
+async function getExecBridge() {
+  if (!execBridgePromise) execBridgePromise = loadExecBridge();
+  try {
+    return await execBridgePromise;
+  } catch (e) {
+    execBridgePromise = null;
+    throw e;
+  }
+}
+
 async function run(cmd) {
-  const result = await exec(cmd);
+  const bridge = await getExecBridge();
+  const result = normalizeExecResult(await bridge.exec(cmd));
   const out = (result && (result.stdout ?? result.errOutput ?? result)) || "";
   const errno = result && typeof result.errno === "number" ? result.errno : 0;
   if (errno !== 0) {
@@ -465,13 +618,28 @@ async function ctlWithStdin(stdinText, ...args) {
   return run(cmd);
 }
 
+function jsonApiBody(body) {
+  return JSON.stringify(body || {}).replace(/[\u007f-\uffff]/g, ch =>
+    "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+
+async function apiRequest(method, path, body) {
+  const args = ["api", method, path];
+  if (body !== undefined) args.push(jsonApiBody(body));
+  return ctl(...args);
+}
+
 async function apiGetJson(path) {
-  const raw = await ctl("api", "GET", path);
+  const raw = await apiRequest("GET", path);
   return raw ? JSON.parse(raw) : {};
 }
 
 async function apiPost(path) {
-  await ctl("api", "POST", path);
+  await apiRequest("POST", path);
+}
+
+async function apiPutJson(path, body) {
+  await apiRequest("PUT", path, body);
 }
 
 function switchTab(name) {
@@ -481,6 +649,9 @@ function switchTab(name) {
   if (name === "perapp") {
     loadPerApp();
     ensureAppListLoaded();
+  }
+  if (name === "outbounds") {
+    loadNodeSelectors();
   }
 }
 document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
@@ -603,6 +774,127 @@ document.getElementById("btn-flush-dns").addEventListener("click", () => flushCa
 document.getElementById("btn-flush-fakeip").addEventListener("click", () => flushCache("/cache/fakeip/flush", "fake-ip 缓存"));
 
 // ---------- 节点 ----------
+const nodeSelectState = { proxies: {}, selectors: [] };
+
+function nodeSelectStatus(msg, warn) {
+  const el = document.getElementById("node-select-status");
+  el.textContent = msg || "";
+  el.className = "field-hint" + (warn ? " warn" : "");
+}
+
+function setNodeSelectEnabled(enabled) {
+  document.getElementById("node-selector-name").disabled = !enabled;
+  document.getElementById("node-target").disabled = !enabled;
+  document.getElementById("btn-node-switch").disabled = !enabled;
+}
+
+function setSelectOptions(selectEl, values, emptyLabel) {
+  selectEl.innerHTML = "";
+  if (!values.length && emptyLabel) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = emptyLabel;
+    selectEl.appendChild(option);
+    return;
+  }
+  values.forEach(value => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    selectEl.appendChild(option);
+  });
+}
+
+function resetNodeSelectUi(message, warn) {
+  setSelectOptions(document.getElementById("node-selector-name"), [], "无可用选择器");
+  setSelectOptions(document.getElementById("node-target"), [], "无可用节点");
+  document.getElementById("node-current").textContent = "-";
+  setNodeSelectEnabled(false);
+  nodeSelectStatus(message, warn);
+}
+
+function normalizeProxies(data) {
+  if (data && data.proxies && typeof data.proxies === "object") return data.proxies;
+  return data && typeof data === "object" ? data : {};
+}
+
+function isRuntimeSelector(name, info) {
+  const type = String(info && info.type || "").toLowerCase();
+  return name !== "GLOBAL" && Array.isArray(info && info.all) && type.includes("selector");
+}
+
+function selectorSort(a, b) {
+  if (a === "proxy") return -1;
+  if (b === "proxy") return 1;
+  return a.localeCompare(b, "zh-Hans-CN");
+}
+
+function renderNodeSelector(preferredSelector) {
+  const selectorEl = document.getElementById("node-selector-name");
+  const targetEl = document.getElementById("node-target");
+  const selectors = nodeSelectState.selectors;
+  if (!selectors.length) {
+    resetNodeSelectUi("没有可切换的选择器。导入节点后点“应用并重启”再加载。", true);
+    return;
+  }
+
+  setSelectOptions(selectorEl, selectors, "");
+  const selectedSelector = selectors.includes(preferredSelector) ? preferredSelector :
+    (selectors.includes(selectorEl.value) ? selectorEl.value : selectors[0]);
+  selectorEl.value = selectedSelector;
+
+  const info = nodeSelectState.proxies[selectedSelector] || {};
+  const targets = Array.from(new Set([...(info.all || []), info.now].filter(Boolean)));
+  setSelectOptions(targetEl, targets, "无可用节点");
+  if (info.now && targets.includes(info.now)) targetEl.value = info.now;
+
+  document.getElementById("node-current").textContent = info.now || "-";
+  setNodeSelectEnabled(targets.length > 0);
+}
+
+async function loadNodeSelectors(preferredSelector) {
+  nodeSelectStatus("正在加载...");
+  setNodeSelectEnabled(false);
+  try {
+    const proxies = normalizeProxies(await apiGetJson("/proxies"));
+    nodeSelectState.proxies = proxies;
+    nodeSelectState.selectors = Object.keys(proxies).filter(name => isRuntimeSelector(name, proxies[name])).sort(selectorSort);
+    renderNodeSelector(preferredSelector || "proxy");
+    if (nodeSelectState.selectors.length) nodeSelectStatus("已加载");
+  } catch (e) {
+    resetNodeSelectUi("无法读取 Clash API:" + e.message, true);
+  }
+}
+
+async function switchNode() {
+  const selector = document.getElementById("node-selector-name").value;
+  const target = document.getElementById("node-target").value;
+  if (!selector || !target) {
+    nodeSelectStatus("请选择选择器和节点", true);
+    return;
+  }
+  const btn = document.getElementById("btn-node-switch");
+  btn.disabled = true;
+  nodeSelectStatus("正在切换...");
+  try {
+    await apiPutJson("/proxies/" + encodeURIComponent(selector), { name: target });
+    toast("已切换到 " + target);
+    await loadNodeSelectors(selector);
+  } catch (e) {
+    nodeSelectStatus("切换失败:" + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("node-selector-name").addEventListener("change", () => {
+  renderNodeSelector(document.getElementById("node-selector-name").value);
+  nodeSelectStatus("");
+});
+document.getElementById("btn-node-load").addEventListener("click", () => loadNodeSelectors());
+document.getElementById("btn-node-switch").addEventListener("click", switchNode);
+resetNodeSelectUi("点击“加载当前节点”读取运行状态", false);
+
 async function loadOutbounds() {
   try {
     document.getElementById("outbounds-text").value = await ctl("config", "get", "outbounds");

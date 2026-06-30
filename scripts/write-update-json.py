@@ -23,7 +23,7 @@ def read_module_prop() -> dict[str, str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Write Magisk-compatible update.json.")
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", "XUANJI233/singbox_tun_Magic"))
-    parser.add_argument("--zip-name", default="星盘.zip")
+    parser.add_argument("--zip-name", default="SingBox_Tun_Magic_arm64-v8a.zip")
     parser.add_argument("--out", default=str(ROOT / "dist" / "update.json"))
     args = parser.parse_args()
 
@@ -45,3 +45,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -81,6 +81,7 @@ load_settings() {
   fi
   set_process_binary_path
   validate_interface_name
+  validate_settings
 }
 
 set_process_binary_path() {
@@ -99,6 +100,59 @@ validate_interface_name() {
       ;;
   esac
   [ "${#SBMAGIC_INTERFACE}" -le 15 ] || die "invalid SBMAGIC_INTERFACE: Linux interface names must be 15 bytes or shorter"
+}
+
+validate_one_of() {
+  value="$1"
+  name="$2"
+  shift 2
+  for allowed in "$@"; do
+    [ "$value" = "$allowed" ] && return 0
+  done
+  die "invalid $name '$value': use one of: $*"
+}
+
+validate_uint_range() {
+  value="$1"
+  name="$2"
+  min="$3"
+  max="$4"
+  case "$value" in
+    ''|*[!0-9]*) die "invalid $name '$value': use an integer from $min to $max" ;;
+  esac
+  [ "$value" -ge "$min" ] && [ "$value" -le "$max" ] || die "invalid $name '$value': use an integer from $min to $max"
+}
+
+validate_dns_server_literal() {
+  value="$1"
+  name="$2"
+  case "$value" in
+    ''|*://*|*/*|*[!0-9A-Fa-f:.]*)
+      die "invalid $name '$value': use an IP literal, not a hostname or URL"
+      ;;
+  esac
+}
+
+validate_settings() {
+  json_bool "$SBMAGIC_ENABLED" >/dev/null
+  json_bool "$SBMAGIC_WATCHDOG" >/dev/null
+  json_bool "$SBMAGIC_IPV6" >/dev/null
+  json_bool "$SBMAGIC_AUTO_ROUTE" >/dev/null
+  json_bool "$SBMAGIC_STRICT_ROUTE" >/dev/null
+  json_bool "$SBMAGIC_API_FIREWALL" >/dev/null
+
+  validate_uint_range "$SBMAGIC_WATCHDOG_INTERVAL" SBMAGIC_WATCHDOG_INTERVAL 60 86400
+  validate_uint_range "$SBMAGIC_MTU" SBMAGIC_MTU 1200 9000
+  validate_one_of "$SBMAGIC_STACK" SBMAGIC_STACK gvisor system mixed
+  validate_one_of "$SBMAGIC_PACKAGE_MODE" SBMAGIC_PACKAGE_MODE black white
+  validate_one_of "$SBMAGIC_DNS_MODE" SBMAGIC_DNS_MODE real-ip fake-ip
+  validate_one_of "$SBMAGIC_DNS_STRATEGY" SBMAGIC_DNS_STRATEGY ipv4_only prefer_ipv4 prefer_ipv6 ipv6_only
+  validate_one_of "$SBMAGIC_DNS_LOCAL_TYPE" SBMAGIC_DNS_LOCAL_TYPE https tls quic h3 udp tcp
+  validate_one_of "$SBMAGIC_DNS_REMOTE_TYPE" SBMAGIC_DNS_REMOTE_TYPE https tls quic h3 udp tcp
+  validate_one_of "$SBMAGIC_DNS_FINAL" SBMAGIC_DNS_FINAL remote local
+  validate_one_of "$SBMAGIC_API_MODE" SBMAGIC_API_MODE Rule Global Direct
+  validate_dns_server_literal "$SBMAGIC_DNS_LOCAL_SERVER" SBMAGIC_DNS_LOCAL_SERVER
+  validate_dns_server_literal "$SBMAGIC_DNS_REMOTE_SERVER" SBMAGIC_DNS_REMOTE_SERVER
 }
 
 cleanup_stale_process_binaries() {
@@ -270,6 +324,7 @@ ensure_api_env() {
       fi
       ;;
     *)
+      valid_port "$configured_port" || die "invalid SBMAGIC_API_PORT '$configured_port': use auto or a port from 1 to 65535"
       SBMAGIC_API_PORT="$configured_port"
       ;;
   esac
@@ -566,6 +621,23 @@ EOF
 check_config() {
   render_config >/dev/null || return 1
   "$SING_BOX" check -D "$DATA_DIR" -c "$CONFIG_FILE"
+}
+
+check_config_scratch() {
+  old_config_file="$CONFIG_FILE"
+  CONFIG_FILE="$RUNTIME_DIR/config.check.$$"
+  rm -f "$CONFIG_FILE" "$CONFIG_FILE.tmp.$$"
+  render_config >/dev/null || {
+    rc=$?
+    rm -f "$CONFIG_FILE" "$CONFIG_FILE.tmp.$$"
+    CONFIG_FILE="$old_config_file"
+    return "$rc"
+  }
+  "$SING_BOX" check -D "$DATA_DIR" -c "$CONFIG_FILE"
+  rc=$?
+  rm -f "$CONFIG_FILE" "$CONFIG_FILE.tmp.$$"
+  CONFIG_FILE="$old_config_file"
+  return "$rc"
 }
 
 # mkdir is atomic, so it doubles as a portable mutex (no flock on Android).
@@ -979,7 +1051,7 @@ config_set() {
   cp -f "$file" "$file.bak" 2>/dev/null
   mv -f "$tmp" "$file"
   chmod 600 "$file"
-  if [ "$key" = "outbounds" ] && ! ( check_config ) >/dev/null 2>&1; then
+  if config_requires_check "$key" && ! ( check_config_scratch ) >/dev/null 2>&1; then
     mv -f "$file.bak" "$file" 2>/dev/null
     chmod 600 "$file" 2>/dev/null
     die "rendered config check failed for $key; restored previous file"
@@ -988,6 +1060,13 @@ config_set() {
   trap - EXIT INT TERM HUP
   release_config_lock
   echo "ok"
+}
+
+config_requires_check() {
+  case "$1" in
+    settings|outbounds|exclude|include|dns-direct) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Swap a config file with its .bak side by side, so calling this twice in
