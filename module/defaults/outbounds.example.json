@@ -1,0 +1,44 @@
+[
+  {
+    "type": "selector",
+    "tag": "proxy",
+    "outbounds": [
+      "auto",
+      "my-node",
+      "direct"
+    ]
+  },
+  {
+    "type": "urltest",
+    "tag": "auto",
+    "outbounds": [
+      "my-node"
+    ],
+    "url": "https://www.gstatic.com/generate_204",
+    "interval": "10m",
+    "tolerance": 50
+  },
+  {
+    "type": "vless",
+    "tag": "my-node",
+    "server": "example.com",
+    "server_port": 443,
+    "uuid": "00000000-0000-0000-0000-000000000000",
+    "tls": {
+      "enabled": true,
+      "server_name": "example.com",
+      "utls": {
+        "enabled": true,
+        "fingerprint": "chrome"
+      }
+    },
+    "transport": {
+      "type": "grpc",
+      "service_name": "grpc"
+    }
+  },
+  {
+    "type": "direct",
+    "tag": "direct"
+  }
+]

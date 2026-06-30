@@ -1,0 +1,34 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 10808
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_cidr": [
+          "198.18.0.10/32"
+        ],
+        "action": "route",
+        "outbound": "direct",
+        "override_address": "10.0.2.2"
+      }
+    ],
+    "final": "direct",
+    "auto_detect_interface": false
+  }
+}

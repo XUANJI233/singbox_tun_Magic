@@ -1,0 +1,40 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun_sb0",
+      "address": [
+        "172.18.0.1/30"
+      ],
+      "mtu": 1500,
+      "auto_route": false,
+      "strict_route": false,
+      "stack": "gvisor"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_cidr": [
+          "198.18.0.10/32"
+        ],
+        "action": "route",
+        "outbound": "direct",
+        "override_address": "10.0.2.2"
+      }
+    ],
+    "final": "direct",
+    "auto_detect_interface": false
+  }
+}

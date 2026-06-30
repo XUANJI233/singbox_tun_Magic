@@ -1,0 +1,7 @@
+/dist/
+/.tmp/
+/build/
+/legacy/
+/bench/bin/
+/module/bin/*/magic-fetch
+/module/bin/applist.dex

@@ -1,0 +1,63 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: sdkmanager "build-tools;35.0.0" "ndk;27.0.12077973"
+
+      - name: Build helper binaries
+        run: bash scripts/build-helpers.sh
+
+      - name: Package module
+        run: python3 scripts/package-module.py --output "dist/星盘.zip"
+
+      - name: Write update.json
+        run: python3 scripts/write-update-json.py --repository "${{ github.repository }}" --zip-name "星盘.zip" --out "dist/update.json"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: singbox_tun_Magic
+          path: |
+            dist/星盘.zip
+            dist/update.json
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 星盘 ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/星盘.zip
+            dist/update.json

@@ -1,0 +1,6 @@
+# Add proxy server domains here to avoid DNS bootstrap loops.
+# Only hostnames belong here -- this renders into a sing-box "domain" DNS
+# rule, which never matches a literal IP.
+connectivitycheck.gstatic.com
+clients3.google.com
+dns.alidns.com

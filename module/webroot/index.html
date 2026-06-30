@@ -1,0 +1,1299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>星盘</title>
+<style>
+  :root {
+    --bg: #0c0e13; --bg-elev: #12151c; --panel: #171b24; --panel-2: #1d212c;
+    --border: #262b37; --border-soft: #1f2430;
+    --text: #e8eaef; --muted: #8b93a3; --faint: #5d6573;
+    --accent: #5b8cff; --accent-soft: rgba(91,140,255,.14);
+    --ok: #36d399; --ok-soft: rgba(54,211,153,.14);
+    --bad: #ff6b6b; --bad-soft: rgba(255,107,107,.14);
+    --warn: #f5b94f; --warn-soft: rgba(245,185,79,.14);
+    --radius: 14px; --radius-sm: 9px;
+    --shadow: 0 1px 0 rgba(255,255,255,.02) inset, 0 8px 24px -12px rgba(0,0,0,.5);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.5; padding-bottom: 48px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  header {
+    position: sticky; top: 0; z-index: 6;
+    background: rgba(18,21,28,.92); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border-soft);
+    padding: 14px 18px 10px;
+  }
+  .header-row { display: flex; align-items: center; gap: 10px; }
+  .brand { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+  .brand-dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none;
+    box-shadow: 0 0 0 3px transparent; transition: box-shadow .2s, background .2s;
+  }
+  .brand-dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
+  .brand-dot.off { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-soft); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge {
+    padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 500;
+    border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+  }
+  .badge.ok { color: var(--ok); border-color: rgba(54,211,153,.35); background: var(--ok-soft); }
+  .badge.bad { color: var(--bad); border-color: rgba(255,107,107,.35); background: var(--bad-soft); }
+  .badge.warn { color: var(--warn); border-color: rgba(245,185,79,.35); background: var(--warn-soft); }
+
+  nav {
+    display: flex; gap: 4px; padding: 10px 14px 0; overflow-x: auto;
+    scrollbar-width: none;
+  }
+  nav::-webkit-scrollbar { display: none; }
+  nav button {
+    background: transparent; border: none; color: var(--muted);
+    padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 500;
+    white-space: nowrap; position: relative;
+  }
+  nav button.active { color: var(--text); background: var(--panel-2); }
+
+  main { padding: 14px 16px 0; max-width: 780px; margin: 0 auto; }
+  section { display: none; }
+  section.active { display: block; animation: fade .15s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+
+  .card {
+    background: linear-gradient(180deg, var(--panel), var(--bg-elev));
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px; margin-bottom: 14px; box-shadow: var(--shadow);
+  }
+  .card-head { margin-bottom: 12px; }
+  .card-head h2 { font-size: 14.5px; margin: 0 0 3px; font-weight: 650; color: var(--text); }
+  .card-head p { margin: 0; color: var(--muted); font-size: 12px; }
+  .card + .card-group-label { margin-top: 18px; }
+
+  .group-title {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--faint); font-weight: 650; margin: 22px 2px 8px;
+  }
+  .group-title:first-child { margin-top: 2px; }
+
+  .field-row {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--border-soft);
+  }
+  .field-row:last-child { border-bottom: none; }
+  .field-main { flex: 1; min-width: 0; }
+  .field-main label { display: block; font-size: 13px; color: var(--text); font-weight: 500; }
+  .field-hint { color: var(--muted); font-size: 11.5px; margin-top: 3px; line-height: 1.45; }
+  .field-hint.warn { color: var(--warn); }
+  .field-control { flex: none; padding-top: 1px; }
+
+  input[type=text], input[type=number], select, textarea {
+    background: #0a0c11; border: 1px solid var(--border); color: var(--text);
+    border-radius: var(--radius-sm); padding: 7px 10px; font-size: 13px;
+    font-family: inherit; outline: none; transition: border-color .15s;
+  }
+  input[type=text]:focus, input[type=number]:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  input[type=text], input[type=number], select { width: 190px; }
+  textarea { width: 100%; min-height: 170px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; resize: vertical; }
+  textarea.log { min-height: 340px; white-space: pre; }
+
+  .btn {
+    background: var(--accent); color: #fff; border: none; border-radius: var(--radius-sm);
+    padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+    transition: filter .12s, transform .05s;
+  }
+  .btn:active { transform: scale(.97); }
+  .btn:hover { filter: brightness(1.08); }
+  .btn.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+  .btn.danger { background: var(--bad); }
+  .btn.sm { padding: 6px 12px; font-size: 12px; }
+  .btn:disabled { opacity: .45; cursor: default; }
+
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .actions.split { justify-content: space-between; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .grid2 .col-title { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+
+  .kv-list { display: flex; flex-direction: column; }
+  .kv { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border-soft); font-size: 13px; }
+  .kv:last-child { border-bottom: none; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-weight: 500; text-align: right; }
+  .kv .v.mono { font-family: ui-monospace, monospace; font-size: 12px; }
+
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .stat-box { background: var(--panel-2); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .stat-box .label { color: var(--muted); font-size: 11px; }
+  .stat-box .value { font-size: 17px; font-weight: 650; margin-top: 2px; }
+
+  .pkglist { max-height: 440px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px; margin-top: 8px; background: #0a0c11; }
+  .pkglist .app-row { padding: 8px 9px; cursor: pointer; border-radius: 6px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid transparent; min-height: 54px; }
+  .pkglist .app-row:hover { background: var(--accent-soft); }
+  .pkglist .app-row.new { border-color: rgba(54,211,153,.35); background: rgba(54,211,153,.08); }
+  .pkglist .app-row.selected { border-color: rgba(91,140,255,.45); background: rgba(91,140,255,.12); }
+  .pkglist .app-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .pkglist .app-title { display: flex; gap: 6px; align-items: center; min-width: 0; }
+  .pkglist .app-label { font-size: 13px; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pkglist .app-pkg { font-size: 11px; color: var(--faint); font-family: ui-monospace, monospace; }
+  .pkglist .app-badge { flex: none; font-size: 10px; color: var(--ok); border: 1px solid rgba(54,211,153,.35); border-radius: 999px; padding: 0 5px; line-height: 16px; }
+  .pkglist .app-action { flex: none; font-size: 11.5px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; white-space: nowrap; }
+  .pkglist .app-row.selected .app-action { color: var(--accent); border-color: rgba(91,140,255,.45); }
+  .pkglist .app-empty { padding: 10px; color: var(--muted); font-size: 12px; cursor: default; }
+  .pkg-tools { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .pkg-tools #pkg-filter { flex: 1; width: auto; }
+  .pkg-tools #pkg-scope-filter { width: 108px; }
+  .pkg-scope { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .pkg-count { color: var(--muted); font-size: 11.5px; margin-top: 6px; }
+  details.card > summary { cursor: pointer; color: var(--text); font-weight: 650; list-style-position: inside; }
+  details.card[open] > summary { margin-bottom: 12px; }
+
+  .toast {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%) translateY(6px);
+    background: #20242f; color: var(--text); border: 1px solid var(--border);
+    padding: 10px 16px; border-radius: 999px; font-size: 13px; opacity: 0;
+    transition: opacity .2s, transform .2s; pointer-events: none; max-width: 90%;
+    box-shadow: 0 10px 30px -10px rgba(0,0,0,.6);
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  @media (max-width: 480px) {
+    input[type=text], input[type=number], select { width: 100%; }
+    .field-row { flex-direction: column; }
+    .field-control { width: 100%; }
+    .field-control select, .field-control input { width: 100%; }
+    .grid2 { grid-template-columns: 1fr; }
+    .stat-grid { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-row">
+    <div class="brand">
+      <span class="brand-dot" id="brand-dot"></span>
+      <div>
+        <h1>星盘</h1>
+        <div class="sub" id="sub-line">正在加载状态...</div>
+      </div>
+    </div>
+  </div>
+  <nav style="padding-left:0;padding-right:0;margin-top:10px">
+    <button data-tab="status" class="active">状态</button>
+    <button data-tab="outbounds">节点</button>
+    <button data-tab="perapp">应用</button>
+    <button data-tab="settings">设置</button>
+    <button data-tab="logs">日志</button>
+  </nav>
+</header>
+
+<main>
+
+  <!-- ===================== 状态 ===================== -->
+  <section id="tab-status" class="active">
+
+    <div class="card">
+      <div class="card-head">
+        <h2>运行概览</h2>
+        <p>模块、进程、控制面的基本信息</p>
+      </div>
+      <div class="kv-list" id="status-kv"></div>
+      <div class="actions">
+        <button class="btn" id="btn-restart">应用并重启</button>
+        <button class="btn secondary" id="btn-start">启动</button>
+        <button class="btn secondary" id="btn-stop">停止</button>
+        <button class="btn ghost" id="btn-ruleset-refresh">更新规则集</button>
+        <button class="btn ghost" id="btn-refresh">刷新</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>实时流量</h2>
+        <p>来自 sing-box 本机 clash API,仅统计当前活跃连接</p>
+      </div>
+      <div class="stat-grid">
+        <div class="stat-box"><div class="label">上行</div><div class="value" id="traffic-up">-</div></div>
+        <div class="stat-box"><div class="label">下行</div><div class="value" id="traffic-down">-</div></div>
+        <div class="stat-box"><div class="label">活跃连接</div><div class="value" id="conn-count">-</div></div>
+      </div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn ghost sm" id="btn-flush-dns">清空 DNS 缓存</button>
+        <button class="btn ghost sm" id="btn-flush-fakeip">清空 fake-ip 缓存</button>
+      </div>
+      <div class="field-hint" style="margin-top:6px">改了分流规则后清缓存可让新查询立即按新规则走;但新增 DNS/出站节点仍需“应用并重启”。</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>故障恢复</h2>
+        <p>看门狗会在进程存活满一个轮询周期后,把当前配置标记为"上次可用"。连续崩溃会自动尝试回退,这里也可以手动触发。</p>
+      </div>
+      <div class="kv-list" id="recovery-kv"></div>
+      <div class="actions">
+        <button class="btn secondary" id="btn-rollback">立即回退到上次可用配置</button>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ===================== 节点 ===================== -->
+  <section id="tab-outbounds">
+    <div class="card">
+      <div class="card-head">
+        <h2>导入节点</h2>
+        <p>兼容分享链接、base64 订阅正文、sing-box JSON/outbounds 导出,支持 UTF-8 中文/emoji 节点名,自动转换成 sing-box 出站并写入下方 outbounds.json。支持 vmess / vless / trojan / ss / hysteria2 / tuic / anytls。</p>
+      </div>
+      <textarea id="import-text" spellcheck="false" placeholder="粘贴分享链接(可多行)、base64 订阅正文、sing-box JSON/outbounds;或粘贴单个订阅链接(http/https),用右侧“拉取订阅”导入"></textarea>
+      <div class="field-row">
+        <div class="field-main">
+          <label>写入方式</label>
+          <div class="field-hint">替换:用导入结果整体替换节点列表;追加:保留已有节点,再并入新节点(同名自动改名)。</div>
+        </div>
+        <div class="field-control">
+          <select id="import-mode">
+            <option value="replace">替换</option>
+            <option value="append">追加</option>
+          </select>
+        </div>
+      </div>
+      <div class="actions split">
+        <div class="actions">
+          <span class="field-hint" id="import-status"></span>
+        </div>
+        <div class="actions">
+          <button class="btn secondary" id="btn-import-links">解析分享链接</button>
+          <button class="btn" id="btn-import-sub">拉取订阅并导入</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>outbounds.json</h2>
+        <p>出站节点配置(协议、传输层、TLS、多节点选优等)。保存前会先做本地 JSON 格式校验。</p>
+      </div>
+      <textarea id="outbounds-text" spellcheck="false"></textarea>
+      <div class="actions split">
+        <div class="actions">
+          <button class="btn secondary sm" id="btn-outbounds-load">重新加载</button>
+          <button class="btn ghost sm" id="btn-outbounds-undo">撤销上次保存</button>
+        </div>
+        <div class="actions">
+          <button class="btn secondary" id="btn-outbounds-save">保存</button>
+          <button class="btn" id="btn-outbounds-check">保存并校验配置</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 应用 ===================== -->
+  <section id="tab-perapp">
+    <div class="card">
+      <div class="card-head">
+        <h2>per-app 名单</h2>
+        <p>决定哪些应用的流量进入 sing-box;未列入代理范围的应用完全不经过 tun,数据和 DNS 都走系统默认网络。</p>
+      </div>
+      <div class="field-row">
+        <div class="field-main">
+          <label>模式</label>
+          <div class="field-hint">黑名单装上就大多数应用可用;白名单代理流量最小,长期常驻更省电。</div>
+        </div>
+        <div class="field-control">
+          <select id="package-mode">
+            <option value="black">黑名单(默认全代理)</option>
+            <option value="white">白名单(默认全直连)</option>
+          </select>
+        </div>
+      </div>
+      <div class="actions split">
+        <div class="actions">
+          <button class="btn secondary sm" id="btn-pkg-load">重新加载</button>
+          <button class="btn ghost sm" id="btn-pkg-undo">撤销上次保存</button>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btn-pkg-save">保存名单</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>应用选择器</h2>
+        <p id="pkg-picker-hint">正在同步应用列表。</p>
+      </div>
+      <div class="pkg-tools" id="pkg-tools">
+        <input type="text" id="pkg-filter" placeholder="搜索应用名 / 包名" autocomplete="off" />
+        <select id="pkg-scope-filter">
+          <option value="all">全部应用</option>
+          <option value="user">用户应用</option>
+          <option value="system">系统应用</option>
+        </select>
+        <button class="btn secondary sm" id="btn-pkg-list">同步应用列表</button>
+      </div>
+      <div class="pkg-count" id="pkg-selection-count">已选择 0 个</div>
+      <div id="pkg-installed" class="pkglist"><div class="app-empty">正在同步应用列表…</div></div>
+    </div>
+
+    <details class="card">
+      <summary>高级:编辑包名文件</summary>
+      <div class="grid2">
+        <div>
+          <div class="col-title">黑名单例外(exclude,直连)</div>
+          <textarea id="exclude-text" spellcheck="false" placeholder="一行一个包名"></textarea>
+        </div>
+        <div>
+          <div class="col-title">白名单成员(include,代理)</div>
+          <textarea id="include-text" spellcheck="false" placeholder="一行一个包名"></textarea>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <!-- ===================== 设置 ===================== -->
+  <section id="tab-settings">
+
+    <div class="card">
+      <div class="card-head">
+        <h2>核心设置</h2>
+        <p>对应 <code>settings.env</code>,改完点底部"保存设置",再回状态页点"应用并重启"生效。</p>
+      </div>
+      <div class="actions">
+        <button class="btn secondary sm" id="btn-settings-load">重新加载</button>
+        <button class="btn ghost sm" id="btn-settings-undo">撤销上次保存</button>
+        <button class="btn" id="btn-settings-save">保存设置</button>
+      </div>
+    </div>
+
+    <div class="group-title">基础</div>
+    <div class="card" id="group-basic"></div>
+
+    <div class="group-title">网络与 TUN</div>
+    <div class="card" id="group-network"></div>
+
+    <div class="group-title">DNS</div>
+    <div class="card" id="group-dns"></div>
+
+    <div class="group-title">本机控制面</div>
+    <div class="card" id="group-api"></div>
+
+    <div class="group-title">维护</div>
+    <div class="card" id="group-maint"></div>
+
+  </section>
+
+  <!-- ===================== 日志 ===================== -->
+  <section id="tab-logs">
+    <div class="card">
+      <div class="card-head">
+        <h2>日志</h2>
+        <p>排查问题先看 sing-box 自身日志,模块控制相关的事件(启停/回退/看门狗)在"控制日志"里。</p>
+      </div>
+      <div class="field-row" style="border-bottom:none;padding-top:0">
+        <div class="field-control" style="flex:1">
+          <select id="log-source" style="width:100%">
+            <option value="box">sing-box (box.log)</option>
+            <option value="run">运行输出 (run)</option>
+            <option value="control">控制日志 (control)</option>
+          </select>
+        </div>
+        <div class="field-control">
+          <button class="btn secondary" id="btn-logs-load">加载</button>
+        </div>
+      </div>
+      <textarea class="log" id="log-text" readonly spellcheck="false"></textarea>
+    </div>
+  </section>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script type="module">
+// Dynamic (catchable) import: a STATIC `import { exec } from "kernelsu"` aborts
+// the whole module script when the "kernelsu" module is absent (any plain
+// browser / preview), which would silently kill every tab click handler below.
+// With this preview guard the page stays fully navigable everywhere; only the
+// privileged (root) actions are unavailable outside the KernelSU WebUI.
+let exec;
+try {
+  ({ exec } = await import("kernelsu"));
+} catch (e) {
+  exec = async () => { throw new Error("此操作仅在 KernelSU 管理器 / KsuWebUI 内可用"); };
+}
+
+const DATA_DIR = "/data/adb/singbox_tun_Magic";
+const CTL = DATA_DIR + "/magicctl";
+
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove("show"), 2400);
+}
+
+function shQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+async function run(cmd) {
+  const result = await exec(cmd);
+  const out = (result && (result.stdout ?? result.errOutput ?? result)) || "";
+  const errno = result && typeof result.errno === "number" ? result.errno : 0;
+  if (errno !== 0) {
+    const err = (result && result.stderr) || "";
+    throw new Error("command failed (" + errno + "): " + (err || out).trim());
+  }
+  return String(out);
+}
+
+async function ctl(...args) {
+  const cmd = [CTL, ...args.map(shQuote)].join(" ");
+  return run(cmd);
+}
+
+async function ctlWithStdin(stdinText, ...args) {
+  const cmd = [CTL, ...args.map(shQuote)].join(" ") + " <<'SBMAGIC_EOF'\n" + stdinText.replace(/\r\n/g, "\n") + "\nSBMAGIC_EOF";
+  return run(cmd);
+}
+
+async function apiGetJson(path) {
+  const raw = await ctl("api", "GET", path);
+  return raw ? JSON.parse(raw) : {};
+}
+
+async function apiPost(path) {
+  await ctl("api", "POST", path);
+}
+
+function switchTab(name) {
+  document.querySelectorAll("section").forEach(s => s.classList.toggle("active", s.id === "tab-" + name));
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  if (name === "status") refreshStatus();
+  if (name === "perapp") {
+    loadPerApp();
+    ensureAppListLoaded();
+  }
+}
+document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
+
+function parseKv(text) {
+  const out = {};
+  text.split("\n").forEach(line => {
+    const i = line.indexOf("=");
+    if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  });
+  return out;
+}
+
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(1) + " " + u[i];
+}
+
+const KV_LABELS = {
+  enabled: "启用", running: "运行中", pid: "进程 PID", data_dir: "数据目录",
+  config: "运行配置", process_name: "进程名", tun_interface: "TUN 接口名", api: "控制面地址",
+  mode: "Clash 模式", package_mode: "per-app 模式", dns_mode: "DNS 模式", ipv6: "IPv6",
+};
+
+// ---------- 状态 / 故障恢复 ----------
+async function refreshStatus() {
+  try {
+    const raw = await ctl("status");
+    const kv = parseKv(raw);
+    const running = kv.running === "true";
+    const enabled = kv.enabled === "true";
+
+    document.getElementById("brand-dot").className = "brand-dot " + (running ? "on" : "off");
+    document.getElementById("sub-line").textContent =
+      (running ? "运行中" : "未运行") + " · " + (enabled ? "已启用" : "已停用") +
+      (kv.package_mode ? " · " + (kv.package_mode === "white" ? "白名单" : "黑名单") : "");
+
+    const wrap = document.getElementById("status-kv");
+    wrap.innerHTML = "";
+    ["enabled", "running", "pid", "process_name", "tun_interface", "package_mode", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
+      if (!(k in kv)) return;
+      const row = document.createElement("div");
+      row.className = "kv";
+      row.innerHTML = "<span class=\"k\">" + (KV_LABELS[k] || k) + "</span><span class=\"v\">" + kv[k] + "</span>";
+      wrap.appendChild(row);
+    });
+
+    // fake-ip cache flush only makes sense (and only succeeds) in fake-ip mode;
+    // calling it in real-ip mode returns HTTP 500 from sing-box.
+    const fakeipBtn = document.getElementById("btn-flush-fakeip");
+    if (fakeipBtn) fakeipBtn.style.display = kv.dns_mode === "fake-ip" ? "" : "none";
+
+    const rec = document.getElementById("recovery-kv");
+    rec.innerHTML = "";
+    const lastGood = kv.last_good && kv.last_good !== "none" ? kv.last_good : "暂无(尚未在一个完整轮询周期内保持存活)";
+    const failCount = kv.fail_count || "0";
+    [["上次可用配置", lastGood], ["当前连续失败次数", failCount + " / 3"]].forEach(([k, v]) => {
+      const row = document.createElement("div");
+      row.className = "kv";
+      row.innerHTML = "<span class=\"k\">" + k + "</span><span class=\"v mono\">" + v + "</span>";
+      rec.appendChild(row);
+    });
+
+    if (running) {
+      try {
+        const data = await apiGetJson("/connections");
+        const conns = data.connections || [];
+        let up = 0, down = 0;
+        conns.forEach(c => { up += c.upload || 0; down += c.download || 0; });
+        document.getElementById("conn-count").textContent = conns.length;
+        document.getElementById("traffic-up").textContent = fmtBytes(up);
+        document.getElementById("traffic-down").textContent = fmtBytes(down);
+      } catch (e) { /* clash API not reachable yet, ignore */ }
+    } else {
+      document.getElementById("conn-count").textContent = "-";
+      document.getElementById("traffic-up").textContent = "-";
+      document.getElementById("traffic-down").textContent = "-";
+    }
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+document.getElementById("btn-refresh").addEventListener("click", refreshStatus);
+document.getElementById("btn-restart").addEventListener("click", async () => {
+  toast("正在校验并应用...");
+  try { await ctl("reload"); toast("已应用并重启"); } catch (e) { toast("配置校验失败,已保持原进程运行:" + e.message); }
+  refreshStatus();
+});
+document.getElementById("btn-start").addEventListener("click", async () => {
+  try { await ctl("start"); toast("已启动"); } catch (e) { toast(e.message); }
+  refreshStatus();
+});
+document.getElementById("btn-stop").addEventListener("click", async () => {
+  try { await ctl("stop"); toast("已停止"); } catch (e) { toast(e.message); }
+  refreshStatus();
+});
+document.getElementById("btn-ruleset-refresh").addEventListener("click", async () => {
+  if (!confirm("清除规则集缓存并安全重启?这会让 geosite/geoip 规则重新下载。")) return;
+  toast("正在更新规则集...");
+  try { await ctl("ruleset-refresh"); toast("规则集已刷新并应用"); } catch (e) { toast(e.message); }
+  refreshStatus();
+});
+document.getElementById("btn-rollback").addEventListener("click", async () => {
+  if (!confirm("回退到上次确认可用的配置并重启?当前未保存到 last-good 的改动不会丢失文件,但本次运行会被覆盖。")) return;
+  toast("正在回退...");
+  try { await ctl("rollback"); toast("已回退并启动"); } catch (e) { toast(e.message); }
+  refreshStatus();
+});
+async function flushCache(path, label) {
+  try {
+    await apiPost(path);
+    toast(label + "已清空");
+  } catch (e) { toast(label + "失败:" + e.message); }
+}
+document.getElementById("btn-flush-dns").addEventListener("click", () => flushCache("/cache/dns/flush", "DNS 缓存"));
+document.getElementById("btn-flush-fakeip").addEventListener("click", () => flushCache("/cache/fakeip/flush", "fake-ip 缓存"));
+
+// ---------- 节点 ----------
+async function loadOutbounds() {
+  try {
+    document.getElementById("outbounds-text").value = await ctl("config", "get", "outbounds");
+  } catch (e) { toast(e.message); }
+}
+async function saveOutbounds(check) {
+  const text = document.getElementById("outbounds-text").value;
+  try {
+    JSON.parse(text);
+  } catch (e) {
+    toast("JSON 格式错误: " + e.message);
+    return;
+  }
+  try {
+    await ctlWithStdin(text, "config", "set", "outbounds");
+    if (check) {
+      await ctl("check");
+      toast("已保存并通过校验");
+    } else {
+      toast("已保存,记得去状态页点\"应用并重启\"生效");
+    }
+  } catch (e) { toast(e.message); }
+}
+document.getElementById("btn-outbounds-load").addEventListener("click", loadOutbounds);
+document.getElementById("btn-outbounds-save").addEventListener("click", () => saveOutbounds(false));
+document.getElementById("btn-outbounds-check").addEventListener("click", () => saveOutbounds(true));
+document.getElementById("btn-outbounds-undo").addEventListener("click", async () => {
+  try { await ctl("config", "rollback", "outbounds"); toast("已撤销"); loadOutbounds(); } catch (e) { toast(e.message); }
+});
+
+// ---------- 节点导入(v2rayN 风格分享链接 / 订阅) ----------
+function importStatus(msg) { document.getElementById("import-status").textContent = msg || ""; }
+
+function bytesToBinaryString(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return out;
+}
+
+function bytesToText(bytes) {
+  if (typeof TextDecoder !== "undefined") {
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch (e) {}
+    // UTF-8 is the standard for share links/subscriptions; gb18030 catches
+    // Non-UTF-8 Chinese exports without affecting valid UTF-8 input.
+    try { return new TextDecoder("gb18030", { fatal: true }).decode(bytes); } catch (e) {}
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+  let encoded = "";
+  for (let i = 0; i < bytes.length; i++) encoded += "%" + bytes[i].toString(16).padStart(2, "0");
+  try { return decodeURIComponent(encoded); } catch (e) { return bytesToBinaryString(bytes); }
+}
+
+function b64ToStr(s) {
+  s = String(s).trim().replace(/\s/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytesToText(bytes);
+}
+function looksBase64(s) { return /^[A-Za-z0-9+/=_\-\s]+$/.test(s) && s.replace(/\s/g, "").length > 16; }
+function qs(search) { const o = {}; new URLSearchParams(search).forEach((v, k) => { o[k] = v; }); return o; }
+function dec(v) { try { return decodeURIComponent(v); } catch (e) { return v; } }
+function tagFrom(hash, fallback) {
+  let t = hash ? dec(String(hash).replace(/^#/, "")) : "";
+  t = (t || "").trim();
+  return t || fallback;
+}
+function splitHostPort(hp) {
+  if (hp.startsWith("[")) { const e = hp.indexOf("]"); return [hp.slice(1, e), hp.slice(e + 2)]; }
+  const i = hp.lastIndexOf(":");
+  return i < 0 ? [hp, ""] : [hp.slice(0, i), hp.slice(i + 1)];
+}
+function splitAlpn(v) { return dec(v).split(",").map(s => s.trim()).filter(Boolean); }
+function truthy(v) { return v === "1" || v === "true"; }
+
+function vmessTransport(net, host, path) {
+  net = (net || "tcp").toLowerCase();
+  if (net === "ws") return { type: "ws", path: path || "/", ...(host ? { headers: { Host: host } } : {}) };
+  if (net === "grpc") return { type: "grpc", service_name: path || host || "" };
+  if (net === "h2" || net === "http") return { type: "http", ...(host ? { host: [host] } : {}), path: path || "/" };
+  return null;
+}
+function parseVmess(line) {
+  const j = JSON.parse(b64ToStr(line.slice(8)));
+  const host = j.host || "", path = j.path || "";
+  const o = {
+    type: "vmess", tag: (j.ps || "").trim() || `${j.add}:${j.port}`,
+    server: j.add, server_port: Number(j.port), uuid: j.id,
+    security: j.scy || "auto", alter_id: Number(j.aid || 0),
+  };
+  const tr = vmessTransport(j.net, host, path);
+  if (tr) o.transport = tr;
+  if (String(j.tls).toLowerCase() === "tls") {
+    o.tls = { enabled: true, server_name: j.sni || host || j.add, insecure: false };
+    if (j.alpn) o.tls.alpn = splitAlpn(j.alpn);
+    if (j.fp) o.tls.utls = { enabled: true, fingerprint: j.fp };
+  }
+  return o;
+}
+function parseVless(line) {
+  const u = new URL(line), p = qs(u.search);
+  const net = (p.type || "tcp").toLowerCase(), host = p.host || "", security = (p.security || "none").toLowerCase();
+  const o = {
+    type: "vless", tag: tagFrom(u.hash, `${u.hostname}:${u.port}`),
+    server: u.hostname, server_port: Number(u.port || 443), uuid: dec(u.username), packet_encoding: "xudp",
+  };
+  if (p.flow) o.flow = p.flow;
+  const tr = vmessTransport(net === "h2" ? "http" : net, host, p.path ? dec(p.path) : "");
+  if (net === "grpc") o.transport = { type: "grpc", service_name: p.serviceName || dec(p.path || "") };
+  else if (tr) o.transport = tr;
+  if (security === "tls") {
+    o.tls = { enabled: true, server_name: p.sni || p.peer || host || u.hostname, insecure: truthy(p.allowInsecure), utls: { enabled: true, fingerprint: p.fp || "chrome" } };
+    if (p.alpn) o.tls.alpn = splitAlpn(p.alpn);
+  } else if (security === "reality") {
+    o.tls = { enabled: true, server_name: p.sni || host || u.hostname, utls: { enabled: true, fingerprint: p.fp || "chrome" }, reality: { enabled: true, public_key: p.pbk || "", short_id: p.sid || "" } };
+  }
+  return o;
+}
+function parseTrojan(line) {
+  const u = new URL(line), p = qs(u.search);
+  const net = (p.type || "tcp").toLowerCase(), host = p.host || "";
+  const o = {
+    type: "trojan", tag: tagFrom(u.hash, `${u.hostname}:${u.port}`),
+    server: u.hostname, server_port: Number(u.port || 443), password: dec(u.username),
+    tls: { enabled: true, server_name: p.sni || host || u.hostname, insecure: truthy(p.allowInsecure) },
+  };
+  if (p.alpn) o.tls.alpn = splitAlpn(p.alpn);
+  if (p.fp) o.tls.utls = { enabled: true, fingerprint: p.fp };
+  if (net === "ws") o.transport = { type: "ws", path: p.path ? dec(p.path) : "/", ...(host ? { headers: { Host: host } } : {}) };
+  else if (net === "grpc") o.transport = { type: "grpc", service_name: p.serviceName || dec(p.path || "") };
+  return o;
+}
+function parseSS(line) {
+  let rest = line.slice(5), hash = "", query = "";
+  const h = rest.indexOf("#"); if (h >= 0) { hash = rest.slice(h + 1); rest = rest.slice(0, h); }
+  const q = rest.indexOf("?"); if (q >= 0) { query = rest.slice(q + 1); rest = rest.slice(0, q); }
+  let method, password, host, port;
+  if (rest.includes("@")) {
+    const at = rest.lastIndexOf("@");
+    let ui = rest.slice(0, at);
+    if (!ui.includes(":")) { try { ui = b64ToStr(ui); } catch (e) {} } else { ui = dec(ui); }
+    const ci = ui.indexOf(":"); method = ui.slice(0, ci); password = ui.slice(ci + 1);
+    [host, port] = splitHostPort(rest.slice(at + 1));
+  } else {
+    const d = b64ToStr(rest), at = d.lastIndexOf("@");
+    const cred = d.slice(0, at), ci = cred.indexOf(":");
+    method = cred.slice(0, ci); password = cred.slice(ci + 1);
+    [host, port] = splitHostPort(d.slice(at + 1));
+  }
+  const o = { type: "shadowsocks", tag: tagFrom("#" + hash, `${host}:${port}`), server: host, server_port: Number(port), method, password };
+  if (query) { const p = qs(query); if (p.plugin) { const parts = dec(p.plugin).split(";"); o.plugin = parts[0]; o.plugin_opts = parts.slice(1).join(";"); } }
+  return o;
+}
+function parseHy2(line) {
+  const u = new URL(line.replace(/^hy2:\/\//, "hysteria2://")), p = qs(u.search);
+  const o = {
+    type: "hysteria2", tag: tagFrom(u.hash, `${u.hostname}:${u.port}`),
+    server: u.hostname, server_port: Number(u.port || 443), password: dec(u.username || u.password || ""),
+    tls: { enabled: true, server_name: p.sni || u.hostname, insecure: truthy(p.insecure) },
+  };
+  if (p.obfs && p.obfs.toLowerCase() === "salamander") o.obfs = { type: "salamander", password: p["obfs-password"] || "" };
+  return o;
+}
+function parseTuic(line) {
+  const u = new URL(line), p = qs(u.search);
+  const o = {
+    type: "tuic", tag: tagFrom(u.hash, `${u.hostname}:${u.port}`),
+    server: u.hostname, server_port: Number(u.port || 443),
+    uuid: dec(u.username), password: dec(u.password || ""),
+    congestion_control: p.congestion_control || "bbr",
+    tls: { enabled: true, server_name: p.sni || u.hostname, insecure: truthy(p.allow_insecure) || truthy(p.allowInsecure), alpn: splitAlpn(p.alpn || "h3") },
+  };
+  return o;
+}
+function parseAnytls(line) {
+  const u = new URL(line), p = qs(u.search);
+  const o = {
+    type: "anytls", tag: tagFrom(u.hash, `${u.hostname}:${u.port}`),
+    server: u.hostname, server_port: Number(u.port || 443), password: dec(u.username),
+    tls: { enabled: true, server_name: p.sni || u.hostname, insecure: truthy(p.insecure) || truthy(p.allowInsecure) },
+  };
+  if (p.alpn) o.tls.alpn = splitAlpn(p.alpn);
+  return o;
+}
+function parseLink(line) {
+  line = line.trim(); if (!line) return null;
+  try {
+    if (line.startsWith("vmess://")) return parseVmess(line);
+    if (line.startsWith("vless://")) return parseVless(line);
+    if (line.startsWith("trojan://")) return parseTrojan(line);
+    if (line.startsWith("ss://")) return parseSS(line);
+    if (line.startsWith("hysteria2://") || line.startsWith("hy2://")) return parseHy2(line);
+    if (line.startsWith("tuic://")) return parseTuic(line);
+    if (line.startsWith("anytls://")) return parseAnytls(line);
+  } catch (e) { console.warn("parse failed:", line, e); }
+  return null;
+}
+
+const SPECIAL_OUT = ["selector", "urltest", "direct", "block", "dns"];
+function extractExportedOutbounds(text) {
+  try {
+    const data = JSON.parse(text);
+    const arr = Array.isArray(data) ? data : (data && Array.isArray(data.outbounds) ? data.outbounds : null);
+    if (!arr) return [];
+    return arr.filter(o => o && o.type && o.tag && !SPECIAL_OUT.includes(o.type));
+  } catch (e) {
+    return [];
+  }
+}
+
+function normalizeImportText(text) {
+  return String(text).replace(/^\uFEFF/, "").trim();
+}
+
+function parseManyLinks(text) {
+  text = normalizeImportText(text);
+  const exported = extractExportedOutbounds(text);
+  if (exported.length) return exported;
+
+  let lines = String(text).split(/\r?\n/).map(normalizeImportText).filter(Boolean);
+  // A subscription body is usually a single base64 blob of newline-joined links.
+  if (lines.length === 1 && !lines[0].includes("://") && looksBase64(lines[0])) {
+    try { lines = normalizeImportText(b64ToStr(lines[0])).split(/\r?\n/).map(normalizeImportText).filter(Boolean); } catch (e) {}
+  }
+  const nodes = [];
+  for (const l of lines) { const n = parseLink(l); if (n) nodes.push(n); }
+  return nodes;
+}
+
+function dedupeTags(nodes) {
+  const seen = new Set();
+  for (const n of nodes) {
+    let t = (n.tag || "node").trim() || "node", base = t, i = 2;
+    while (seen.has(t)) t = base + "-" + (i++);
+    seen.add(t); n.tag = t;
+  }
+  return nodes;
+}
+function assembleOutbounds(nodes) {
+  dedupeTags(nodes);
+  const tags = nodes.map(n => n.tag);
+  return [
+    { type: "selector", tag: "proxy", outbounds: ["auto", ...tags, "direct"] },
+    { type: "urltest", tag: "auto", outbounds: tags.slice(), url: "https://www.gstatic.com/generate_204", interval: "10m", tolerance: 50 },
+    ...nodes,
+    { type: "direct", tag: "direct" },
+  ];
+}
+async function existingProxyNodes() {
+  try {
+    const arr = JSON.parse(await ctl("config", "get", "outbounds"));
+    return Array.isArray(arr) ? arr.filter(o => o && o.type && !SPECIAL_OUT.includes(o.type)) : [];
+  } catch (e) { return []; }
+}
+async function doImport(nodes) {
+  if (!nodes.length) { toast("没有解析到有效节点(协议不支持或格式错误)"); return; }
+  let all = nodes;
+  if (document.getElementById("import-mode").value === "append") {
+    all = [...await existingProxyNodes(), ...nodes];
+  }
+  const text = JSON.stringify(assembleOutbounds(all), null, 2);
+  document.getElementById("outbounds-text").value = text;
+  try {
+    await ctlWithStdin(text, "config", "set", "outbounds");
+    await ctl("check");
+    toast(`导入成功并通过校验:解析 ${nodes.length} 个,合计 ${all.length} 个节点。去状态页点“应用并重启”生效。`);
+  } catch (e) { toast("写入失败:" + e.message); }
+}
+document.getElementById("btn-import-links").addEventListener("click", () => {
+  const t = document.getElementById("import-text").value.trim();
+  if (!t) { toast("请先粘贴分享链接"); return; }
+  doImport(parseManyLinks(t));
+});
+document.getElementById("btn-import-sub").addEventListener("click", async () => {
+  const url = (document.getElementById("import-text").value.trim().split(/\r?\n/)[0] || "").trim();
+  if (!/^https?:\/\//.test(url)) { toast("请粘贴 http/https 订阅链接"); return; }
+  importStatus("正在拉取订阅…(若服务未运行将走系统直连)");
+  let body;
+  try { body = await ctl("fetch", url); }
+  catch (e) { importStatus(""); toast("拉取失败:" + e.message); return; }
+  importStatus("");
+  doImport(parseManyLinks(body));
+});
+
+// ---------- 应用 ----------
+async function loadPerApp() {
+  try {
+    const settings = parseKv(await ctl("config", "get", "settings"));
+    document.getElementById("package-mode").value = settings.SBMAGIC_PACKAGE_MODE || "black";
+    document.getElementById("exclude-text").value = await ctl("config", "get", "exclude");
+    document.getElementById("include-text").value = await ctl("config", "get", "include");
+    updatePackageModeUi();
+    renderAppList();
+  } catch (e) { toast(e.message); }
+}
+async function savePerApp() {
+  try {
+    await ctlWithStdin(document.getElementById("exclude-text").value, "config", "set", "exclude");
+    await ctlWithStdin(document.getElementById("include-text").value, "config", "set", "include");
+    await setSettingValue("SBMAGIC_PACKAGE_MODE", document.getElementById("package-mode").value);
+    toast("已保存,记得去状态页点\"应用并重启\"生效");
+  } catch (e) { toast(e.message); }
+}
+document.getElementById("btn-pkg-load").addEventListener("click", loadPerApp);
+document.getElementById("btn-pkg-save").addEventListener("click", savePerApp);
+document.getElementById("btn-pkg-undo").addEventListener("click", async () => {
+  try {
+    await ctl("config", "rollback", "exclude");
+    await ctl("config", "rollback", "include");
+    toast("已撤销");
+    loadPerApp();
+  } catch (e) { toast(e.message); }
+});
+const APP_LIST_PACKAGES_KEY = "singbox_tun_Magic.app.seenPackages";
+let appListCache = [];
+let appListLoaded = false;
+let appListLoading = null;
+
+function activePackageMode() {
+  return document.getElementById("package-mode").value === "white" ? "white" : "black";
+}
+
+function activePackageTextArea() {
+  return document.getElementById(activePackageMode() === "white" ? "include-text" : "exclude-text");
+}
+
+function modeActionLabel() {
+  return activePackageMode() === "white" ? "代理" : "直连";
+}
+
+function readPackageEntries(text) {
+  return text.replace(/\r\n/g, "\n").split("\n").map(v => v.trim()).filter(Boolean);
+}
+
+function readActivePackageSet() {
+  return new Set(readPackageEntries(activePackageTextArea().value).filter(v => !v.startsWith("#")));
+}
+
+function writeActivePackageSet(set) {
+  const ta = activePackageTextArea();
+  const comments = readPackageEntries(ta.value).filter(v => v.startsWith("#"));
+  const packages = [...set].sort();
+  ta.value = [...comments, ...packages].join("\n") + (comments.length || packages.length ? "\n" : "");
+}
+
+function updatePackageModeUi() {
+  const hint = document.getElementById("pkg-picker-hint");
+  if (!hint) return;
+  hint.textContent = activePackageMode() === "white"
+    ? "当前是白名单:点击应用加入/移除代理名单。"
+    : "当前是黑名单:点击应用加入/移除直连例外。";
+}
+
+function updateSelectionCount(selectedPackages) {
+  const el = document.getElementById("pkg-selection-count");
+  if (!el) return;
+  el.textContent = `当前${modeActionLabel()}名单已选择 ${selectedPackages.size} 个应用`;
+}
+
+function readSeenPackages() {
+  try {
+    const v = JSON.parse(localStorage.getItem(APP_LIST_PACKAGES_KEY) || "[]");
+    return new Set(Array.isArray(v) ? v : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function writeSeenPackages(apps) {
+  try {
+    localStorage.setItem(APP_LIST_PACKAGES_KEY, JSON.stringify(apps.map(a => a.pkg)));
+  } catch (e) {}
+}
+
+function parseAppList(raw, previousPackages) {
+  const apps = [];
+  const seen = new Set();
+  raw.split("\n").forEach(line => {
+    if (!line.trim()) return;
+    const c = line.split("\t");
+    const pkg = (c[0] || "").trim();
+    if (!pkg || seen.has(pkg)) return;
+    const label = (c[1] || pkg).trim() || pkg;
+    const type = (c[2] || "unknown").trim();
+    seen.add(pkg);
+    apps.push({
+      pkg,
+      label,
+      type,
+      isNew: previousPackages.size > 0 && !previousPackages.has(pkg),
+    });
+  });
+  apps.sort((a, b) => {
+    if (a.isNew !== b.isNew) return a.isNew ? -1 : 1;
+    const byLabel = a.label.localeCompare(b.label, "zh-Hans-CN", { sensitivity: "base" });
+    return byLabel || a.pkg.localeCompare(b.pkg);
+  });
+  return apps;
+}
+
+function togglePackage(pkg, label) {
+  const set = readActivePackageSet();
+  let selected;
+  if (set.has(pkg)) {
+    set.delete(pkg);
+    selected = false;
+  } else {
+    set.add(pkg);
+    selected = true;
+  }
+  writeActivePackageSet(set);
+  renderAppList();
+  toast(`${label || pkg} 已${selected ? "加入" : "移出"}${modeActionLabel()}名单`);
+}
+function renderAppList() {
+  const wrap = document.getElementById("pkg-installed");
+  const q = (document.getElementById("pkg-filter").value || "").toLowerCase().trim();
+  const scope = document.getElementById("pkg-scope-filter").value;
+  const selectedPackages = readActivePackageSet();
+  updateSelectionCount(selectedPackages);
+  wrap.innerHTML = "";
+  wrap.style.display = "block";
+  if (!appListCache.length) {
+    const e = document.createElement("div");
+    e.className = "app-empty";
+    e.textContent = appListLoading ? "正在同步应用列表…" : "暂无应用列表";
+    wrap.appendChild(e);
+    return;
+  }
+  const visibleApps = appListCache.filter(a => {
+    if (scope !== "all" && a.type !== scope) return false;
+    if (q && a.label.toLowerCase().indexOf(q) < 0 && a.pkg.toLowerCase().indexOf(q) < 0) return false;
+    return true;
+  }).sort((a, b) => {
+    const aSelected = selectedPackages.has(a.pkg);
+    const bSelected = selectedPackages.has(b.pkg);
+    if (aSelected !== bSelected) return aSelected ? -1 : 1;
+    if (a.isNew !== b.isNew) return a.isNew ? -1 : 1;
+    const byLabel = a.label.localeCompare(b.label, "zh-Hans-CN", { sensitivity: "base" });
+    return byLabel || a.pkg.localeCompare(b.pkg);
+  });
+  visibleApps.forEach(a => {
+    const selected = selectedPackages.has(a.pkg);
+    const row = document.createElement("div");
+    row.className = "app-row" + (a.isNew ? " new" : "") + (selected ? " selected" : "");
+    const main = document.createElement("div"); main.className = "app-main";
+    const title = document.createElement("div"); title.className = "app-title";
+    const l = document.createElement("span"); l.className = "app-label"; l.textContent = a.label; l.title = a.label;
+    title.appendChild(l);
+    if (a.isNew) {
+      const badge = document.createElement("span"); badge.className = "app-badge"; badge.textContent = "新";
+      title.appendChild(badge);
+    }
+    const p = document.createElement("span"); p.className = "app-pkg"; p.textContent = a.pkg;
+    main.appendChild(title); main.appendChild(p);
+    const action = document.createElement("span");
+    action.className = "app-action";
+    action.textContent = selected ? "移除" : "加入" + modeActionLabel();
+    row.appendChild(main); row.appendChild(action);
+    row.addEventListener("click", () => togglePackage(a.pkg, a.label));
+    wrap.appendChild(row);
+  });
+  if (!visibleApps.length) { const e = document.createElement("div"); e.className = "app-empty"; e.textContent = "无匹配应用"; wrap.appendChild(e); }
+}
+
+async function loadAppList(options = {}) {
+  if (appListLoading) return appListLoading;
+  const btn = document.getElementById("btn-pkg-list");
+  const old = btn.textContent; btn.disabled = true; btn.textContent = "同步中…";
+  appListLoading = (async () => {
+    const raw = await ctl("applist");
+    const previousPackages = readSeenPackages();
+    appListCache = parseAppList(raw, previousPackages);
+    writeSeenPackages(appListCache);
+    appListLoaded = true;
+    renderAppList();
+    if (!options.silent) {
+      const newCount = appListCache.filter(a => a.isNew).length;
+      toast(newCount ? `已同步应用列表,新增 ${newCount} 个` : "已同步应用列表");
+    }
+  })();
+  try {
+    await appListLoading;
+  } catch (e) {
+    if (!options.silent) toast(e.message);
+  } finally {
+    appListLoading = null;
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+function ensureAppListLoaded() {
+  if (!appListLoaded) loadAppList({ silent: true });
+}
+document.getElementById("btn-pkg-list").addEventListener("click", () => loadAppList());
+document.getElementById("pkg-filter").addEventListener("input", renderAppList);
+document.getElementById("pkg-scope-filter").addEventListener("change", renderAppList);
+document.getElementById("package-mode").addEventListener("change", () => {
+  updatePackageModeUi();
+  renderAppList();
+});
+document.getElementById("exclude-text").addEventListener("input", renderAppList);
+document.getElementById("include-text").addEventListener("input", renderAppList);
+
+// ---------- 设置(分组渲染) ----------
+const SETTINGS_GROUPS = [
+  {
+    id: "group-basic",
+    fields: [
+      { key: "SBMAGIC_ENABLED", label: "启用模块", type: "bool" },
+      { key: "SBMAGIC_WATCHDOG", label: "看门狗", type: "bool", hint: "关闭后不再自动重启,也不会有崩溃回退/last-good 快照能力。" },
+      { key: "SBMAGIC_WATCHDOG_INTERVAL", label: "看门狗轮询间隔(秒)", type: "number", hint: "默认 300 秒,不建议调到更短(短间隔轮询是隐形耗电源)。" },
+    ],
+  },
+  {
+    id: "group-network",
+    fields: [
+      { key: "SBMAGIC_PROCESS_NAME", label: "进程名", type: "text", hint: "运行时二进制文件名,仅允许 A-Z a-z 0-9 . _ -,用于避开固定进程名检测。" },
+      { key: "SBMAGIC_STACK", label: "TUN 栈", type: "select", options: ["gvisor", "system", "mixed"] },
+      { key: "SBMAGIC_INTERFACE", label: "TUN 接口名", type: "text", hint: "最多 15 字节,仅允许 A-Z a-z 0-9 . _ -,建议用低调名。" },
+      { key: "SBMAGIC_MTU", label: "MTU", type: "number" },
+      { key: "SBMAGIC_AUTO_ROUTE", label: "自动路由", type: "bool" },
+      { key: "SBMAGIC_STRICT_ROUTE", label: "严格路由", type: "bool" },
+      {
+        key: "SBMAGIC_IPV6", label: "IPv6", type: "bool",
+        hint: "关闭时不是\"不管 IPv6\",而是接管 IPv6 路由后整体拦截,防止真机有 v6 出口时绕过代理泄漏。开启后还需要在下面 DNS 卡片里把\"DNS 策略\"从 ipv4_only 改掉,否则不会真正解析到 IPv6 地址。",
+      },
+    ],
+  },
+  {
+    id: "group-dns",
+    fields: [
+      { key: "SBMAGIC_DNS_MODE", label: "DNS 模式", type: "select", options: ["real-ip", "fake-ip"] },
+      {
+        key: "SBMAGIC_DNS_STRATEGY", label: "DNS 策略", type: "select",
+        options: ["ipv4_only", "prefer_ipv4", "prefer_ipv6", "ipv6_only"],
+        hint: "只有在上面网络卡片里打开了 IPv6,把这里改成 prefer_ipv4/prefer_ipv6 才会真正解析到 IPv6 地址。",
+      },
+      { key: "SBMAGIC_DNS_LOCAL_TYPE", label: "本地 DNS 协议(直连)", type: "select", options: ["https", "tls", "quic", "h3", "udp", "tcp"] },
+      { key: "SBMAGIC_DNS_LOCAL_SERVER", label: "本地 DNS 地址", type: "text", hint: "填 IP(如 223.5.5.5),别填带协议头的 URL。" },
+      { key: "SBMAGIC_DNS_REMOTE_TYPE", label: "远程 DNS 协议(代理)", type: "select", options: ["https", "tls", "quic", "h3", "udp", "tcp"] },
+      { key: "SBMAGIC_DNS_REMOTE_SERVER", label: "远程 DNS 地址", type: "text", hint: "填 IP(如 1.1.1.1),解析走代理、防 DNS 泄漏。" },
+      { key: "SBMAGIC_DNS_FINAL", label: "DNS 默认出口", type: "select", options: ["remote", "local"] },
+      { key: "SBMAGIC_FAKEIP4", label: "fake-ip v4 CIDR", type: "text", hint: "仅 DNS 模式为 fake-ip 时生效。" },
+      { key: "SBMAGIC_FAKEIP6", label: "fake-ip v6 CIDR", type: "text", hint: "仅 DNS 模式为 fake-ip 且 IPv6 已开启时生效。" },
+    ],
+  },
+  {
+    id: "group-api",
+    fields: [
+      { key: "SBMAGIC_API_HOST", label: "监听地址", type: "text", hint: "保持 127.0.0.1,不要改成对外地址。" },
+      { key: "SBMAGIC_API_PORT", label: "监听端口", type: "text", hint: "默认 auto,首次启动生成随机高端口;仅在需要固定端口时填数字。" },
+      { key: "SBMAGIC_API_FIREWALL", label: "限制控制端口", type: "bool", hint: "开启后用本机防火墙只允许 root/shell 访问控制端口,普通应用扫端口拿不到 401 指纹。" },
+      { key: "SBMAGIC_API_MODE", label: "Clash 模式", type: "select", options: ["Rule", "Global", "Direct"] },
+    ],
+  },
+  {
+    id: "group-maint",
+    fields: [
+      { key: "SBMAGIC_RULE_UPDATE_INTERVAL", label: "规则集更新间隔", type: "text", hint: "例如 168h = 7 天,不建议调得太频繁。" },
+    ],
+  },
+];
+
+let settingsRawText = "";
+
+function buildFieldRow(f, current) {
+  const row = document.createElement("div");
+  row.className = "field-row";
+
+  const main = document.createElement("div");
+  main.className = "field-main";
+  const label = document.createElement("label");
+  label.textContent = f.label;
+  main.appendChild(label);
+  if (f.hint) {
+    const hint = document.createElement("div");
+    hint.className = "field-hint" + (f.key === "SBMAGIC_IPV6" ? " warn" : "");
+    hint.textContent = f.hint;
+    main.appendChild(hint);
+  }
+  row.appendChild(main);
+
+  const ctrl = document.createElement("div");
+  ctrl.className = "field-control";
+  let input;
+  if (f.type === "bool") {
+    input = document.createElement("select");
+    ["true", "false"].forEach(v => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = v === "true" ? "开启" : "关闭";
+      if (current === v) o.selected = true;
+      input.appendChild(o);
+    });
+  } else if (f.type === "select") {
+    input = document.createElement("select");
+    f.options.forEach(v => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = v;
+      if (current === v) o.selected = true;
+      input.appendChild(o);
+    });
+  } else {
+    input = document.createElement("input");
+    input.type = f.type === "number" ? "number" : "text";
+    input.value = current ?? "";
+  }
+  input.dataset.key = f.key;
+  ctrl.appendChild(input);
+  row.appendChild(ctrl);
+  return row;
+}
+
+function renderSettingsForm(values) {
+  SETTINGS_GROUPS.forEach(group => {
+    const card = document.getElementById(group.id);
+    card.innerHTML = "";
+    group.fields.forEach(f => card.appendChild(buildFieldRow(f, values[f.key] ?? "")));
+  });
+}
+
+function applySettingsEdits(rawText, values) {
+  const lines = rawText.split("\n");
+  const seen = new Set();
+  const out = lines.map(line => {
+    const m = line.match(/^([A-Z0-9_]+)=/);
+    if (m && Object.prototype.hasOwnProperty.call(values, m[1])) {
+      seen.add(m[1]);
+      return m[1] + "=" + values[m[1]];
+    }
+    return line;
+  });
+  Object.entries(values).forEach(([k, v]) => {
+    if (!seen.has(k)) out.push(k + "=" + v);
+  });
+  return out.join("\n");
+}
+
+async function loadSettings() {
+  try {
+    settingsRawText = await ctl("config", "get", "settings");
+    renderSettingsForm(parseKv(settingsRawText));
+  } catch (e) { toast(e.message); }
+}
+
+async function saveSettings() {
+  const values = {};
+  document.querySelectorAll("#tab-settings [data-key]").forEach(el => {
+    values[el.dataset.key] = el.value;
+  });
+  try {
+    const latestRawText = await ctl("config", "get", "settings");
+    const newText = applySettingsEdits(latestRawText, values);
+    await ctlWithStdin(newText, "config", "set", "settings");
+    settingsRawText = newText;
+    toast("已保存,记得去状态页点\"应用并重启\"生效");
+  } catch (e) { toast(e.message); }
+}
+
+// 应用单个键值改动,不影响表单里其它未保存的编辑(用于 per-app 模式切换)
+async function setSettingValue(key, value) {
+  const raw = await ctl("config", "get", "settings");
+  const newText = applySettingsEdits(raw, { [key]: value });
+  await ctlWithStdin(newText, "config", "set", "settings");
+}
+
+document.getElementById("btn-settings-load").addEventListener("click", loadSettings);
+document.getElementById("btn-settings-save").addEventListener("click", saveSettings);
+document.getElementById("btn-settings-undo").addEventListener("click", async () => {
+  try { await ctl("config", "rollback", "settings"); toast("已撤销"); loadSettings(); } catch (e) { toast(e.message); }
+});
+
+// ---------- 日志 ----------
+async function loadLogs() {
+  const src = document.getElementById("log-source").value;
+  try {
+    document.getElementById("log-text").value = await ctl("logs", src, "300");
+  } catch (e) { toast(e.message); }
+}
+document.getElementById("btn-logs-load").addEventListener("click", loadLogs);
+
+// ---------- init ----------
+refreshStatus();
+loadOutbounds();
+loadPerApp();
+ensureAppListLoaded();
+loadSettings();
+</script>
+</body>
+</html>

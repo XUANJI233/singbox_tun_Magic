@@ -1,0 +1,22 @@
+.gitattributes text eol=lf
+.gitignore text eol=lf
+go.mod text eol=lf
+*/go.mod text eol=lf
+*.sh text eol=lf
+module/common/* text eol=lf
+module/META-INF/com/google/android/* text eol=lf
+module/module.prop text eol=lf
+module/defaults/* text eol=lf
+module/webroot/*.html text eol=lf
+*.go text eol=lf
+*.java text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ps1 text eol=crlf
+*.py text eol=lf
+*.zip binary
+*.dex binary
+module/bin/** binary
+bench/bin/** binary

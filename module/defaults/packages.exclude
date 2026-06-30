@@ -1,0 +1,6 @@
+# Root/module managers and local debugging tools are excluded by default.
+me.weishu.kernelsu
+me.bmax.apatch
+com.topjohnwu.magisk
+io.github.vvb2060.magisk
+com.termux

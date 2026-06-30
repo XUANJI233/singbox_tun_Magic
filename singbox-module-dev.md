@@ -1,494 +1,354 @@
-# sing-box 内置代理模块 — 开发文档
+# 星盘 — 开发文档
 
 > 形态:Magisk/KernelSU 模块,su 权限常驻运行。
 > 设计目标(按优先级):**全天常驻省电 > 链路稳定 > 隐蔽性**。
-> 架构路线:**系统层 per-app 决策 + hev-socks5-tunnel(tun层) + sing-box(核心+分流)** 三层拆分。
-> 默认落地形态:**hev → 127.0.0.1 随机高端口 SOCKS → sing-box**。UDS 仅作为 fork/实验路线,不是初版硬前提。
+> **当前架构(已落地):sing-box 原生 TUN 单进程**——per-app 用 Android `include_package`/`exclude_package`,目的地分流用 sing-box route 引擎,DNS 用 `hijack-dns` action,全部在一个进程里完成。
+> **不再使用** hev-socks5-tunnel + 本机 loopback SOCKS 的三层拆分方案。该方案的完整设计记录在 [singbox-module-dev.legacy-hev-design.md](singbox-module-dev.legacy-hev-design.md),仅作**未来 fork/对比实验**的参考,不是当前实现的一部分(见第 17 节)。
 
 > ⚠️ 本文档分**架构层**(模块固有设计,写死)与**配置层**(用户经 UI 设置,不硬编码)。
 > 文中出现的具体协议(VLESS/gRPC 等)、伪装策略、CDN 等**均为配置示例**,非模块要求。模块协议无关。
 
 ---
 
-## 0. 架构层 vs 配置层(先划清边界)
+## 0. 为什么从"三层拆分"切到"单进程原生 TUN"
 
-| | 内容 | 谁决定 | 是否硬编码 |
-|---|------|--------|-----------|
-| **架构层** | 三层拆分、本地 SOCKS 通信、降权、守护机制、分流分工、WebUI 框架 | 模块设计 | 是(固有) |
-| **配置层** | 上游协议、传输层、TLS/指纹、落地地址、CDN、伪装、分流规则、per-app 名单、DNS、日志级别、MTU…… | 用户经 UI | 否(可配置) |
+旧设计(见 legacy 文档)是 `系统层 nft per-app + hev tun2socks + sing-box 核心` 三层拆分,理由是"hev 纯 C 待机更省电、职责分离更干净"。基准测试(`bench/results/*.md`)否定了这个假设里的关键部分:
 
-**原则:凡是"针对某场景的选择",都属配置层,经 UI 设置,不写进模块代码。**
-模块本身只提供"协议无关的代理管道 + 可配置入口"。
+- **吞吐**:并发下载场景,sing-box 原生 TUN 比 hev+SOCKS 快了近 50%(7.96 MiB/s vs 5.35 MiB/s);单流场景两者接近。
+- **CPU 效率**:下载方向原生 TUN 每 MiB 耗 CPU 更低;上传方向 hev 略低,但差距在个位百分比。
+- **内存**:小负载下 hev 方案省 ~4MiB;但加压并发后反转,原生 TUN 涨到 ~73MiB,hev 方案稳定在 ~58MiB。
+- **架构复杂度**:Android 的 `VpnService` per-app 排除(`include_package`/`exclude_package`)是系统级机制,**排除的 APP 连 DNS 查询都不会进 VPN 接口**——这天然解决了旧文档第 3.5 节大段讨论的"DNS 不能按 uid 区分、需要两类独立 nft 规则"的问题。单进程原生 TUN 不需要手写 nftables 规则、不需要本机 SOCKS 入口、不需要凭据同步、不需要防回环 mark 方案。
+
+**结论**:吞吐/CPU 数据没有压倒性地支持 hev 方案,而原生 TUN 在架构复杂度上大幅简化(少一个常驻进程、少一套 nft 规则、少一个本地协议接口要维护)。复杂度降低本身就是省电/省维护成本的收益,所以当前版本**全面采用 sing-box 原生 TUN**,不做三层拆分。
+
+> 待机/Doze 下两条路线的真实功耗差异目前没有真机长时间数据(20 秒空闲窗口测不出有效信号),架构选择主要基于"复杂度 + 已测得的吞吐数据",不是"已证明待机更省电"。如果未来真机长时间待机测试显示原生 TUN 在某些 ROM 上待机明显更耗电,hev 方案可以按 legacy 文档重新拾起作为 fork 分支,不需要推翻当前实现。
 
 ---
 
 ## 1. 整体架构
 
-### 1.1 三层分工(核心)
+### 1.1 单进程数据流
 
 ```
-APP 流量
-  │
-  ├──────────────[DNS 查询]──────────────┐
-  │                                       ▼
-  │                          系统层 nft 重定向 53(全局,不经tun)
-  │                                       ▼
-  │                          sing-box DNS 服务(本地端口)
-  │                            ├ 默认稳定模式 → 返回真实IP(按域名选择 DNS 出口)
-  │                            └ 可选 fake-ip 模式 → 仅在非硬 per-app 场景启用
-  │  (DNS 与数据是两条独立路径)            │
-  ▼                                       │(APP 拿到 IP)
+APP 流量 + DNS 查询
+         │
+         ▼
 ┌─────────────────────────────────────────────┐
-│ 系统层 (nftables + uid)  ← 按"应用"决策:谁进代理 │
-│  ├─ 不代理的 APP → 直接放行,走默认网络        │
-│  └─ 要代理的 APP → 打标进 tun                 │
+│ Android VpnService per-app 排除/包含          │
+│  (sing-box tun inbound 的 include_package/    │
+│   exclude_package,系统级,DNS 与数据流量一起处理)│
+│  ├─ 不代理的 APP → 完全不经过 tun 接口         │
+│  └─ 要代理的 APP → 数据 + DNS 都进 tun         │
 └─────────────────────────────────────────────┘
-                    │ (仅被代理的 APP 流量)
+                    │ (仅被代理的 APP)
                     ▼
-            hev-socks5-tunnel          ← 纯转发:tun → SOCKS5
-            (纯C, 不做任何决策)            (此处通常只剩目标IP)
-                    │ SOCKS5 over 127.0.0.1:随机高端口
-                    │ (仅 hev/module UID 可连; UDS 为 fork/实验路线)
-                    ▼
-            sing-box (核心)
-              ├─ 默认:按 IP 规则集 + TCP sniff(SNI/HTTP Host)恢复部分域名
-              ├─ 可选 fake-ip:收到假IP后查映射表反查回域名 ★
-              ├─ route 引擎按域名/IP/rule-set 分流
-              │   ├─ 该直连 → direct
-              │   └─ 该代理 → 代理 outbound
-              └─ 协议出站 <用户配置的协议/传输层>
+            sing-box tun inbound (stack: gvisor 默认)
                     │
                     ▼
-              <用户配置的上游链路>
-              (示例:VLESS+gRPC+TLS over CDN → 自建落地)
+            route 引擎
+              ├─ protocol=dns → hijack-dns(交给 DNS 模块处理,不当数据转发)
+              ├─ sniff(SNI/HTTP Host,300ms)
+              ├─ clash_mode Direct/Global 覆盖
+              ├─ ip_is_private → direct
+              ├─ domain_suffix cn / rule_set(geosite-cn, geoip-cn) → direct
+              └─ final → proxy outbound
+                    │
+                    ▼
+              DNS 引擎(real-ip 默认 / 可选 fake-ip 高级模式)
+              ├─ dns-direct-domains.txt / *.cn → local detour(direct)
+              └─ 其余 → remote detour(proxy)
+                    │
+                    ▼
+              <用户配置的协议出站>(VLESS/Trojan/...)
 ```
 
-> ★ **关键修正**:hev 转 socks5 后通常只剩目标 IP、域名会丢失。fake-ip 可以恢复域名级分流,但它与"某些 APP 硬直连、不进 tun"存在冲突:全局 DNS 返回假 IP 后,被排除 APP 也会拿到假 IP。故初版默认不依赖 fake-ip,用真实 DNS + IP 规则集 + TCP sniff;fake-ip 只在"全局代理/软排除/假 IP 网段统一进 tun"等可接受语义下启用。
+- 一个进程同时持有 tun、DNS、路由、协议出站,没有本机 SOCKS 中转,没有第二个常驻二进制。
+- per-app 决策和"进不进 tun"是 Android 系统层(`VpnService`)完成的,sing-box 看到的已经是"被代理的流量",不需要也不能再按 uid 分。
 
-### 1.2 两层分流,各取所长(关键设计)
+### 1.2 per-app(系统级,非 nft)
 
-| 层 | 抓取的信息 | 负责 | 为什么在这层 |
-|----|-----------|------|-------------|
-| **系统层** | **APP uid** | **per-app:哪些应用进代理** | uid 只有系统层可见,流量经 hev 转 socks 后丢失 |
-| **sing-box** | 域名 / IP / rule-set(.srs) | 进代理流量的目的地细分流 | 规则集是 sing-box 强项,灵活成熟 |
-
-**省电收益叠加两份:**
-1. 系统层:不代理的 APP **整个不碰代理栈**(uid 级排除)。
-2. sing-box:被代理的 APP,其国内域名流量仍可判 direct,**不全推给落地**。
-
-→ 直连最大化、代理流量最小化,这是省电分流的正解。
+- 用 sing-box tun inbound 的 `include_package`(白名单)或 `exclude_package`(黑名单)字段,对应模块的 `packages.include` / `packages.exclude` 文件,见 `module/defaults/`。
+- 这是 Android `VpnService` 原生能力,**排除的 APP 的数据和 DNS 都不会进入 tun 接口**,不存在旧文档里"DNS 全局接管、排除 APP 的 DNS 仍被拦截"的问题。
+- 黑/白名单两种模式见 §3。
 
 ### 1.3 各组件职责
 
 | 组件 | 形态 | 职责 | 待机能耗 |
 |------|------|------|----------|
-| 系统层规则 | nft/iptables + ip rule | per-app 打标、策略路由 | 零(内核态,被动) |
-| hev-socks5-tunnel | 纯 C 二进制 | tun 创建 + tun↔SOCKS5 转换,**不做决策** | 极低(近零) |
-| sing-box | Go 二进制 | DNS 服务(解析/可选 fake-ip/分流)+ 目的地分流 + 协议出站 | 中(Go运行时) |
-| service.sh | shell | 启动编排、特权配置、守护 | 取决于守护方式 |
-| WebUI | HTML/JS | 配置入口 + 状态可视化 | 零(不常驻) |
-
-### 1.4 为什么这样拆
-
-- **省电**:tun 层纯 C(hev)待机近零;直连流量经系统层排除后零代理开销;sing-box 只处理真正要代理的流量。
-- **职责清晰**:决策(系统层 per-app + sing-box 目的地)与转发(hev)分离,各司其职。
-- 对比 sing-box 一体化 tun:省一组件、无本地 SOCKS 端口、DNS/tun/per-app 集成更完整;但 Go tun 栈与路由都在 sing-box 内,真实耗电必须真机测。本文默认先选 hev 方案,不是因为理论必胜,而是为了把系统层 per-app 与轻量 tun2socks 分开验证。
-
-### 1.5 三条落地路线对比
-
-| 路线 | 优点 | 代价/风险 | 当前建议 |
-|------|------|-----------|----------|
-| **A. hev + loopback SOCKS(默认)** | hev 轻量;UDP-in-UDP/UDP-in-TCP 成熟;系统层 per-app 与核心分流解耦 | 多一个本地 SOCKS 入口;域名会丢,默认靠真实 DNS + IP rule-set + sniff;需严格防回环 | 初版主线 |
-| **B. sing-box 原生 tun** | 单进程;无本地 SOCKS 端口;`dns_mode`、`include_package`/`exclude_package`、`stack` 等能力集中 | Go 进程直接处理 tun;Android `auto_redirect` 能力有限;直连排除与 DNS 语义仍要测 | 备选基线,必须同机对比 |
-| **C. UDS fork** | 隐藏 TCP 监听端口;理论上少一点 TCP loopback 暴露 | 需要同时改 hev/sing-box 或维护兼容分支;UDP 语义复杂;维护成本高 | 后续优化,不阻塞初版 |
-
-**性能判断不要靠想象:**
-- 吞吐/CPU:hev 的 C/lwIP 路径可能更轻,但 loopback SOCKS 会多一次本机连接、拷贝和握手;sing-box 原生 tun 少一跳,但不同 `stack`(`system`/`gvisor`/`mixed`)性能差异很大。
-- 待机耗电:关键不是峰值吞吐,而是息屏后唤醒次数、常驻 RSS、DNS/规则更新、keepalive 和守护方式。只要系统层把大多数直连 APP 排除,两条路线都可能足够省电。
-- 结论:以真机数据决定默认路线。若 sing-box 原生 tun 在目标 ROM 上待机和吞吐接近 hev,可优先选原生 tun 降低架构复杂度;若 hev 明显更省电,保留三层方案。
-
-**真机对比测试计划:**
-1. 同一台手机、同一网络、同一出站协议,分别跑 A/B 两套配置。
-2. 测吞吐:`iperf3` TCP 上传/下载、UDP 丢包/抖动;记录 CPU 占用、RSS、线程数。
-3. 测待机:息屏 30-60 分钟,记录电量下降、`dumpsys batterystats`、进程 CPU time、唤醒次数。
-4. 测交互延迟:息屏 10 分钟后首次打开网页/IM 的 DNS+连接耗时。
-5. 测泄漏与回环:`ss/netstat`、`ip rule`、`ip route`、nft/iptables 计数器、DNS 查询路径、fake-ip 模式下排除 APP 行为。
-6. 每次只改一个变量:路线(A/B)、stack、MTU、fake-ip、DoT 策略、keepalive。
+| sing-box | Go 二进制 | tun 创建/per-app/DNS(real-ip/fake-ip)/目的地分流/协议出站,单进程全包 | 中(Go 运行时 + gvisor 默认栈) |
+| magicctl | shell | 渲染配置、启停/`reload`/`rollback`、带启动互斥锁、watchdog 崩溃自愈、`fetch` 订阅、clash API 代理调用 | 取决于守护方式 |
+| service.sh / post-fs-data.sh | shell | 启动编排 | 零(仅启动时跑一次) |
+| WebUI(已落地) | HTML/JS | 配置入口 + 节点导入 + 状态/流量可视化 + 故障恢复 | 零(不常驻,见 §8) |
 
 ---
 
-## 2. 解耦合设计
+## 2. 解耦合设计(精简版)
 
-### 2.1 必须解耦的边界
+**① 配置层 ↔ 架构层**
+- 协议、传输层、TLS/指纹、CDN、伪装、分流规则、per-app 名单、DNS、日志级别、MTU 等均经 `module/defaults/*` + 运行时 `/data/adb/singbox_tun_Magic/configs/*` 配置,不写进模块代码;改完跑 `magicctl reload` 生效(先校验,再重启)。
+- 架构层(本节固有设计):单进程 sing-box、`include_package`/`exclude_package` per-app、配置渲染管线、守护方式、WebUI 框架。
+- 配置/规则放在可写的 `/data/adb/singbox_tun_Magic/`,不随二进制更新覆盖(见 `module/customize.sh` 的"已存在则跳过、否则写 `.default`"逻辑)。
 
-**① tun 层 ↔ 核心层(hev ↔ sing-box)**
-- 唯一协议接口:**SOCKS5**。
-- 默认传输:**127.0.0.1 随机高端口 TCP**。用本机监听、认证、owner/uid 防火墙限制来降低暴露面。
-- 实验传输:**Unix Domain Socket**。只有在同时 fork/改造 hev 与 sing-box,并验证 TCP/UDP 都可用后才能启用;不能把 UDS 当作上游版本的默认能力。
-- hev 不关心上游协议;sing-box 不关心 tun 实现。任一侧可独立替换。
-
-**② 系统层分流 ↔ sing-box 分流**
-- 系统层只管 uid(谁进代理),sing-box 只管目的地(进了之后去哪)。
-- 两层信息各用各的,不重叠不冲突。
-
-**③ 代理子系统 ↔ root 隐藏子系统**
-- 彻底无关。代理=本模块(普通 Magisk 模块,不做成 Zygisk 模块)。隐藏=独立装 Zygisk Next 等。
+**② 代理子系统 ↔ root 隐藏子系统**
+- 彻底无关。代理 = 本模块(普通 Magisk 模块,不做成 Zygisk 模块)。隐藏 = 独立装 Zygisk Next 等。
 - 唯一交集:启用隐藏时把本模块挂载痕迹纳入排除列表。
 
-**④ 流量伪装 ↔ 设备隐藏**
-- 防 CDN/审查识别=流量层(服务器侧);防 APP 检测 root=设备层(本机)。对手与手段都不同。
+**③ 流量伪装 ↔ 设备隐藏**
+- 防 CDN/审查识别 = 流量层(服务器侧);防 APP 检测 root = 设备层(本机)。对手与手段都不同。
 
-**⑤ 配置层 ↔ 架构层**(见第 0 节)
-- 协议、伪装、CDN、分流规则等均经 UI 配置,不硬编码。
-- 配置/规则放可写 `/data/adb/<module>/`,不随二进制更新覆盖。
+---
 
-### 2.2 不可解耦:启动顺序
+## 3. per-app 黑白名单
+
+- **黑名单模式(`SBMAGIC_PACKAGE_MODE=black`,默认)**:默认全部 APP 代理,排除 `packages.exclude` 里的 APP(它们完全不经过 tun,数据和 DNS 都走系统默认网络)。优先保证"装上就大多数应用可用"。
+- **白名单模式(`SBMAGIC_PACKAGE_MODE=white`)**:默认全部直连,只有 `packages.include` 里的 APP 走代理。省电收益最大(代理流量最小),长期常驻用户推荐切换。
+- 默认排除列表 `module/defaults/packages.exclude` 已包含 root/模块管理类应用(`com.topjohnwu.magisk`、`me.weishu.kernelsu` 等)和 `com.termux`,避免管理工具自身被绕进隧道导致连不上自己。
+
+---
+
+## 4. DNS 设计
+
+### 4.1 基本原理
+
+- sing-box tun inbound 的路由规则里有 `{"protocol": "dns", "action": "hijack-dns"}`,会把所有经过 tun 的 DNS 查询接管,交给 sing-box 自己的 DNS 模块处理,而不是当成普通数据流量转发给出站。
+- 因为 per-app 排除发生在 `VpnService` 层,**被排除的 APP 的 DNS 查询根本不会经过 tun**,所以这里完全不需要旧文档里"系统层全局 nft 重定向 53"那套机制。
+
+> **DNS server 用 sing-box 1.12+ 新格式**(`{"type":"https","server":"223.5.5.5"}`),不是旧的 `{"address":"https://..."}` URL 写法——后者 1.14 移除。新格式 DNS server 自带 dial fields,本地直连解析器不再写 `detour:"direct"`(运行时会报 "detour to an empty direct outbound makes no sense");只有远程解析器显式 `detour:"proxy"`。规则也用 action 式(`{"...":..., "action":"route", "server":"local"}` / `{"query_type":["AAAA"],"action":"reject"}`)。已移除的旧字段(顶层 `dns.fakeip` 对象、`reverse_mapping`、`independent_cache`)都不再下发。
+
+### 4.2 默认:real-ip 模式(`SBMAGIC_DNS_MODE=real-ip`)
+
+- `dns.final` = `remote`,本地 DNS(`local`,直连 dialer)处理 `dns-direct-domains.txt` 里列出的域名和 `*.cn`,其余走 `remote`(detour `proxy`)。
+- 返回真实 IP,不返回 fake-ip,语义最清晰、兼容性最好。
+
+### 4.3 可选:fake-ip 高级模式(`SBMAGIC_DNS_MODE=fake-ip`)
+
+- `magicctl` 渲染时会加一个 `{"type":"fakeip","tag":"fakeip",...}` DNS server(1.12+ 新格式,不再用顶层 `dns.fakeip` 对象),并在直连/CN 规则之后追加 `query_type: A/AAAA -> server: fakeip` 的 DNS 规则。**不能**把 `dns.final` 设成 `fakeip`;sing-box 1.13 会拒绝启动(`default server cannot be fakeip`)。
+- fake-ip 模式下渲染会显式写 `cache_file.store_fakeip: true`,把 fake-ip↔域名映射持久化到 `cache.db`,避免重启后旧映射失效导致正在用 fake-ip 的连接断开(该字段默认值在不同 sing-box 版本间不一致,所以显式写死)。
+- 因为所有流量都在 tun 内(没有"排除 APP 拿到假 IP 但流量不进 tun"的问题——排除的 APP 本来就不查这个 DNS),fake-ip 在当前架构下**不存在旧文档里 per-app 冲突的那套顾虑**,可以放心用来恢复域名级分流精度。
+- IPv6 关闭时(`SBMAGIC_IPV6=false`,默认),AAAA 已被 DNS 规则最前面的 `reject` 全局拦掉(见 §4.4),所以 fake-ip 自然只产出 v4,不会下发 fake v6 段。
+
+### 4.4 IPv6 防泄漏(`SBMAGIC_IPV6`)
+
+这是容易被忽略的一点:**`SBMAGIC_IPV6=false` 不等于"不管 IPv6"**,而是"接管 IPv6 但全部拦截",理由如下。
+
+- tun inbound 的 `address` 字段**始终**包含一个 ULA(`fdfe:dcba:9876::1/126`)地址,不管 `SBMAGIC_IPV6` 是否开启。这个地址本身不可全局路由,纯粹是为了让 `auto_route` 把系统的 IPv6 默认路由也劫持到 tun 接口上。
+- 如果不这么做,在一台真有 IPv6 出口的设备上,被代理的 APP 的 IPv6 流量会**完全绕过 tun**,直接走运营商网络的 IPv6 通路出去——这是一个会直接暴露真实 IP 的"代理穿透"问题,比"没适配 IPv6"更糟。
+- `SBMAGIC_IPV6=false`(默认)时,渲染管线额外加两条防线:
+  1. **DNS 层**:在 DNS 规则最前面插入 `{"query_type": ["AAAA"], "action": "reject"}`,任何域名的 AAAA 查询直接被拒绝,不管 `SBMAGIC_DNS_STRATEGY` 设的是什么——这是兜底,不依赖用户没改错别的设置。
+  2. **路由层**:在 `ip_is_private` 规则之后插入 `{"ip_version": 6, "action": "reject"}`,即便某个 APP 拿到了硬编码的 IPv6 地址(没走 DNS),数据面也直接拒绝,不会泄漏、也不会误判成"直连"。(用 `action: reject` 而不是旧的 `outbound: block`——`block` 特殊出站在 sing-box 1.13 已移除。)
+- `SBMAGIC_IPV6=true` 时,上面两条防线不插入,IPv6 数据可以正常走 fake-ip/真实解析 + 域名/规则集分流,和 IPv4 走一样的 route 引擎逻辑。**但**默认的 `SBMAGIC_DNS_STRATEGY=ipv4_only` 不会因为这个开关自动改变——开 IPv6 只是"允许"接管,要真正解析到 AAAA,还需要把 DNS 策略换成 `prefer_ipv4`(双栈优先 v4)之类的值。WebUI 的设置表单在这两个字段之间加了提示文案,避免用户以为开了 IPv6 开关就立刻生效。
+
+### 4.5 DNS 鸡生蛋
+
+- DNS server 拆成 `SBMAGIC_DNS_LOCAL_TYPE`/`SBMAGIC_DNS_LOCAL_SERVER` 与 `SBMAGIC_DNS_REMOTE_TYPE`/`SBMAGIC_DNS_REMOTE_SERVER` 两组(协议 + 地址),默认 `https` + IP 字面量(`223.5.5.5`、`1.1.1.1`)。`SERVER` 是 IP 时不需要再解析,天然避免"远程 DNS 走代理但落地域名要解析"的死循环。
+- 如果把 `SERVER` 改成域名(如 `dns.alidns.com`),sing-box 1.12+ 要求该 server 配 `domain_resolver` 指定用谁解析它,否则会死循环;`sing-box check` 不会报语法错(`domain_resolver` 是可选字段),但运行时解不出来。**所以默认坚持填 IP 字面量**,WebUI 输入框也写了"填 IP"的提示。
+- `dns-direct-domains.txt` 只接受**域名**,渲染成 sing-box 的 `domain` DNS 规则,写 IP 字面量进去不会生效。
+
+### 4.6 出站/节点域名解析(`route.default_domain_resolver`)
+
+- 渲染管线在 `route` 块写死 `"default_domain_resolver": {"server": "local"}`。**这是 1.12+ 的硬性要求**:当配了多个 DNS server(我们有 `local`+`remote`,fake-ip 模式还有 `fakeip`)时,sing-box 不知道该用哪个去解析**出站服务器的域名**,必须显式指定,否则节点域名解析会失败。导入的节点几乎全是域名,没有这一行它们根本连不上。
+- 指向 `local`(直连解析)是因为代理服务器必须**直连可达**——不能用"走代理"的 `remote` 去解析代理自己的域名(又一个鸡生蛋)。
+- 注意 sing-box 有三个名字相近、位置不同的 resolver 字段,别放错:
+
+  | 字段 | 位置 | 用途 |
+  |------|------|------|
+  | `default_domain_resolver` | **`route` 块**(全局默认) | 解析出站服务器域名,我们用的这个 |
+  | `domain_resolver` | `dns.servers[]` 单个 server | 该 DNS server 地址是域名时 |
+  | `domain_resolver` | `outbounds[]` 单个出站 | 覆盖全局默认 |
+
+  `default_domain_resolver` 只属于 `route`;放进 `dns` 块会被 `sing-box check` 当成 unknown field 拒绝。
+
+---
+
+## 5. 配置注意事项
+
+### 5.1 sing-box
+
+- **不再有"是否配 tun"的争议**——当前架构下 tun 就是唯一入口,`module/common/magicctl` 的 `render_config` 直接生成 `inbounds: [{"type":"tun", ...}]`。
+- route 引擎用 1.13+ 的 action 式语法(`sniff`/`hijack-dns`/`reject`),避免已废弃字段。**特别注意**:`block` 和 `dns` 两种特殊出站在 sing-box **1.13 已移除**,所以默认 `outbounds.json` 里**不再有** `{"type":"block"}`/`{"type":"dns"}`,拦截一律用路由 `action: reject`、DNS 接管用 `action: hijack-dns`。装在 1.13 二进制上若带着这两个旧出站会直接 `check` 失败、服务起不来。
+- tun inbound 显式写了几个"显式优于隐式"的字段,不依赖版本默认值:
+  - `endpoint_independent_nat: true` 只在 `SBMAGIC_STACK=gvisor` 时写入(官方说明该字段仅 gvisor 可用;其他 stack 默认就是 endpoint-independent NAT)。
+  - `udp_timeout: "5m"`(UDP NAT 映射超时,避免大量短连接 UDP 把 NAT 表撑大,行为可预期)。
+- `SBMAGIC_STACK` 默认 `gvisor`,不是 sing-box 官方在带 gVisor tag 时的默认 `mixed`。原因是 `bench/results/avd-stack-benchmark-2026-06-30.md` 在 `Pixel_9_API_36_1_root` AVD 上验证: `system`/`mixed` 能通过 `check` 并启动,但 TCP 流量没有进入 tun inbound;`mixed` 的 TCP 半边也是 `system`,所以同样不可用。`system` 理论上少一层虚拟栈,但当前模块不把"理论更快"置于"实测可用"之前。
+- `cache_file` 开启;fake-ip 模式额外写 `store_fakeip: true`(见 §4.3)。
+- 规则集(geosite-cn / geoip-cn,`.srs` 格式)远程拉取,`download_detour: direct`,更新间隔默认 `168h`(7 天)。这就是"geofiles 自动更新"——sing-box 按间隔重下。clash API 没有可用的强制更新端点,所以模块提供 `magicctl ruleset-refresh` / WebUI"更新规则集":清掉规则集缓存后走安全 `reload` 触发重新下载(见 §8.4)。
+
+### 5.2 版本
+
+- 官方 sing-box **1.13.x 或更高 arm64/x86_64**,二进制放在 `module/bin/<abi>/sing-box`,按架构在 `customize.sh` 里选择拷贝。
+- 配置语法与二进制版本匹配,不可错配。
+
+---
+
+## 6. 进程身份与权限
+
+- **sing-box 当前以 root 运行**——原生 TUN 模式下,`auto_route`/`strict_route` 需要直接操作路由表和创建 tun 设备,降权方案比三层拆分时代更难(没有独立的特权编排进程帮它建好 tun 再交接),初版不强行降权。
+- `service.sh`/`post-fs-data.sh`/`customize.sh` 同样以 root 运行(Magisk/KernelSU 模块固有)。
+- 本地控制面(clash API)监听 `127.0.0.1:<随机高端口>`(默认 `SBMAGIC_API_PORT=auto`,首次启动生成并写入 `runtime/api.env`;仍可在 settings 里填数字固定),凭据(`SBMAGIC_API_SECRET`)同样由 `magicctl ensure_api_env` 随机生成,写入 `runtime/api.env`,权限 `600`(root 可读)。所有 `magicctl api` 调用都带 `Authorization: Bearer`。默认 `SBMAGIC_API_FIREWALL=true` 时,`magicctl start` 会加一条本机 OUTPUT 防火墙链,只允许 root/shell 访问该随机端口,普通 APP 扫 localhost 端口拿不到 clash API 的 401 指纹。
+- **取舍**:初版接受全 root 运行,把降权列为后续优化项,不在当前阶段卡 SELinux/降权细节。
+
+---
+
+## 7. 启动与进程守护
+
+### 7.1 启动阶段
+
+- `post-fs-data.sh`:只创建 `runtime/` 目录、记录模块路径,不做网络相关操作(此阶段网络栈未就绪)。
+- `service.sh`(late_start):等待 `sys.boot_completed=1`,再 sleep 5 秒缓冲,然后调用 `magicctl boot`(渲染配置 → 校验 → 启动 sing-box → 视情况拉 watchdog)。
+
+### 7.2 守护:长间隔轮询(当前实现)
+
+- `magicctl watchdog`:`while true; sleep $SBMAGIC_WATCHDOG_INTERVAL(默认300s); 检查 pid 存活,挂了就重启`。
+- 没有用 init service 托管(事件驱动、零轮询唤醒),原因是 Magisk/KernelSU 模块写 init service 单元跨 ROM 兼容性问题更大,初版用长间隔轮询换稳定性;300s 间隔符合"短间隔轮询是隐形耗电源,禁用"的底线。
+- `start_service`/`rollback_service` 成功后都会调用 `ensure_watchdog`(只要 `SBMAGIC_WATCHDOG=true` 且当前没有活的 watchdog 才拉新的),不只在 `boot` 路径拉看门狗,所以无论是开机自启还是用户在 WebUI 点"启动",看门狗都会跟着起来。
+- 看门狗在检测到 `SBMAGIC_ENABLED=false`(用户主动关闭,或下面崩溃自愈触发的自动关闭)时会**退出循环**,不会继续空转轮询——禁用状态下不该再有任何周期性唤醒。
+- `magicctl stop` 和 `disable` 现在都会**连看门狗一起停**(`stop_watchdog`),否则 `stop` 只杀 sing-box、看门狗下一轮会把它当崩溃又拉起来,"停不住"。内部的 restart/rollback/看门狗自愈路径不走这个,所以看门狗不会误杀自己(用 `"$wpid" != "$$"` 守卫)。
+- 配置变更不靠看门狗轮询生效,而是靠用户在 WebUI 点"应用并重启"这个**显式事件**触发 `reload`(见 §7.4)——架构上配置应用已是事件驱动,看门狗只管"进程死没死"这一件事。给 300s 的存活巡检再套一层 SIGHUP 事件管道属于过度设计,不做。
+- 后续优化方向:评估 init service 托管,把存活巡检也换成事件驱动。
+
+### 7.3 配置回退与崩溃自愈
+
+> 编辑配置(尤其是 `outbounds.json`、IPv6/DNS 相关开关)出错是真实会发生的事,需要一个"改坏了也能自己爬回来"的兜底,而不是指望用户每次都记得手动备份。
+
+**两层备份,两种粒度:**
+
+1. **单个配置文件级(`config.json` 的源文件)**——`magicctl config set <key>` 写入前会把旧文件备份成 `<file>.bak`(`settings.env.bak`、`outbounds.json.bak` 等)。`magicctl config rollback <key>` 把当前文件和 `.bak` 互换,所以连续调用两次等于"改了再改回去",不是单向操作。WebUI 每个编辑区都配了对应的"撤销上次保存"按钮。
+2. **渲染后整份运行配置级(`runtime/config.json`)**——`magicctl watchdog` 每次发现进程在一个完整的 `$SBMAGIC_WATCHDOG_INTERVAL` 周期里都存活,就把当前 `config.json` 提升为 `runtime/config.last-good.json`。这个"必须先活过一整个轮询周期才算数"的门槛,是为了避免把一个"能跑 1 秒但 10 分钟后崩"的坏配置误判成"好配置"。
+
+**崩溃自愈状态机(`watchdog()`):**
 
 ```
-sing-box(监听 SOCKS 入口 + DNS 端口)
-   └─► 系统层规则(per-app 打标 + DNS 53 重定向到 sing-box DNS 端口 + 防回环)
-        └─► hev(连接 SOCKS + 接管 tun)
-```
-- **sing-box 必须先就绪**:它要先监听好 SOCKS 入口(数据)和 DNS 端口,否则:
-  - hev 连 SOCKS 会失败重试;
-  - DNS 53 重定向的目标端口还没起来 → 开机瞬间 DNS 失败。
-- 顺序:**起 sing-box(确认 SOCKS + DNS 端口可连)→ 配系统层规则(打标 + DNS 重定向 + 防回环)→ 起 hev**。
-- 停止时反序:先撤系统层规则(恢复直连)→ 停 hev → 停 sing-box,避免规则指向已死进程导致全断网。
-
----
-
-## 3. 系统层 per-app 代理
-
-### 3.1 机制(Android)
-
-- 用 **nftables/iptables 按 APP 的 uid 打 fwmark**,决定流量是否进 tun。
-- `ip rule` 按 fwmark 分流到不同路由表:打标的进 tun 路由表(→hev),未打标的走默认网络(直连,零代理开销)。
-- 所有规则是特权操作,在 service.sh 的 root 阶段配置。
-
-### 3.2 黑白名单(UI 可切换)
-
-- **黑名单模式**:默认全部 APP 代理,排除名单内的 APP(它们直连)。
-- **白名单模式**:默认全部直连,只有名单内 APP 走代理(更省电,代理流量最小)。
-- 两种模式经 UI 切换,底层是 uid 集合的"默认动作 + 例外"翻转。
-
-### 3.3 限制
-
-- 被系统层判定要代理的 APP,流量进 hev 后 **uid 丢失**,故 sing-box 那层**不能再按 APP 区分**,只能按目的地。这没问题——APP 级决策已在系统层完成。
-
----
-
-## 3.5 DNS 处理设计(单独成节,易错)
-
-> DNS 这块逻辑绕、容易做错(典型错误:按 APP uid 屏蔽 DNS)。本节给出正确设计。
-
-### 3.5.1 三个基础事实
-
-1. **Private DNS 是系统全局设置**,不是 per-app。用户在系统设置里设一次,全局生效。
-2. **APP 用系统解析器时,DNS 查询由系统 netd 统一代发**——带的是**系统 uid,不带 APP uid**。故 **DNS 无法按 APP uid 区分**。
-3. **DNS 解析与"哪个 APP"无关**:同一域名谁查都该得到相同的直连/代理判断。所以 DNS 本就不需要按 APP 分。
-
-### 3.5.2 核心原则:两层解耦 + 系统层两类 nft 规则
-
-**DNS 全局统一接管,按"域名"分流;per-app 在"数据流量"层按 uid 分流。两层互不干扰。**
-
-| | DNS 层 | 数据流量层 |
-|---|--------|-----------|
-| 粒度 | **全局**(不分 APP) | **per-app**(按 uid) |
-| 依据 | 域名 | uid + 目标 IP(真实/fake) |
-| 接管方式 | nft 重定向 53 到 sing-box DNS 端口 | nft 按 uid 打 fwmark 进 tun |
-| 路径 | **直达 sing-box DNS,不经 hev/tun** | 经 tun → hev → sing-box |
-| fake-ip | 默认关闭;仅在域名优先模式可启用 | 假 IP 网段必须统一进 tun,否则排除 APP 会访问失败 |
-| 执行者 | 系统层 nft + sing-box DNS 引擎 | 系统层 nft + hev + sing-box |
-
-**系统层因此有两类独立的 nft 规则,别混:**
-1. **DNS 重定向规则(全局,不看 uid)**:把所有 53 流量 DNAT 到 sing-box DNS 端口。因为 DNS 由 netd 代发、不带 APP uid,所以这类规则**只能全局**,不能按 APP。
-2. **per-app 打标规则(按 uid)**:把"要代理 APP"的**非 DNS 流量**打 fwmark 进 tun。
-3. **可选 fake-ip 网段规则(按目标 IP)**:若启用 fake-ip,`198.18.0.0/15` 等假 IP 网段必须进入 tun 交给 sing-box 反查;这会让"排除 APP 访问代理域名"不再是硬直连,因此只适合域名优先模式。
-
-> 两类规则作用对象不同(一个管 53 DNS、一个管数据流量),独立配置,不冲突。
-
-### 3.5.3 DNS 接管机制(应对系统 DoT / 53)
-
-> **版本注**:`dns_mode: hijack` 是 sing-box **原生 tun inbound** 的 1.14+ 特性。hev 路线不配置 sing-box tun,因此不要依赖该字段;本架构默认由系统层手写 nft/iptables DNS 重定向。机制类似:把 53 引到 sing-box DNS。
-> **路径**:DNS 53 流量被 nft **直接重定向到 sing-box 的本地 DNS 端口,不经过 hev/tun**(DNS 不是"被代理的数据流量",不该绕 tun→socks5→UDP associate 那套,既慢又复杂)。
-
-系统 DNS 可能是明文 53 或 DoT(853),分别处理:
-
-**① 明文 53 — nft DNAT 重定向(标准做法)**
-- 系统层 nft 把目标端口 53 的 UDP/TCP 流量 **DNAT 重定向**到本地 sing-box 的 DNS 监听端口(全局,不看 uid)。
-- 不改系统 DNS 设置项,而是在**网络层劫持流量**:系统以为在查自己设的 DNS(如 8.8.8.8),包被改道到 sing-box。
-- 补充:部分场景系统可能绕过劫持,辅助手段是**把接口 DNS 指向本地地址**强制送入。
-
-**② DoT(853)— 区别对待,不要承诺 per-app 接管**
-- **不能伪造**:DoT 是 TLS 加密 + 证书验证,中间人会被证书校验挡死。
-- **系统级 Private DNS 常由 netd 发起**,UID 是系统组件,不是原 APP;因此不能稳定按 APP 判断"这个 DoT 属于谁"。
-- **会回落的(Android Private DNS"自动"模式)**:可选择屏蔽 853 逼其回落到 53,再由 nft 劫持到 sing-box DNS。必须真机验证回落,失败就撤规则。
-- **严格 Private DNS(hostname 模式)**:默认不拦截,UI 检测后提示用户改"自动/关闭"以获得完整接管。若强行 block,严格模式会直接断解析。
-- **应用内置 DoH/DoT**:本质是普通 HTTPS/TLS 数据流,只能随该 APP 的数据流量走代理或直连;模块无法在 DNS 层还原域名分流。
-
-**③ fake-ip 不是默认兜底**
-- fake-ip 可以让 sing-box 用"假IP↔域名"映射恢复域名,但它会影响所有 APP 的 DNS 答案。
-- 在硬 per-app 模式下,默认关闭 fake-ip,避免排除 APP 拿到假 IP 后无法直连。
-- 若启用 fake-ip,必须把假 IP 网段统一送入 sing-box,并在 UI 中明确提示:排除 APP 访问这些域名时也会被域名策略接管。
-
-### 3.5.4 fake-ip:可选能力,不是默认架构前提
-
-**先承认冲突:**
-- DNS 答案是全局的,不是 per-app 的。
-- 如果某个代理域名被返回 fake-ip,排除 APP 也会拿到这个 fake-ip。
-- 如果排除 APP 的数据流量不进 tun,它会直接访问 `198.18.0.0/15` 等假地址并失败。
-
-**因此定义两个模式:**
-
-| 模式 | fake-ip | per-app 语义 | 适用场景 |
-|------|---------|--------------|----------|
-| **硬 per-app 模式(默认)** | 关闭 | 排除 APP 真正不进代理栈 | 省电、兼容、语义清晰 |
-| **域名优先模式(高级)** | 开启 | 假 IP 网段统一进 tun;排除 APP 访问代理域名也会被接管 | 更强域名分流,接受"软排除" |
-
-**默认硬 per-app 模式如何分流:**
-- DNS 对 APP 返回真实 IP,按域名选择本地/远程 DNS 出口,但不返回 fake-ip。
-- 数据层按 uid 决定进不进 tun。
-- 进 tun 后,sing-box 可用 IP 规则集、已缓存 DNS 结果、TCP sniff(SNI/HTTP Host)恢复部分域名信息。
-- 限制:QUIC/ECH/无 SNI/纯 IP 访问无法稳定恢复域名,需要靠 IP rule-set 或直接走默认策略。
-
-**高级 fake-ip 模式如何启用:**
-- DNS 对代理域名返回 fake-ip,直连域名返回真实 IP。
-- 系统层增加目标 IP 规则:fake-ip CIDR 必须进 tun。
-- sing-box 收到 fake-ip 后反查域名,恢复域名级分流。
-- UI 必须明确提示:此模式不是"硬 per-app 排除";排除 APP 访问被判代理的域名时仍会进入 sing-box。
-
-**注意事项:**
-- fake-ip 不支持 `query_type` 分流,所有请求类型统一处理。
-- 移动端 fake-ip 会污染本地 DNS 缓存(Android 清缓存不便),切换模式时要重启相关 APP 或清理网络状态。
-- **与 IPv6 的关系**:若关闭 IPv6(见 14.2),要确保 AAAA 查询的处理一致(不返回 fake v6,或 v6 fake 网段也统一进 tun),避免应用拿到不可达地址。
-
-### 3.5.5 完整数据流
-
-```
-DNS 阶段(全局,直达 sing-box DNS 端口,不经 hev/tun):
-  APP/netd 发起 DNS
-    → 系统层 nft(全局,不看 uid):
-        ├─ 明文 53 → DNAT 重定向到 sing-box DNS 端口
-        ├─ DoT(自动模式且已验证会回落)→ 可屏蔽853 → 降级53 → 同上
-        └─ DoT(严格/不回落/应用内置)→ 不承诺DNS层接管,按数据流量策略处理
-    → sing-box DNS 引擎(本地端口,非 tun):
-        ├─ 硬 per-app 默认 → 返回真实 IP(按域名选择 DNS 出口)
-        └─ 域名优先模式 → 代理域名 fake-ip、直连域名真实 IP
-
-数据阶段(per-app,按 uid + 目标IP,经 tun):
-  APP 拿 IP 发起连接 → 系统层 nft(按 uid):
-    ├─ uid 不在代理集合 → 直连(不进 tun)
-    └─ uid 在代理集合:
-        ├─ 目标=真实IP → 进 tun → hev → sing-box(IP规则集/sniff/默认策略)
-        └─ 目标=fake-ip(仅域名优先模式) → 进 tun → sing-box反查域名
-
-可选 fake-ip 网段规则:
-  目标 IP 属于 fake-ip CIDR → 无论 APP uid,统一进 tun → sing-box 反查域名
-  代价:排除 APP 访问这些域名时不是硬直连。
+检测到进程不在 → 失败计数 +1
+  ├─ 失败计数 < 3  → 用当前配置重启(走正常 start_service)
+  └─ 失败计数 ≥ 3  → 判定为"这份配置本身有问题/反复崩溃",尝试:
+        ├─ 有 last-good 快照 → 回退到 last-good 并直接启动(跳过渲染)
+        │     ├─ 成功 → 失败计数清零,继续正常巡检
+        │     └─ 失败 → 判定为更严重的问题(二进制损坏/设备环境变化等)
+        └─ 没有 last-good 快照,或 last-good 也启动失败
+              → 关闭模块(SBMAGIC_ENABLED=false)、停掉看门狗,而不是无限重启
+                耗电、也不是放着一份会反复崩的配置在那干扰系统网络
 ```
 
-### 3.5.6 边界:严格 Private DNS / 强制 DoT 应用
+- **为什么 3 次才触发,不是 1 次**:避免偶发的网络抖动/系统资源紧张导致的单次崩溃就被误判成"配置坏了"而立刻回退,3 次连续失败(间隔 ≥300s,也就是至少 15 分钟内反复崩)才算"大概率是配置问题"。
+- **为什么最终选择"关闭"而不是"无限重启"**:无限重启在前台是吵的(`run_log` 狂刷),在后台是隐形耗电源(频繁拉起 Go 运行时 + gvisor 栈),"宁可暂时没有代理,也不要一个反复重启的进程在背景烧电"。
+- **手动触发**:`magicctl rollback`(WebUI 状态页有对应按钮)可以在用户自己发现"刚保存的配置好像有问题"时,不等 15 分钟,直接手动回退到 last-good。
 
-- 这类应用**不回落到 53**,屏蔽 853 会让它 DNS 失败、断网(社区已知问题)。
-- **系统级严格 Private DNS**:默认不屏蔽;UI 检测到后提示用户改"自动/关闭"以获得完整接管。若用户坚持严格模式,接受 DNS 层不可接管。
-- **应用内置强制 DoT/DoH**:按该 APP 的数据流量策略走代理或直连;模块不能在 DNS 层解密或还原。
-- **原则:宁可放弃对它的域名分流,也不要让它断网。**
+**已知限制(诚实写在这里,不要假装解决了)**:
+- 没有真正的网络连通性自检(比如"代理是否真的能访问外网")——`pid_alive` 只代表进程没死,不代表代理链路是通的(比如节点凭据错误、服务器侧封禁,sing-box 进程可能正常运行但代理不通)。这类问题目前需要用户自己在 WebUI 看流量/连接面板,或读日志判断,不会触发自动回退。
+- last-good 快照依赖看门狗持续运行;如果 `SBMAGIC_WATCHDOG=false`,快照不会更新,回退能力随之失效——这是默认开看门狗的另一个理由。
+- 全新安装后,如果用户第一次配置就写错了且在 15 分钟内反复崩,此时还没有任何 last-good 快照,自愈会直接走到"关闭模块"这一步,而不是回退到某个旧配置(因为没有旧配置可回退)。这是预期内的安全失败模式,不是 bug。
 
-### 3.5.7 一句话本质
+### 7.4 配置应用(`reload`)与启动并发安全
 
-- **DNS = nft DNAT 劫持 53 + 默认返回真实 IP;fake-ip 是域名优先高级模式,不是硬 per-app 默认。DoT 只对已验证会回落的自动模式可逼降级;严格模式提示用户调整,不无脑 block、不伪造。**
-- **per-app = 数据层按 uid 决定连接走不走代理。**
-- 两者解耦:DNS 不分 APP,代理与否在数据层定。**原则:宁可放弃域名分流,不让应用断网。**
-
----
-
-## 4. 启动与进程守护
-
-### 4.1 启动阶段
-
-- 用 **`service.sh`(late_start)**,不用 post-fs-data(网络栈未就绪,tun 创建会失败)。
-- 主动等待网络就绪,失败容错重试(建 tun 失败别直接退出)。
-- KernelSU 的 `boot-completed.sh` 更晚,确需系统完全起来可用它。
-
-### 4.2 进程守护:事件驱动优先
-
-- **优选:init service 托管**——hev 和 sing-box 注册为 init service,进程退出时 init 自动重启。系统级事件驱动,**闲时零轮询唤醒**,最省电。代价:init/SELinux 语法,跨 ROM 差异。
-- **回落:长间隔轮询**——while + pidof,间隔 ≥300s,异常时才密集检查。短间隔轮询是隐形耗电源,禁用。
-- 两个进程都要守护。
-
-### 4.3 tun 创建
-
-- 推荐 hev 自己 open `/dev/net/tun`(自包含)。确保设备存在、权限/SELinux 正确。
+- **没有进程内热重载**:sing-box 的 clash API `PUT /configs`(`updateConfigs`)在源码里是空函数(只 `render.NoContent`),根本不 reload;`PATCH /configs` 只改 `mode`。所以**不能**靠 clash API 热重载配置(那会"返回成功但什么都没发生",比重启更坑)。
+- 因此应用配置改动统一走 `magicctl reload` = **先渲染 + `sing-box check` 校验,通过了才 restart**。好处:配置写错时校验直接失败、**保住正在运行的进程**,而不是停成一个死服务。WebUI 的"应用并重启"按钮对应 `reload`,失败会提示"已保持原进程运行"。代价:restart 会重建 tun,现有连接会断后自动重连(亚秒级)。
+- **启动互斥锁**:`start_service`/`rollback_service` 的启动临界区用 `mkdir` 原子锁(`acquire_start_lock`)串行化。否则快速连点"启动",或看门狗恰好和手动启动同时触发,两个进程可能都通过 `pid_alive` 检查、都拉起 sing-box,后者覆盖 PID 文件、前者变成占着 tun 的孤儿,最终拖垮整个网络栈。锁会自动回收"持有者 PID 已死"的陈旧锁,避免被一个被杀的 magicctl 永久卡住。
 
 ---
 
-## 5. 配置注意事项(架构相关的固定要求)
+## 8. WebUI 与本地控制面
 
-> 注意:本节是**架构强制的配置要求**(如"sing-box 不配 tun"),区别于第 9 节用户可调的配置项。
+> 实现见 `module/webroot/`。
 
-### 5.1 sing-box(纯核心 + 目的地分流 + DNS 服务)
+### 8.1 目标
 
-sing-box 在本架构有**两个入口**(都不碰 tun):
+- 不用 node、不常驻,KernelSU WebUI 机制(`webroot/index.html` + `import { exec } from 'kernelsu'`)按需在 WebView 里渲染。
+- **面板并入 WebUI,不单独部署 Yacd/metacubexd 之类的静态 clash 面板**:自己的 WebUI 同时承担"配置编辑"和"状态/流量可视化"两件事,统一一个入口,减少多一份前端资源占用和维护成本。
+- 数据来源两条:
+  1. `exec()` 调 `magicctl status|logs|render`,拿模块自身状态、日志、配置文件内容(用于编辑表单)。
+  2. 通过 `magicctl api METHOD PATH [JSON]` 由 root 侧转发到 sing-box clash API,拿连接列表、流量统计等实时数据,以及调用真实可用的缓存清理端点(见 §8.4)。页面 JS 不直接读取 Bearer secret,也不直接 `fetch(127.0.0.1)`。
 
-- **socks inbound(数据)**:默认监听 **127.0.0.1 随机高端口**(非公网地址),接 hev 转来的被代理流量。必须配认证,并用系统层规则限制只有 hev/module 专用 uid 可访问。
-- **UDS 实验入口**:仅在同时确认 sing-box 与 hev/fork 都支持 UDS 后启用;不要在初版配置里依赖它。
-- **DNS 服务(解析)**:监听一个**本地 DNS 端口**(如 127.0.0.1:1053),接系统层 nft 重定向来的 DNS 查询。**注意:DNS 走本地端口直达,不经 hev/tun**(见 3.5.5)。
+### 8.2 访问控制
 
-其他:
-- **不配 tun inbound**。
-- **route 引擎做目的地分流**:1.13 的 action 式语法(`{"action":"sniff"}`/`"resolve"`/`"reject"`),按域名/IP/rule-set(.srs) 决定 outbound。
-- **DNS 引擎**:默认真实 IP 模式(本地 DNS detour direct + 远程 DNS detour proxy);fake-ip server 只作为域名优先高级模式启用。
-- **废弃字段规避**(1.13 已删):legacy special outbounds、inbound 的 sniff/domain_strategy 字段、direct 的 override_address/port、WireGuard outbound(改 endpoint)。
+- **clash API 凭据不下发到页面 JS 里硬编码,也不进入页面运行时**——WebUI 只调用 `magicctl api`,由 root 侧读取 `runtime/api.env` 并附加 Bearer。凭据始终只存在于 root-only 文件和 `magicctl` 子进程环境里,不进 webroot 静态资源、不进版本控制。
+- **clash API 本身只监听 `127.0.0.1` + 随机高端口**,且默认额外启用 owner/uid 防火墙,只允许 root/shell 访问控制端口。这样普通 APP 即使扫全 localhost 端口,也拿不到未授权响应指纹;如果 ROM 缺少 iptables owner match,防火墙会 best-effort 跳过,仍保留随机端口 + Bearer secret 作为防线。
+- WebUI 本身只能在 KernelSU Manager/KsuWebUI standalone app 的 WebView 里加载(`exec()` 桥接是 KernelSU 提供的特权能力,普通浏览器打开同样的 HTML 没有 `exec`,拿不到 secret,也就调不通控制类接口),这天然限制了"谁能打开这个面板"。
+- 结论:**不需要再加一层 nft/uid 限制访问面板**,当前的"root-only 凭据文件 + Bearer 校验 + WebUI 只能跑在特权 WebView 里"三件套已经构成合理的访问控制,后续如果发现本地检测/抓包能拿到 secret 再加固。
 
-### 5.2 hev-socks5-tunnel
+### 8.3 机制
 
-- tun 设备:名称、地址、MTU。tun `interface_name` 可设不显眼名(隐蔽)。
-- 上游:默认指向 sing-box 的 **127.0.0.1 随机高端口 SOCKS**。配置 `username/password`,并设置 `socks5.mark` 用于防回环。
-- UDS:仅在 fork 版本验证 TCP/UDP 后再作为可选传输。
-- 不做任何分流/决策,纯转发。
+- Web 资源放 `module/webroot/`,入口 `index.html`,KernelSU 安装时自动设权限和 SELinux context,不手动改。
+- 页面结构:深色主题 + 顶部 sticky header(状态点 + pill 式 Tab),五个 Tab——**状态 / 节点 / 应用 / 设置 / 日志**:
+  - **状态**:运行概览(running/pid/版本/API/模式…)、实时流量(走 clash API,含"清空 DNS / fake-ip 缓存"按钮,见 §8.4)、故障恢复(last-good 时间、失败计数、"立即回退"按钮 → `magicctl rollback`)。
+  - **节点**:节点导入(见 §8.4)+ `outbounds.json` 编辑(保存前本地 JSON 校验,写入时再做 `outbounds` 语义校验)+ "撤销上次保存"(`config rollback outbounds`)。
+  - **应用**:per-app 黑/白名单模式 + 全部应用选择器(默认显示全部应用,可筛用户/系统;点击加入/移除当前模式名单,新安装应用同步后置顶) + 高级包名文件编辑 + 撤销。
+  - **设置**:`settings.env` 按"基础/网络与TUN/DNS/本机控制面/维护"分组成 5 张卡片,数据驱动渲染,IPv6 开关旁带依赖提示;每张可"保存/撤销上次保存"。
+  - **日志**:`magicctl logs run|box|control`。
+- 改配置后统一走"应用并重启"按钮 → `exec("magicctl reload")`(先校验再重启,见 §7.4)。
 
-### 5.3 版本
+### 8.4 节点导入(分享链接/订阅)与 clash API 端点现状
 
-- 二进制用官方 sing-box **1.13.x 或更高 arm64**;配置语法与二进制版本匹配,不可错配。
-- **DNS 相关版本差异**:`dns_mode: hijack` 是 sing-box 原生 tun 的 **1.14+** 特性;hev 路线不配 sing-box tun,所以固定使用独立 DNS 配置项 + 手写系统层 nft/iptables 重定向。
-- fake-ip server、DNS 分流、各协议出站在 1.13.x 已具备,但 fake-ip 不作为硬 per-app 默认模式。
+**节点导入(对标 v2rayN 的"导入"体验)**——在 WebUI 的"节点"Tab:
+- 解析在**页面 JS** 里完成(JS 自带 base64/URL/JSON 能力,比 sh 干净可靠),把分享链接转成 sing-box 原生 outbound,再 `config set outbounds` 写入。
+- 支持协议:`vmess` / `vless`(含 reality、flow、ws/grpc/http 传输、uTLS 指纹)/ `trojan` / `ss`(SIP002 与旧版全 base64 两种写法,含 plugin)/ `hysteria2`(含 salamander obfs)/ `tuic` / `anytls`。
+- 支持**订阅链接/导出配置**:WebUI 调模块自带 `magic-fetch` 拉取 URL(UA 用 `v2rayN/...` 以拿到通用的 base64 分享链接列表),再按行解析。缺少 `magic-fetch` 视为安装不完整,不再退回 curl/wget/nc 这类设备环境不稳定的后端。订阅正文是单段 base64 时自动解码;也可直接粘贴 sing-box JSON/outbounds 导出。
+- 不支持 Clash YAML 订阅(需 YAML 解析器,暂不引入);这类订阅请先转换成分享链接列表或 sing-box outbounds JSON。
+- 写入方式两种:**替换**(整体替换节点)/ **追加**(保留已有节点再并入,同名自动改名 `-2`/`-3`…)。组装结果 = `selector(proxy)` + `urltest(auto)` + 各节点 + `direct`。导入后会立刻做 `outbounds` 语义校验(`proxy/direct` 必需、tag 不重复、selector/urltest 引用必须存在)和整配置 `check`,通过后仍需点"应用并重启"。
+- **不**在 sh 里写分享链接解析器(协议边界太多、极易出错),解析集中在 JS。
 
----
-
-## 6. 进程身份与权限(最小权限)
-
-| 组件 | 身份 | 原因 |
-|------|------|------|
-| service.sh 编排 | root | 配系统层规则、建 tun 必需;做完即退 |
-| 系统层规则 + tun + 路由 | root | 特权操作 |
-| hev | root 建tun后可降权 | open /dev/net/tun 需权限 |
-| **sing-box 核心** | **普通 uid + inet 组** | 只需本地 SOCKS 监听 + 出站,不需要 root;降权更安全更隐蔽 |
-| WebUI 查询命令 | 普通 uid | 只读状态无需 root |
-| WebUI 控制命令 | root | 重启/改路由才需要 |
-
-- **SELinux**:降权后 domain 要正确,否则本地监听/网络/配置读取可能被拦,可能需 `sepolicy.rule`。这是降权最易卡的点。
-- **本地 SOCKS 访问控制**:hev 与 sing-box 最好使用可区分 uid/mark;防火墙只允许 hev/module uid 连接 sing-box SOCKS 端口。
-- **文件权限**:配置/日志属主匹配降权 uid;凭据文件 root 可读即可,不要给普通 APP 可读。
-- **取舍**:初版可全 root 跑通,稳定后再降权加固,别一上来卡 SELinux。
+**clash API 端点现状(挖了 sing-box 主分支源码,避免做"假功能")**:
+- `PUT /configs` = 空桩(不 reload);`PATCH /configs` 只改 mode → 所以**没有**热重载,配置应用走 `reload`(§7.4)。
+- `PUT /providers/rules/*`(规则集 provider 更新)= 整段被注释掉、`findRuleProviderByName` 永远 404 → **规则集无法经 clash API 强制更新**。模块的手动更新按钮走 `magicctl ruleset-refresh`:清 cache 后安全重启,不是 API 热更新。
+- `POST /cache/dns/flush`、`POST /cache/fakeip/flush` = **真实现** → WebUI 状态页据此提供"清空 DNS / fake-ip 缓存"按钮(改了分流规则后清缓存,新查询立即按新规则走;但新增 server/节点仍需"应用并重启")。
 
 ---
 
-## 7. 进程间通信:本地 SOCKS 接口
+## 9. UI 可配置项清单
 
-### 7.1 默认方案:loopback TCP SOCKS
-
-- sing-box socks inbound 监听 `127.0.0.1:<随机高端口>`,不监听 `0.0.0.0`、WLAN/LAN 地址或公网地址。
-- socks inbound 必须启用 `username/password`;凭据随机生成,写入 root 可读配置。
-- 系统层加访问控制:仅允许 hev/module 专用 uid 访问该端口,其他 uid 连接直接拒绝。
-- hev 配置 `socks5.mark`,并在策略路由里让该 mark 查 main 表,避免 hev 连接 sing-box 的流量再次进 tun 形成回环。
-- sing-box 自身出站、规则集更新、bootstrap DNS 也必须排除自身 uid/mark,否则 direct/outbound 可能被重新打进 tun。
-
-**是否会被发现:**
-- 本机普通 APP 通常不能直接读取所有进程 socket 信息;但 root 检测类 APP、同 root 环境或有调试权限的对手可以通过 `/proc/net/tcp`、`ss/netstat`、端口探测、进程列表和路由规则发现本地监听。
-- 只监听 `127.0.0.1` + 随机端口 + 认证 + owner/uid 防火墙后,暴露面主要从"可连接代理"降为"可观察到本机有一个监听"。
-- 如果威胁模型包含本地 root 级检测,UDS 也不是万能:它隐藏端口,但 socket 文件、进程、tun 接口、路由/nft 规则仍可被发现。真正的隐藏要放在独立 root 隐藏子系统处理。
-
-### 7.2 UDS 实验方案
-
-- 只改 hev 不够:sing-box inbound 也要能监听 UDS,且 TCP/UDP relay 语义都要验证。
-- TCP over UDS 简单;UDP 若要全程无端口,需要确认 SOCKS5 UDP ASSOCIATE、UDP-in-TCP 或自定义封装在两侧一致。
-- 不建议增加一个常驻 TCP↔UDS bridge 来凑能力:多进程、多复制、多故障点,还抵消省电收益。
-- 结论:UDS 可以作为 fork 分支优化,但初版以 loopback TCP SOCKS 跑通和真机测电为准。
-
-### 7.3 不用 binder/广播
-
-- 广播是事件信令,传不了持续数据流。
-- binder 要改 hev/sing-box 源码,对大流量字节流不合适,并且破坏 SOCKS 协议边界。
-
----
-
-## 8. 面板:KernelSU WebUI(配置入口 + 状态可视化)
-
-### 8.1 为什么 WebUI(不用 node,不用纯 clash 面板)
-
-- **不用 node**:避免常驻进程,续航负担。
-- **clash 静态面板不够**:sing-box 在本架构只见 hev 转来的 socks 连接,拿不到 hev 侧 tun 统计、也拿不到 uid(在系统层),可视化失真。
-- **WebUI 方案**:前端是自写 HTML/JS,"后端"是 shell `exec()`,能跨系统层/hev/sing-box 三处取数,**零常驻进程**(WebView 按需开)。
-
-### 8.2 机制
-
-- Web 资源放模块根目录 `webroot/`,入口 `index.html`。安装时 KernelSU 自动设权限和 SELinux context,**勿手动改**。
-- `import { exec } from 'kernelsu'` 调系统命令拼视图。
-- Magisk 用户用 **KsuWebUI standalone** app 也能跑 WebUI。
-
----
-
-## 9. UI 可配置项清单(完整可视化)
-
-> 设计:**几乎所有 sing-box/hev/系统层参数都经 UI 设置**,模块不硬编码。
-> 生效方式:**统一"应用并重启代理"按钮**(改任何项后点一次,按 2.2 顺序:sing-box→系统层规则→hev)。
+> 设计:几乎所有 sing-box/per-app 参数都经 `settings.env` + WebUI 表单设置,模块不硬编码。改完点"应用并重启"生效(`magicctl reload`:先渲染/check,通过后重启;失败保持原进程)。
 
 ### 9.1 节点 / 上游(协议无关)
-- 协议类型(VLESS/VMess/Trojan/Shadowsocks/Hysteria2/TUIC/AnyTLS… 由 sing-box 支持的全集)
+- **分享链接/订阅/sing-box JSON 导入**(vmess/vless/trojan/ss/hysteria2/tuic/anytls,见 §8.4)——对标 v2rayN 的导入,无需手写 JSON;节点名/路径等文本按 UTF-8 解码,并对老中文订阅尝试 GB18030 兜底
+- 协议类型(VLESS/VMess/Trojan/Shadowsocks/Hysteria2/TUIC/AnyTLS… 由 sing-box 支持的全集),编辑 `outbounds.json`
 - 服务器地址、端口、UUID/密码等凭据
-- 传输层(TCP/WS/gRPC/HTTPUpgrade/HTTP2…)及其参数(path、host、service-name)
-- TLS:开关、SNI、ALPN、证书校验、**uTLS 指纹**(Chrome 等)
-- 多节点管理 + 切换 + 延迟测试(测试为按需触发,非常驻轮询)
+- 传输层(TCP/WS/gRPC/HTTPUpgrade/HTTP2…)及其参数
+- TLS:开关、SNI、ALPN、证书校验、uTLS 指纹
+- 多节点管理 + `urltest` 自动选优(参考 `outbounds.example.json`)
 
-### 9.2 per-app 代理(系统层)
-- **黑/白名单模式切换**
-- APP 列表勾选(读已安装应用 + uid)
-- 子进程/系统应用的处理
+### 9.2 per-app(`packages.exclude` / `packages.include`)
+- 黑/白名单模式切换(`SBMAGIC_PACKAGE_MODE`)
+- APP 列表勾选(WebUI 默认显示全部已安装应用,按应用名/包名搜索,点击行加入/移除当前模式名单)
 
-### 9.3 分流(sing-box 目的地)
-- 规则集订阅源(rule-set `.srs`,如 geoip/geosite 转换后的规则集)+ 更新间隔(默认 ≥7d)
-- 自定义规则(域名/IP → 代理/直连/拒绝)
-- 规则顺序调整(高频靠前)
-- `clash_mode` 全局/规则/直连切换
+### 9.3 分流
+- 规则集订阅源 + 更新间隔(`SBMAGIC_RULE_UPDATE_INTERVAL`,默认 168h;按间隔自动重下,无强制立即更新端点,见 §8.4)
+- 自定义直连域名(`dns-direct-domains.txt`)
+- `clash_mode` 全局/规则/直连切换(走 clash API `default_mode` / `PATCH /configs`,这个 PATCH 改 mode 是真实现)
 
-### 9.4 DNS(详见 3.5)
-- 远程 DNS(DoH/DoH3,走代理)、本地 DNS(直连)、sing-box DNS 监听端口
-- DNS 域名分流规则(决定哪些域名走代理/直连)
-- **DNS 模式**:硬 per-app 默认(真实 IP) / 域名优先高级模式(fake-ip)
-- **fake-ip 开关 + fake-ip 域名范围**:仅域名优先模式启用;UI 必须提示"排除 APP 访问假 IP 域名也会被接管"
-- **系统 DoT 处理**:自动模式可验证回落后逼降级;严格模式提示用户改自动/关闭;应用内置 DoH/DoT 按数据流量策略处理
-- nft DNS 重定向开关(53 → sing-box DNS 端口)
-- 缓存(optimistic)开关
-- **bootstrap DNS**(解析落地域名,防鸡生蛋,见 14.1)
+### 9.4 DNS
+- `SBMAGIC_DNS_MODE`:real-ip(默认)/ fake-ip
+- `SBMAGIC_DNS_LOCAL_TYPE` / `SBMAGIC_DNS_LOCAL_SERVER`(直连解析,默认 `https` + `223.5.5.5`)
+- `SBMAGIC_DNS_REMOTE_TYPE` / `SBMAGIC_DNS_REMOTE_SERVER`(走代理解析,默认 `https` + `1.1.1.1`)
+- `SBMAGIC_DNS_STRATEGY`(ipv4_only / prefer_ipv4 / ...)
+- `SBMAGIC_FAKEIP4` / `SBMAGIC_FAKEIP6`(fake-ip 模式才用)
 
 ### 9.5 网络 / tun
-- tun MTU、地址、interface_name
-- IPv6 开关
-- 本地 SOCKS 监听端口(随机生成/可重置)、访问控制状态
-- UDS socket 路径(仅 fork/实验模式显示)
+- `SBMAGIC_PROCESS_NAME`(默认 `netd-helper`,运行时二进制文件名,改名后 `reload` 会先停旧进程再用新名启动)
+- `SBMAGIC_MTU`、`SBMAGIC_INTERFACE`(默认 `utun0`,避免和模块 id 同名暴露身份)
+- `SBMAGIC_IPV6`
+- `SBMAGIC_STACK`(默认 `gvisor`;`system`/`mixed` 保留为实验选项,不作为默认)
 
 ### 9.6 保活 / 省电
-- keepalive 间隔(协议心跳参数)
-- 守护方式(init / 轮询间隔)
-- 电池白名单开关(Doze 对抗)
+- `SBMAGIC_WATCHDOG` / `SBMAGIC_WATCHDOG_INTERVAL`(默认 300s)
+- 电池白名单开关(Doze 对抗,需要 WebUI 引导用户去系统设置加白名单,模块本身不能直接改)
 
-### 9.7 伪装 / 隐蔽(可选,按需)
-- tun interface_name 低调名
-- 进程名(固定低调名)
-- 日志级别(默认 warn)
-
-### 9.8 系统 / 维护
-- 启动开关、开机自启
-- 配置导入/导出、备份
-- 二进制版本管理 / 更新
-- 状态面板:三层状态(系统层规则是否生效、hev/sing-box 存活)、流量统计、连接列表、日志查看
+### 9.7 系统 / 维护
+- `SBMAGIC_ENABLED` 启动开关
+- 配置导入/导出、备份(`/data/adb/singbox_tun_Magic/configs/`)
+- 状态面板:running/pid/版本、流量统计、连接列表、日志查看(WebUI,见 §8)
 
 ---
 
 ## 10. root 隐藏配合(仅当需要时)
 
-> 只防 CDN/服务器侧识别则**完全不需要本节**;仅当手机上有检测 root 会罢工的 APP 时相关。
+> 只防 CDN/服务器侧识别则完全不需要本节;仅当手机上有检测 root 会罢工的 APP 时相关。
 
 - 本模块保持普通 Magisk 模块,不做成 Zygisk 模块。
-- 隐藏靠独立装 Zygisk Next(整合了 Shamiko 大部分挂载隐藏)或 ReZygisk(注意与 Shamiko 不兼容,改配 NoHello/Treat Wheel)。
-- 进阶过 Play Integrity:Zygisk Next + Tricky-Store + PlayIntegrityFix。
-- 配合点:把本模块挂载痕迹纳入排除列表,tun interface_name 设低调名。
+- 隐藏靠独立装 Zygisk Next(整合了 Shamiko 大部分挂载隐藏)或 ReZygisk。
+- 配合点:把本模块挂载痕迹纳入排除列表,tun `interface_name` 设低调名(已默认 `utun0`)。
 
 ---
 
 ## 11. 流量伪装(配置层示例,非模块要求)
-
-> 这是"过 CDN + 防识别为代理"场景的**一种配置选择**,全部经 UI 配置,非模块硬编码。
 
 - 核心手段:落地挂真实网站 + 代理走自定义 path,让 CDN 看到"正常 HTTPS 站点"。
 - 传输层 path 设成像正常 API,避开烂大街默认 path。
@@ -498,134 +358,143 @@ sing-box 在本架构有**两个入口**(都不碰 tun):
 
 ---
 
-## 12. 连接保活与 Doze 对抗(分层)
+## 12. 连接保活与 Doze 对抗
 
 ### 12.1 协议心跳 — 核心自动处理
-- gRPC/WS/传输层 keepalive 由 sing-box **配置参数**驱动,自动发心跳、检测死连、重连。**不手搓发包**。
-- WS 与 gRPC 都有等价心跳,选哪个取决于"省电 vs 抗丢包",不取决于 ping/pong。
+- gRPC/WS/传输层 keepalive 由 sing-box 配置参数驱动,自动发心跳、检测死连、重连。
 
 ### 12.2 对抗 Doze — 系统层(核心管不到)
-- Doze 息屏冻结后台网络,在 sing-box 之上,换协议不解决。
-- 手段:**电池优化白名单**(优先,温和省电)、wakelock(费电慎用)、前台服务/持久通知。
+- 手段:电池优化白名单(优先,温和省电)、wakelock(费电慎用)、前台服务/持久通知。
 
 ### 12.3 调参真机实测
-- 看息屏后首次访问延迟:太长→连接断了调 keepalive/白名单;掉电快→心跳太勤调稀。电池白名单是性价比最高第一步。
+- 看息屏后首次访问延迟:太长 → 连接断了调 keepalive/白名单;掉电快 → 心跳太勤调稀。
 
 ---
 
 ## 13. 进程名伪装
 
-- 只防最低级字符串检测,**要固定低调名,不要随机化**(随机本身可疑;伪装内核线程名露馅)。
-- 优先级:tun 接口名 > uid 降权 > Zygisk 挂载隐藏 ≫ 进程名。最弱一环,顺手做。
-- 只防 CDN 则完全不用做。
+- **已实现基础低调化**:`customize.sh` 把 sing-box 原始二进制安装为 `$DATA_DIR/bin/.core`,`magicctl` 再按 `SBMAGIC_PROCESS_NAME` 生成运行时硬链接/副本(默认 `$DATA_DIR/bin/netd-helper`)并只执行这个路径。改进程名不需要更新模块包,WebUI 设置后 `reload` 会停旧路径进程并用新路径启动。
+- 这只防最低级字符串检测,不是 root 隐藏。高权限检测仍可通过 `/data/adb/singbox_tun_Magic` 路径、模块挂载痕迹、TUN 接口和路由规则判断代理模块存在。
+- 优先级仍然是:tun 接口名/per-app 排除/控制面收敛 > 进程名。
 
 ---
 
-## 14. 常见坑与排查(真机才暴露)
+## 14. 常见坑与排查
 
-### 14.1 DNS 鸡生蛋(必踩)
-- 远程 DNS 走代理,但落地域名要解析→死循环。解决:落地用 IP,或配 bootstrap 直连 DNS 解析落地域名。
+### 14.1 DNS 鸡生蛋
+- 见 §4.5。`SBMAGIC_DNS_LOCAL_SERVER`/`SBMAGIC_DNS_REMOTE_SERVER` 配 IP 字面量是默认解法;改成域名要给该 server 配 `domain_resolver`。
+- 节点/出站服务器域名解析靠 `route.default_domain_resolver`(见 §4.6),多 DNS server 时必须有,否则节点连不上。
 
-### 14.2 防回环(必踩)
-- hev 连接 sing-box 本地 SOCKS 的流量必须查 main 表,不能再次进 tun。使用 `socks5.mark` + `ip rule fwmark ... lookup main`。
-- sing-box 自身出站、规则集更新、bootstrap DNS、direct outbound 也要排除自身 uid/mark。
-- 验证方法:看 nft/iptables 计数器、`ip rule` 命中、sing-box direct 是否真的走默认网络。
+### 14.2 本地控制面暴露面
+- clash API 只监听 `127.0.0.1` + 随机高端口,凭据 root-only,WebUI 通过 `magicctl api` 转发而不是页面直连。默认还有 OUTPUT owner 防火墙,普通 APP 不应能连到该端口拿 401 指纹;若目标 ROM 缺少 iptables/owner match,会自动降级为随机端口 + Bearer secret,见 §8.2。
 
-### 14.3 本地 SOCKS 暴露面
-- 只监听 `127.0.0.1`,随机高端口,启用认证。
-- 防火墙按 owner/uid 限制访问,普通 APP 即使知道端口也连不上。
-- root 级本地检测仍可看到进程、tun、规则或监听,这属于 root 隐藏子系统范围,不要指望 SOCKS/UDS 单独解决。
+### 14.3 IPv6
+- 链路 v6 不完整 → 走 v6 通不了 → 卡。`SBMAGIC_IPV6=false` 是默认,建议先用 v4 跑通再开。fake-ip 模式下 v6 关闭则不返回 fake v6(见 §4.3)。
+- `SBMAGIC_IPV6=false` 不是"放过 IPv6 不管",而是"接管 IPv6 路由后整体拦截",防止真有 v6 出口的设备绕过代理泄漏,见 §4.4。
+- 开 `SBMAGIC_IPV6=true` 后如果没把 `SBMAGIC_DNS_STRATEGY` 从默认 `ipv4_only` 改掉,实际效果是"看起来开了但没生效"(不会有任何变化),这是预期行为,不是 bug,见 §4.4。
 
-### 14.4 fake-ip 与 per-app 冲突
-- 硬 per-app 模式默认关闭 fake-ip。
-- 启用 fake-ip 时,假 IP 网段必须统一进 tun;这会让排除 APP 访问代理域名时也被接管。
-- UI 必须把"硬排除"和"域名优先软排除"说清楚。
+### 14.4 MTU/MSS
+- `SBMAGIC_MTU` 默认 1400,够保守;层层封装后仍黑洞需考虑 MSS clamping(sing-box tun 本身不直接提供,需出站层配合或调小 MTU)。
 
-### 14.5 IPv6(高频翻车)
-- 链路 v6 不完整→走 v6 通不了→卡。建议初期关 v6 跑通再开。tun 的 v6 地址/路由别漏(防泄漏)。
+### 14.5 时间同步
+- 时间不准 → TLS 校验失败 → 代理全挂且报错难懂。
 
-### 14.6 MTU/MSS(隐蔽)
-- MTU 不对+层层封装→分片/黑洞。表现:开网页正常、大文件卡死。tun MTU 保守(1400),必要时 MSS clamping。
+### 14.6 默认配置不会真正代理
+- 全新安装时 `outbounds.json` 的 `proxy` selector 只有 `direct` 一个选项(`module/defaults/outbounds.json`),刻意做成"装上不出错但也不代理"的安全默认值。用户必须参考 `outbounds.example.json` 填真实节点信息到 `outbounds.json` 才会真正代理。`customize.sh` 安装时会打印提示。
 
-### 14.7 时间同步(TLS 前提)
-- 时间不准→TLS 校验失败→代理全挂且报错难懂。service.sh 加时间检查/同步。
+### 14.7 开机竞速
+- tun 创建与系统网络初始化打架。`service.sh` 已等 `sys.boot_completed` + 5 秒缓冲,如果某些 ROM 仍偶发失败,可以加重试逻辑。
 
-### 14.8 系统层规则与 ROM 差异
-- nft/iptables、fwmark、策略路由在不同 ROM/内核行为有差异,per-app 打标可能失效。这是系统层方案最需真机验证处。
+### 14.8 以为能"热重载 / 强制更新规则集"
+- sing-box 的 clash API `PUT /configs` 是空桩、rule-provider 更新被注释掉(见 §8.4),所以**没有**进程内热重载、也**没有**强制立即更新规则集的接口。配置改动一律走 `reload`(校验后重启,§7.4),规则集靠 `update_interval` 自动更新。能即时生效的只有 `POST /cache/*/flush` 清缓存。
 
-### 14.9 开机竞速
-- tun 创建与系统网络初始化打架。等网络 + 容错重试。
+### 14.9 升到 sing-box 1.14 前注意
+- 当前 DNS 已用 1.12+ 新 server 格式(§4.1),但 `route` 里若残留任何 1.14 才移除的旧字段需提前迁移;升级二进制后务必先 `magicctl check` 再 `reload`。`block`/`dns` 旧出站已在 1.13 清除(§5.1),不要在 `outbounds.json` 里加回来。
 
-### 14.10 热点/共享网络
-- 开热点时转发逻辑不同,热点设备流量可能不走代理或断网。需单独处理热点接口路由+其 uid 归属。
-
-### 14.11 配置生效与统计口径
-- "应用并重启":起 sing-box(SOCKS+DNS就绪)→ 重载系统层规则 → 起 hev;停止反序(先撤规则恢复直连,再停 hev、sing-box)。
-- 流量统计:系统层(打标流量)、hev(tun 总量)、sing-box(经它部分)口径不同,UI 展示别混。
+### 14.10 `system` / `mixed` TUN stack
+- sing-box 官方定义里,`system` 使用系统网络栈做 L3→L4 转换,`gvisor` 使用 gVisor 虚拟网络栈,`mixed` 是 system TCP + gVisor UDP。理论上 `system` 可能更省 CPU/内存,但当前 AVD root shell 测试显示它没有接管 TCP 连接,表现为客户端 `dial tcp ... i/o timeout`,日志里没有 inbound connection。
+- 因为 `mixed` 的 TCP 半边也是 `system`,它在同一测试里也失败。当前默认固定为 `gvisor`;除非在目标真机上完成 `magicctl check`、实际连通性和吞吐测试,否则不要为了理论性能切到 `system`/`mixed`。
 
 ---
 
-## 15. 关键检查清单
+## 15. 构建与发布
+
+- 模块 ID 固定为 `singbox_tun_Magic`,展示名为 `星盘`,运行目录为 `/data/adb/singbox_tun_Magic`。
+- 本地打包产物名固定为 `星盘.zip`:先运行 `scripts/build-helpers.ps1` 重建 `magic-fetch`(arm64-v8a/x86_64)和 `applist.dex`,再运行 `python scripts/package-module.py --output dist/星盘.zip`。x86_64 Go/Android helper 需要 Android NDK clang wrapper,脚本会从 `ANDROID_HOME`/`ANDROID_SDK_ROOT` 下自动查找。
+- `scripts/write-update-json.py` 生成 Magisk update metadata,`module.prop` 的 `updateJson` 指向 GitHub latest release 的 `update.json`;该 JSON 的 `zipUrl` 指向同一 release 下的 `星盘.zip`。
+- GitHub Actions `.github/workflows/release.yml` 在 tag `v*` 推送时自动构建、打包、生成 `update.json`,并把 `星盘.zip` 与 `update.json` 发布为 release 资产。workflow_dispatch 也可手动构建 artifacts。
+
+---
+
+## 16. 关键检查清单
 
 **架构正确性**
-- [ ] 系统层 nft/iptables 按 uid 打标做 per-app(谁进代理)
-- [ ] sing-box 只做目的地分流(域名/IP),不配 tun
-- [ ] hev 纯转发,不做决策
-- [ ] hev↔sing-box 默认用 `127.0.0.1` 随机高端口 SOCKS + 认证 + uid/owner 访问控制
-- [ ] UDS 仅作为 fork/实验路线,不阻塞初版
-- [ ] 启动顺序:sing-box(SOCKS+DNS就绪)→系统层规则(含防回环)→hev;停止反序
+- [ ] sing-box 单进程持有 tun + DNS + 路由 + 出站,不依赖第二个常驻二进制
+- [ ] per-app 用 `include_package`/`exclude_package`,不是 nft/iptables
+- [ ] route 引擎做目的地分流(域名/IP/rule-set),`hijack-dns` 接管 DNS
+- [ ] 配置渲染管线:`settings.env` + `outbounds.json` + packages 列表 + dns-direct 列表 → `runtime/config.json`
 
 **省电**
-- [ ] 白名单模式优先(代理流量最小)/ 按需黑名单
-- [ ] 守护用 init 事件驱动(或 ≥300s 轮询)
-- [ ] 直连流量经系统层排除,不进代理栈
-- [ ] 日志 warn+、规则集更新 ≥7d、DNS 缓存开
-- [ ] 电池白名单(Doze 对抗)
+- [ ] 架构默认黑名单(可用性优先);白名单模式给长期常驻用户作为更省电选项
+- [ ] 守护用 ≥300s 长间隔轮询(当前;init 事件驱动是后续优化方向)
+- [ ] 直连 APP(per-app 排除)完全不进 tun,数据和 DNS 都不经过
+- [ ] 日志 warn、规则集更新 ≥7d、cache_file 开
+- [ ] 电池白名单(Doze 对抗,需 WebUI 引导)
 
 **权限身份**
-- [ ] 特权操作集中 service.sh root 阶段
-- [ ] sing-box 降权 普通uid+inet 组(稳定后)
-- [ ] hev/sing-box uid 或 mark 可区分,本地 SOCKS 端口只允许模块内部访问
-- [ ] SELinux 验证通过、配置/日志/凭据权限匹配
+- [ ] sing-box 当前以 root 运行(原生 TUN 降权比三层拆分更难,初版不强求)
+- [ ] 控制面凭据 root-only(600),Bearer 校验,`127.0.0.1` only,端口默认 `auto` 随机高端口,默认 owner 防火墙阻断普通 UID 扫描
 
-**配置兼容**
-- [ ] 官方 sing-box 1.13.x+ arm64,配置语法与版本匹配
-- [ ] hev 路线不使用 sing-box tun 的 `dns_mode`;DNS 53 手写系统层 nft/iptables 重定向
-- [ ] 废弃字段已规避
+**配置版本**
+- [ ] 官方 sing-box 1.13.x+,配置语法与版本匹配
+- [ ] DNS 用 1.12+ 新 server 格式(type+server)、规则用 action 式;旧字段(`address` URL、顶层 `fakeip`、`reverse_mapping`、`independent_cache`)不下发
+- [ ] `block`/`dns` 旧特殊出站已移除(1.13 删除),拦截用 `action: reject`、DNS 用 `hijack-dns`
+- [ ] `route.default_domain_resolver` 已设(多 DNS server 时解析节点域名必需,见 §4.6)
+- [ ] tun 在 gvisor stack 下显式 `endpoint_independent_nat: true`,所有 stack 显式 `udp_timeout: "5m"`;fake-ip 模式显式 `store_fakeip: true`
 
-**UI**
-- [ ] per-app 黑白名单可切换
-- [ ] 协议/传输/TLS/分流/DNS/网络/保活 全可视化配置
-- [ ] "应用并重启"统一生效按钮
-- [ ] 三层状态 + 流量 + 日志可视化
+**应用配置 / 并发(详见 §7.4)**
+- [ ] 配置改动走 `reload`(校验后重启),不依赖 clash API 热重载(那是空桩)
+- [ ] `start`/`rollback` 有 `mkdir` 启动互斥锁,防快速连点产生孤儿进程
+- [ ] `stop`/`disable` 连看门狗一起停,不会被自动拉起
 
-**保活/坑**
-- [ ] 协议心跳走配置(不手搓);真机实测息屏延迟
-- [ ] DNS 鸡生蛋:落地用 IP 或 bootstrap DNS
-- [ ] IPv6 初期关;tun MTU 保守;时间同步检查
-- [ ] 系统层规则在目标 ROM 实测
+**IPv6(详见 §4.4)**
+- [ ] tun 始终带 IPv6 地址,claim 默认 v6 路由(不管 `SBMAGIC_IPV6` 开关)
+- [ ] `SBMAGIC_IPV6=false` 时:DNS 层拒绝 AAAA + 路由层 `action: reject` 所有 v6 目的地,双重防线
+- [ ] `SBMAGIC_IPV6=true` 时额外提示用户调整 `SBMAGIC_DNS_STRATEGY`,否则"开了等于没开"
+- [ ] fake-ip 的 v6 段只在 `SBMAGIC_IPV6=true` 时下发
 
-**DNS(详见 3.5)**
-- [ ] DNS 全局接管(不按 APP uid),分流在域名层
-- [ ] DNS 53 直达 sing-box DNS 端口,不经 hev/tun
-- [ ] sing-box 开两个入口:socks(loopback TCP,数据)+ DNS(本地端口)
-- [ ] 明文 53:nft DNAT 重定向到 sing-box DNS
-- [ ] DoT 区别对待:自动模式需验证回落;严格模式提示改自动/关闭;应用内置 DoH/DoT 按数据流量策略处理
-- [ ] 不无脑 block 853(会让强制DoT应用断网);不尝试伪造 DoT
-- [ ] 硬 per-app 默认关闭 fake-ip,返回真实 IP
-- [ ] fake-ip 仅域名优先高级模式启用;假 IP CIDR 必须统一进 tun
-- [ ] UI 明确提示 fake-ip 会把排除 APP 访问代理域名变成软排除
-- [ ] 系统层两类 nft 规则独立:DNS重定向(全局)+ per-app打标(uid)
-- [ ] 可选 fake-ip 网段规则与 per-app 语义分开展示
-- [ ] per-app(uid)在数据层,与 DNS 解耦
+**回退与崩溃自愈(详见 §7.3)**
+- [ ] 每个配置源文件 `config set` 自动留 `.bak`,`config rollback <key>` 可逆切换
+- [ ] watchdog 确认进程活过一整个轮询周期才把 `config.json` 提升为 `last-good`
+- [ ] 连续失败 ≥3 次自动尝试回退到 last-good,last-good 也失败则关闭模块而不是无限重启
+- [ ] `magicctl rollback` 支持手动立即回退,不必等 15 分钟
 
-**隐蔽(仅防本地检测才做)**
-- [ ] tun interface_name 低调名(优先级高于进程名)
-- [ ] 进程名固定低调名(非随机)
+**WebUI**
+- [ ] 面板并入 WebUI,不单独部署静态 clash 面板
+- [ ] clash API 凭据只由 `magicctl api` 在 root 侧读取,不写进静态页面资源,也不暴露给页面 JS
+- [ ] WebUI 只能在 KernelSU 特权 WebView 里跑,`exec()` 桥接天然限制访问者
+- [ ] 节点导入(分享链接/订阅,vmess/vless/trojan/ss/hysteria2/tuic,见 §8.4)
+- [ ] 状态页"清空 DNS / fake-ip 缓存"用真实 clash API 端点;各编辑区"撤销上次保存" + 故障恢复"立即回退"
+
+**隐蔽**
+- [ ] tun `interface_name` 用 `utun0` 等低调名(已完成)
+- [ ] 进程名基础低调化为 `netd-helper`,且可通过 `SBMAGIC_PROCESS_NAME` 手动改名(已完成,见 §13)
 - [ ] 伪装(挂站/path/证书/uTLS)属配置层,按需
 
-**解耦验证**
-- [ ] 系统层分流 与 sing-box 分流 职责不重叠
-- [ ] hev↔sing-box 仅通过 SOCKS 协议通信,传输层可从 loopback TCP 演进到 UDS fork
-- [ ] 代理 与 隐藏 子系统独立
-- [ ] 配置/规则 与 二进制 分离
+---
+
+## 17. 未来考虑:hev 三层拆分(fork 分支,不阻塞当前版本)
+
+完整的 hev + 本机 SOCKS + 系统层 nft 方案设计记录在 [singbox-module-dev.legacy-hev-design.md](singbox-module-dev.legacy-hev-design.md),包括:
+
+- hev↔sing-box 的 SOCKS 协议解耦、UDS 实验路线
+- 系统层 nftables per-app 打标 + 全局 DNS 重定向的两类规则设计
+- fake-ip 与 per-app 排除的冲突分析与两种模式定义
+- 进程降权(普通 uid + inet 组)、SELinux 隔离方案
+
+**触发重新评估的条件**(任一满足再考虑拾起):
+1. 真机长时间息屏待机数据显示原生 TUN 在主流 ROM 上明显更耗电(不是模拟器 20 秒空闲窗口这种噪声级别的差异)。
+2. 需要把 sing-box 降权到普通 uid 跑,而原生 TUN 模式下降权方案验证不通过(降权后无法自建 tun/改路由)。
+3. 出现"必须隐藏本机正在监听的 TCP 控制端口"这类强隐蔽需求(原生 TUN 模式下控制面仍是 loopback TCP)。
+
+在以上条件出现前,**不要并行维护两套架构**,以免文档/代码精力分散。
