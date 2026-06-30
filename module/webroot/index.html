@@ -134,18 +134,18 @@
   .stat-box .value { font-size: 17px; font-weight: 650; margin-top: 2px; }
 
   .pkglist { max-height: 440px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px; margin-top: 8px; background: #0a0c11; }
-  .pkglist .app-row { padding: 8px 9px; cursor: pointer; border-radius: 6px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid transparent; min-height: 54px; }
+  .pkglist .app-row { padding: 8px 9px; cursor: pointer; border-radius: 6px; display: grid; grid-template-columns: minmax(0, 1fr) 88px auto; align-items: center; gap: 10px; border: 1px solid transparent; min-height: 54px; }
   .pkglist .app-row:hover { background: var(--accent-soft); }
   .pkglist .app-row.new { border-color: rgba(54,211,153,.35); background: rgba(54,211,153,.08); }
   .pkglist .app-row.selected { border-color: rgba(91,140,255,.45); background: rgba(91,140,255,.12); }
-  .pkglist .app-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .pkglist .app-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   .pkglist .app-title { display: flex; gap: 6px; align-items: center; min-width: 0; }
-  .pkglist .app-label { font-size: 13px; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .pkglist .app-pkg { font-size: 11px; color: var(--faint); font-family: ui-monospace, monospace; }
+  .pkglist .app-label { font-size: 13px; color: var(--text); min-width: 0; white-space: normal; overflow-wrap: anywhere; line-height: 1.35; }
+  .pkglist .app-pkg { font-size: 11px; color: var(--faint); font-family: ui-monospace, monospace; white-space: normal; overflow-wrap: anywhere; word-break: break-all; line-height: 1.3; }
   .pkglist .app-badge { flex: none; font-size: 10px; color: var(--ok); border: 1px solid rgba(54,211,153,.35); border-radius: 999px; padding: 0 5px; line-height: 16px; }
-  .pkglist .app-action { flex: none; font-size: 11.5px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; white-space: nowrap; }
+  .pkglist .app-action { justify-self: end; align-self: center; font-size: 11.5px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 3px 8px; white-space: nowrap; text-align: center; }
   .pkglist .app-row.selected .app-action { color: var(--accent); border-color: rgba(91,140,255,.45); }
-  .pkglist .app-strategy { width: 88px; flex: none; padding: 5px 7px; font-size: 12px; }
+  .pkglist .app-strategy { width: 88px; justify-self: center; align-self: center; padding: 5px 7px; font-size: 12px; }
   .pkglist .app-empty { padding: 10px; color: var(--muted); font-size: 12px; cursor: default; }
   .pkg-tools { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
   .pkg-tools #pkg-filter { flex: 1; width: auto; }
@@ -171,6 +171,8 @@
     .field-control select, .field-control input { width: 100%; }
     .grid2 { grid-template-columns: 1fr; }
     .stat-grid { grid-template-columns: 1fr 1fr; }
+    .pkglist .app-row { grid-template-columns: minmax(0, 1fr) 88px; }
+    .pkglist .app-action { grid-column: 1 / -1; justify-self: start; }
   }
 </style>
 </head>
@@ -693,7 +695,9 @@ const KV_LABELS = {
   config: "运行配置", process_name: "进程名", tun_interface: "TUN 接口名", api: "控制面地址",
   mode: "Clash 模式", boot_start: "开机自启", package_mode: "TUN 名单模式",
   proxy_rule_mode: "代理规则", free_flow_rule_mode: "免流规则",
-  mixed_rule_priority: "混合优先级", dns_mode: "DNS 模式", ipv6: "IPv6",
+  mixed_rule_priority: "混合优先级", ruleset_download_detour: "规则下载出口",
+  ruleset_update_interval: "规则更新间隔", ruleset_cache_time: "规则缓存时间",
+  dns_mode: "DNS 模式", ipv6: "IPv6",
 };
 
 // ---------- 状态 / 故障恢复 ----------
@@ -711,7 +715,7 @@ async function refreshStatus() {
 
     const wrap = document.getElementById("status-kv");
     wrap.innerHTML = "";
-    ["enabled", "config_valid", "config_error", "running", "pid", "process_name", "tun_interface", "boot_start", "package_mode", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
+    ["enabled", "config_valid", "config_error", "running", "pid", "process_name", "tun_interface", "boot_start", "package_mode", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
       if (!(k in kv)) return;
       const row = document.createElement("div");
       row.className = "kv";
@@ -1630,6 +1634,7 @@ const SETTINGS_GROUPS = [
   {
     id: "group-maint",
     fields: [
+      { key: "SBMAGIC_RULESET_DOWNLOAD_DETOUR", label: "规则集下载出口", type: "select", options: ["proxy", "direct"], hint: "默认 proxy,让 geosite/geoip 从代理出口更新;网络环境不需要代理时可改 direct。" },
       { key: "SBMAGIC_RULE_UPDATE_INTERVAL", label: "规则集更新间隔", type: "text", hint: "例如 168h = 7 天,不建议调得太频繁。" },
     ],
   },

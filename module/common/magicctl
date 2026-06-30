@@ -79,6 +79,7 @@ load_settings_values() {
   SBMAGIC_API_PORT=auto
   SBMAGIC_API_FIREWALL=true
   SBMAGIC_API_MODE=Rule
+  SBMAGIC_RULESET_DOWNLOAD_DETOUR=proxy
   SBMAGIC_RULE_UPDATE_INTERVAL=168h
 
   if [ -f "$SETTINGS_FILE" ]; then
@@ -177,6 +178,7 @@ validate_settings() {
   validate_one_of "$SBMAGIC_DNS_REMOTE_TYPE" SBMAGIC_DNS_REMOTE_TYPE https tls quic h3 udp tcp
   validate_one_of "$SBMAGIC_DNS_FINAL" SBMAGIC_DNS_FINAL remote local
   validate_one_of "$SBMAGIC_API_MODE" SBMAGIC_API_MODE Rule Global Direct
+  validate_one_of "$SBMAGIC_RULESET_DOWNLOAD_DETOUR" SBMAGIC_RULESET_DOWNLOAD_DETOUR proxy direct
   validate_dns_server_literal "$SBMAGIC_DNS_LOCAL_SERVER" SBMAGIC_DNS_LOCAL_SERVER
   validate_dns_server_literal "$SBMAGIC_DNS_REMOTE_SERVER" SBMAGIC_DNS_REMOTE_SERVER
 }
@@ -731,7 +733,7 @@ EOF
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
-        "download_detour": "direct",
+        "download_detour": "$SBMAGIC_RULESET_DOWNLOAD_DETOUR",
         "update_interval": "$SBMAGIC_RULE_UPDATE_INTERVAL"
       },
       {
@@ -739,7 +741,7 @@ EOF
         "type": "remote",
         "format": "binary",
         "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
-        "download_detour": "direct",
+        "download_detour": "$SBMAGIC_RULESET_DOWNLOAD_DETOUR",
         "update_interval": "$SBMAGIC_RULE_UPDATE_INTERVAL"
       }
     ],
@@ -1104,6 +1106,33 @@ disable_service() {
   echo "disabled"
 }
 
+file_mtime_epoch() {
+  stat -c '%Y' "$1" 2>/dev/null || echo 0
+}
+
+file_mtime_text() {
+  stat -c '%y' "$1" 2>/dev/null | cut -d'.' -f1
+}
+
+ruleset_cache_time() {
+  newest_file=""
+  newest_epoch=0
+  for candidate in "$CACHE_DIR"/cache.db "$CACHE_DIR"/cache.db-* "$CACHE_DIR"/*.srs "$CACHE_DIR"/rule*; do
+    [ -f "$candidate" ] || continue
+    epoch="$(file_mtime_epoch "$candidate")"
+    case "$epoch" in ''|*[!0-9]*) epoch=0 ;; esac
+    if [ "$epoch" -gt "$newest_epoch" ]; then
+      newest_epoch="$epoch"
+      newest_file="$candidate"
+    fi
+  done
+  if [ -n "$newest_file" ]; then
+    file_mtime_text "$newest_file"
+  else
+    echo "none"
+  fi
+}
+
 status() {
   mkdirs
   status_config_error=""
@@ -1151,6 +1180,9 @@ status() {
   echo "proxy_rule_mode=$SBMAGIC_PROXY_RULE_MODE"
   echo "free_flow_rule_mode=$SBMAGIC_FREE_FLOW_RULE_MODE"
   echo "mixed_rule_priority=$SBMAGIC_MIXED_RULE_PRIORITY"
+  echo "ruleset_download_detour=$SBMAGIC_RULESET_DOWNLOAD_DETOUR"
+  echo "ruleset_update_interval=$SBMAGIC_RULE_UPDATE_INTERVAL"
+  echo "ruleset_cache_time=$(ruleset_cache_time)"
   echo "dns_mode=$SBMAGIC_DNS_MODE"
   echo "ipv6=$SBMAGIC_IPV6"
   if [ -f "$LAST_GOOD_FILE" ]; then

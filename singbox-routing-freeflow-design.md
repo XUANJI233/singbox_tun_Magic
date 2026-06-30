@@ -91,6 +91,7 @@ SBMAGIC_BOOT_START=false
 SBMAGIC_PROXY_RULE_MODE=bypass-cn
 SBMAGIC_FREE_FLOW_RULE_MODE=off
 SBMAGIC_MIXED_RULE_PRIORITY=proxy
+SBMAGIC_RULESET_DOWNLOAD_DETOUR=proxy
 ```
 
 说明：
@@ -99,6 +100,7 @@ SBMAGIC_MIXED_RULE_PRIORITY=proxy
 - `SBMAGIC_PROXY_RULE_MODE=bypass-cn`：保持当前“国内/私网直连，其余代理”的默认行为。
 - `SBMAGIC_FREE_FLOW_RULE_MODE=off`：免流默认关闭，用户明确配置后再启用。
 - `SBMAGIC_MIXED_RULE_PRIORITY=proxy`：混合模式下默认代理优先。免流关闭时不会产生额外影响。
+- `SBMAGIC_RULESET_DOWNLOAD_DETOUR=proxy`：geosite/geoip 规则集默认从 `proxy` 出口下载，避免 GitHub 规则源在直连网络里不可达。
 
 需要删除当前半成品里的错误模型：
 

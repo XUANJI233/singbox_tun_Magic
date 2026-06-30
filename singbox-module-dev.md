@@ -180,7 +180,7 @@ APP 流量 + DNS 查询
   - `udp_timeout: "5m"`(UDP NAT 映射超时,避免大量短连接 UDP 把 NAT 表撑大,行为可预期)。
 - `SBMAGIC_STACK` 默认 `gvisor`,不是 sing-box 官方在带 gVisor tag 时的默认 `mixed`。原因是 `bench/results/avd-stack-benchmark-2026-06-30.md` 在 `Pixel_9_API_36_1_root` AVD 上验证: `system`/`mixed` 能通过 `check` 并启动,但 TCP 流量没有进入 tun inbound;`mixed` 的 TCP 半边也是 `system`,所以同样不可用。`system` 理论上少一层虚拟栈,但当前模块不把"理论更快"置于"实测可用"之前。
 - `cache_file` 开启;fake-ip 模式额外写 `store_fakeip: true`(见 §4.3)。
-- 规则集(geosite-cn / geoip-cn,`.srs` 格式)远程拉取,`download_detour: direct`,更新间隔默认 `168h`(7 天)。这就是"geofiles 自动更新"——sing-box 按间隔重下。clash API 没有可用的强制更新端点,所以模块提供 `magicctl ruleset-refresh` / WebUI"更新规则集":清掉规则集缓存后走安全 `reload` 触发重新下载(见 §8.4)。
+- 规则集(geosite-cn / geoip-cn,`.srs` 格式)远程拉取,默认 `download_detour: proxy`(`SBMAGIC_RULESET_DOWNLOAD_DETOUR=proxy`),更新间隔默认 `168h`(7 天)。这就是"geofiles 自动更新"——sing-box 按间隔重下。clash API 没有可用的强制更新端点,所以模块提供 `magicctl ruleset-refresh` / WebUI"更新规则集":清掉规则集缓存后走安全 `reload` 触发重新下载(见 §8.4)。状态页的"规则缓存时间"来自本地 `cache.db`/规则缓存文件的最新 mtime,用于判断当前设备上的规则大致是什么时候落盘的。
 
 ### 5.2 版本
 
@@ -323,6 +323,7 @@ APP 流量 + DNS 查询
 - `SBMAGIC_PROXY_RULE_MODE`: `off` / `global` / `bypass-cn`
 - `SBMAGIC_FREE_FLOW_RULE_MODE`: `off` / `global`
 - `SBMAGIC_MIXED_RULE_PRIORITY`: `proxy` / `free-flow`
+- `SBMAGIC_RULESET_DOWNLOAD_DETOUR`: `proxy` / `direct`,默认 `proxy`
 - 规则集订阅源 + 更新间隔(`SBMAGIC_RULE_UPDATE_INTERVAL`,默认 168h;按间隔自动重下,无强制立即更新端点,见 §8.4)
 - 自定义直连域名(`dns-direct-domains.txt`)
 - `clash_mode` 全局/规则/直连切换(走 clash API `default_mode` / `PATCH /configs`,这个 PATCH 改 mode 是真实现)
