@@ -34,6 +34,7 @@ CONFIG_LOCK_DIR="$RUNTIME_DIR/config.lock"
 RUN_LOG="$LOG_DIR/sing-box.log"
 CONTROL_LOG="$LOG_DIR/control.log"
 CORE_VERSION_FILE="$RUNTIME_DIR/core.version"
+ANDROID_PACKAGES_XML="/data/system/packages.xml"
 
 # Consecutive watchdog-detected crashes within this many restart cycles
 # before we give up restarting the rendered config and try last-good /
@@ -42,6 +43,10 @@ FAIL_THRESHOLD=3
 API_CONNECT_TIMEOUT=1
 API_MAX_TIME=2
 API_RETRIES=1
+# sing-tun treats an empty include_package list as "no UID include filter",
+# which would let every app enter TUN. Keep whitelist mode closed by adding a
+# sentinel UID that should never belong to a real Android app.
+WHITELIST_SENTINEL_UID=4294967294
 
 mkdirs() {
   mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"
@@ -74,7 +79,7 @@ load_settings_values() {
   SBMAGIC_IPV6=false
   SBMAGIC_AUTO_ROUTE=true
   SBMAGIC_STRICT_ROUTE=true
-  SBMAGIC_PACKAGE_MODE=black
+  SBMAGIC_PACKAGE_MODE=white
   SBMAGIC_PROXY_RULE_MODE=bypass-cn
   SBMAGIC_FREE_FLOW_RULE_MODE=off
   SBMAGIC_MIXED_RULE_PRIORITY=proxy
@@ -93,6 +98,7 @@ load_settings_values() {
   SBMAGIC_API_MODE=Rule
   SBMAGIC_RULESET_DOWNLOAD_DETOUR=proxy
   SBMAGIC_RULE_UPDATE_INTERVAL=168h
+  SBMAGIC_SNIFF=false
   SBMAGIC_SNIFF_TIMEOUT=100ms
   SBMAGIC_OOM_PROTECT=false
   SBMAGIC_OOM_SCORE_ADJ=-900
@@ -264,6 +270,7 @@ validate_settings() {
   json_bool "$SBMAGIC_AUTO_ROUTE" >/dev/null
   json_bool "$SBMAGIC_STRICT_ROUTE" >/dev/null
   json_bool "$SBMAGIC_API_FIREWALL" >/dev/null
+  json_bool "$SBMAGIC_SNIFF" >/dev/null
   json_bool "$SBMAGIC_OOM_PROTECT" >/dev/null
 
   validate_uint_range "$SBMAGIC_WATCHDOG_INTERVAL" SBMAGIC_WATCHDOG_INTERVAL 60 86400
@@ -461,6 +468,41 @@ package_file_has_entries() {
     }
     END { exit(found ? 0 : 1) }
   ' "$file" 2>/dev/null
+}
+
+package_file_entry_count() {
+  file="$1"
+  [ -f "$file" ] || { echo 0; return 0; }
+  awk '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[ \t]+/, "", line)
+      sub(/[ \t]+$/, "", line)
+      if (line != "" && line !~ /^#/) count++
+    }
+    END { print count + 0 }
+  ' "$file" 2>/dev/null
+}
+
+package_database_readable_text() {
+  if [ -r "$ANDROID_PACKAGES_XML" ]; then
+    echo true
+  else
+    echo false
+  fi
+}
+
+validate_package_database_access() {
+  case "$SBMAGIC_PACKAGE_MODE" in
+    white)
+      package_file_has_entries "$INCLUDE_FILE" || return 0
+      ;;
+    *)
+      package_file_has_entries "$EXCLUDE_FILE" || return 0
+      ;;
+  esac
+  [ -r "$ANDROID_PACKAGES_XML" ] || die "cannot read $ANDROID_PACKAGES_XML; package-based TUN entry filtering would not resolve app UIDs"
 }
 
 first_package_conflict_files() {
@@ -731,7 +773,7 @@ package_field() {
   case "$mode" in
     white)
       arr="$(json_array_from_file "$INCLUDE_FILE")"
-      printf ',\n      "include_package": %s' "$arr"
+      printf ',\n      "include_uid": [%s],\n      "include_package": %s' "$WHITELIST_SENTINEL_UID" "$arr"
       ;;
     *)
       arr="$(json_array_from_file "$EXCLUDE_FILE")"
@@ -770,6 +812,17 @@ render_config() {
   forced_proxy_rules="$(route_proxy_rules "$proxy_packages")"
   forced_free_flow_rules="$(route_free_flow_rules "$free_flow_packages")"
   mixed_rules="$(route_mixed_rules)"
+  sniff_rule=""
+  if [ "$SBMAGIC_SNIFF" = "true" ]; then
+    sniff_rule=$(cat <<EOF
+,
+      {
+        "action": "sniff",
+        "timeout": "$SBMAGIC_SNIFF_TIMEOUT"
+      }
+EOF
+)
+  fi
 
   # The tun interface always claims a (non-routable ULA) IPv6 address so
   # auto_route grabs the IPv6 default route too -- even when SBMAGIC_IPV6 is
@@ -933,11 +986,7 @@ EOF
       {
         "protocol": "dns",
         "action": "hijack-dns"
-      },
-      {
-        "action": "sniff",
-        "timeout": "$SBMAGIC_SNIFF_TIMEOUT"
-      },
+      }$sniff_rule,
       $route_ipv6_guard{
         "ip_is_private": true,
         "outbound": "direct"
@@ -984,6 +1033,7 @@ check_config() {
 
 validate_runtime_ready() {
   ensure_no_strategy_conflicts
+  validate_package_database_access
 
   need_proxy=false
   need_free_flow=false
@@ -1489,12 +1539,26 @@ status() {
     echo "current_oom_score_adj=$(cat "/proc/$(cat "$PID_FILE")/oom_score_adj" 2>/dev/null || echo unknown)"
   fi
   echo "package_mode=$SBMAGIC_PACKAGE_MODE"
+  echo "package_database_readable=$(package_database_readable_text)"
   echo "proxy_rule_mode=$SBMAGIC_PROXY_RULE_MODE"
   echo "free_flow_rule_mode=$SBMAGIC_FREE_FLOW_RULE_MODE"
   echo "mixed_rule_priority=$SBMAGIC_MIXED_RULE_PRIORITY"
+  proxy_strategy_count="$(package_file_entry_count "$PROXY_PACKAGES_FILE")"
+  free_flow_strategy_count="$(package_file_entry_count "$FREE_FLOW_PACKAGES_FILE")"
+  strategy_package_count=$((proxy_strategy_count + free_flow_strategy_count))
+  strategy_process_lookup=false
+  if [ "$proxy_strategy_count" -gt 0 ] && [ "$SBMAGIC_PROXY_RULE_MODE" != "off" ]; then
+    strategy_process_lookup=true
+  fi
+  if [ "$free_flow_strategy_count" -gt 0 ] && [ "$SBMAGIC_FREE_FLOW_RULE_MODE" != "off" ]; then
+    strategy_process_lookup=true
+  fi
+  echo "strategy_package_count=$strategy_package_count"
+  echo "strategy_process_lookup=$strategy_process_lookup"
   echo "ruleset_download_detour=$SBMAGIC_RULESET_DOWNLOAD_DETOUR"
   echo "ruleset_update_interval=$SBMAGIC_RULE_UPDATE_INTERVAL"
   echo "ruleset_cache_time=$(ruleset_cache_time)"
+  echo "sniff=$SBMAGIC_SNIFF"
   echo "sniff_timeout=$SBMAGIC_SNIFF_TIMEOUT"
   echo "dns_mode=$SBMAGIC_DNS_MODE"
   echo "ipv6=$SBMAGIC_IPV6"

@@ -387,12 +387,12 @@
       <div class="field-row">
         <div class="field-main">
           <label>模式</label>
-          <div class="field-hint">黑名单装上就大多数应用可用;白名单代理流量最小,长期常驻更省电。</div>
+          <div class="field-hint">白名单只让点选应用进入 TUN,性能/省电最好;黑名单适合临时全局接管。安装新应用不会切换模式。</div>
         </div>
         <div class="field-control">
           <select id="package-mode">
-            <option value="black">黑名单(默认全代理)</option>
             <option value="white">白名单(默认全直连)</option>
+            <option value="black">黑名单(默认全代理)</option>
           </select>
         </div>
       </div>
@@ -410,7 +410,7 @@
     <div class="card">
       <div class="card-head">
         <h2>应用选择器</h2>
-        <p id="pkg-picker-hint">点击同步应用列表后可点选应用。</p>
+        <p id="pkg-picker-hint">名单决定是否进入 TUN;自动/代理/免流只决定进入 TUN 后的出站策略。</p>
       </div>
       <div class="pkg-tools" id="pkg-tools">
         <input type="text" id="pkg-filter" placeholder="搜索应用名 / 包名" autocomplete="off" />
@@ -763,13 +763,15 @@ const KV_LABELS = {
   running: "运行中", pid: "进程 PID", api_alive: "控制 API", tun_alive: "TUN 存在", data_dir: "数据目录",
   config: "运行配置", process_name: "进程名", tun_interface: "TUN 接口名", api: "控制面地址",
   mode: "Clash 模式", boot_start: "开机自启", init_service: "init 后备", init_service_seen: "init 入口时间", package_mode: "TUN 名单模式",
+  package_database_readable: "包数据库可读",
   watchdog: "进程托管", watchdog_running: "托管运行中", watchdog_mode: "托管模式",
   network_watch: "网络事件监听", network_watch_running: "网络监听运行中", network_change_flush: "切网清旧连接", network_recovery_cooldown: "网络恢复冷却",
   oom_protect: "低内存保护", oom_score_adj: "OOM 分值", current_oom_score_adj: "当前 OOM 分值",
   proxy_rule_mode: "代理规则", free_flow_rule_mode: "免流规则",
   mixed_rule_priority: "混合优先级", ruleset_download_detour: "规则下载出口",
   ruleset_update_interval: "规则更新间隔", ruleset_cache_time: "规则缓存时间",
-  sniff_timeout: "嗅探超时", dns_mode: "DNS 模式", ipv6: "IPv6",
+  strategy_package_count: "强制策略应用数", strategy_process_lookup: "包名识别热路径",
+  sniff: "路由嗅探", sniff_timeout: "嗅探超时", dns_mode: "DNS 模式", ipv6: "IPv6",
 };
 
 // ---------- 状态 / 故障恢复 ----------
@@ -797,7 +799,7 @@ async function refreshStatusInner() {
 
     const wrap = document.getElementById("status-kv");
     wrap.innerHTML = "";
-    ["enabled", "config_valid", "config_error", "running", "pid", "api_alive", "tun_alive", "watchdog_running", "network_watch_running", "current_oom_score_adj", "process_name", "tun_interface", "boot_start", "init_service", "init_service_seen", "network_recovery_cooldown", "package_mode", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "sniff_timeout", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
+    ["enabled", "config_valid", "config_error", "running", "pid", "api_alive", "tun_alive", "watchdog_running", "network_watch_running", "current_oom_score_adj", "process_name", "tun_interface", "boot_start", "init_service", "init_service_seen", "network_recovery_cooldown", "package_mode", "package_database_readable", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "strategy_package_count", "strategy_process_lookup", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "sniff", "sniff_timeout", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
       if (!(k in kv)) return;
       const row = document.createElement("div");
       row.className = "kv";
@@ -1735,11 +1737,13 @@ document.getElementById("btn-import-sub").addEventListener("click", async () => 
 
 // ---------- 应用 ----------
 let perAppLoaded = false;
+let loadedPackageMode = "";
 
 async function loadPerApp() {
   try {
     const settings = parseKv(await ctl("config", "get", "settings"));
-    document.getElementById("package-mode").value = settings.SBMAGIC_PACKAGE_MODE || "black";
+    loadedPackageMode = settings.SBMAGIC_PACKAGE_MODE || "white";
+    document.getElementById("package-mode").value = loadedPackageMode;
     document.getElementById("exclude-text").value = await ctl("config", "get", "exclude");
     document.getElementById("include-text").value = await ctl("config", "get", "include");
     document.getElementById("proxy-packages-text").value = await ctl("config", "get", "proxy-packages");
@@ -1760,7 +1764,11 @@ async function savePerApp() {
       await ctlWithStdin(strategyPackagesPayload(), "config", "set-strategies");
       await ctlWithStdin(document.getElementById("exclude-text").value, "config", "set", "exclude");
       await ctlWithStdin(document.getElementById("include-text").value, "config", "set", "include");
-      await setSettingValue("SBMAGIC_PACKAGE_MODE", document.getElementById("package-mode").value);
+      const currentPackageMode = document.getElementById("package-mode").value;
+      if (currentPackageMode !== loadedPackageMode) {
+        await setSettingValue("SBMAGIC_PACKAGE_MODE", currentPackageMode);
+        loadedPackageMode = currentPackageMode;
+      }
       toast("已保存,记得去状态页点\"应用并重启\"生效");
     } catch (e) { toast(e.message); }
   });
@@ -2113,7 +2121,8 @@ const SETTINGS_GROUPS = [
     fields: [
       { key: "SBMAGIC_RULESET_DOWNLOAD_DETOUR", label: "规则集下载出口", type: "select", options: ["proxy", "direct"], hint: "默认 proxy,让 geosite/geoip 从代理出口更新;网络环境不需要代理时可改 direct。" },
       { key: "SBMAGIC_RULE_UPDATE_INTERVAL", label: "规则集更新间隔", type: "text", hint: "例如 168h = 7 天,不建议调得太频繁。" },
-      { key: "SBMAGIC_SNIFF_TIMEOUT", label: "嗅探超时", type: "text", hint: "例如 100ms。越小首连越快,但极慢首包场景可能少量影响域名分流。" },
+      { key: "SBMAGIC_SNIFF", label: "路由嗅探", type: "bool", defaultValue: "false", hint: "默认关闭以降低首连延迟。仅当某些应用不走系统 DNS、域名分流明显缺失时再开启。" },
+      { key: "SBMAGIC_SNIFF_TIMEOUT", label: "嗅探超时", type: "text", hint: "例如 100ms。越小首连越快;路由嗅探关闭时此项不会写入运行配置。" },
     ],
   },
 ];
@@ -2122,6 +2131,7 @@ let settingsRawText = "";
 let settingsLoaded = false;
 
 function buildFieldRow(f, current) {
+  const value = current === "" && f.defaultValue !== undefined ? f.defaultValue : current;
   const row = document.createElement("div");
   row.className = "field-row";
 
@@ -2146,7 +2156,7 @@ function buildFieldRow(f, current) {
     ["true", "false"].forEach(v => {
       const o = document.createElement("option");
       o.value = v; o.textContent = v === "true" ? "开启" : "关闭";
-      if (current === v) o.selected = true;
+      if (value === v) o.selected = true;
       input.appendChild(o);
     });
   } else if (f.type === "select") {
@@ -2154,13 +2164,13 @@ function buildFieldRow(f, current) {
     f.options.forEach(v => {
       const o = document.createElement("option");
       o.value = v; o.textContent = v;
-      if (current === v) o.selected = true;
+      if (value === v) o.selected = true;
       input.appendChild(o);
     });
   } else {
     input = document.createElement("input");
     input.type = f.type === "number" ? "number" : "text";
-    input.value = current ?? "";
+    input.value = value ?? "";
   }
   input.dataset.key = f.key;
   ctrl.appendChild(input);

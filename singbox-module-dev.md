@@ -2,7 +2,7 @@
 
 > 形态:Magisk/KernelSU 模块,su 权限常驻运行。
 > 设计目标(按优先级):**全天常驻省电 > 链路稳定 > 隐蔽性**。
-> **当前架构(已落地):sing-box 原生 TUN 单进程**——per-app 用 Android `include_package`/`exclude_package`,目的地分流用 sing-box route 引擎,DNS 用 `hijack-dns` action,全部在一个进程里完成。
+> **当前架构(已落地):sing-box 原生 TUN 单进程**——per-app 入口控制用 tun inbound 的 `include_package`/`exclude_package`(root CLI 下由 sing-tun 转成 Android UID 路由规则),目的地分流用 sing-box route 引擎,DNS 用 `hijack-dns` action,全部在一个进程里完成。
 > **不再使用** hev-socks5-tunnel + 本机 loopback SOCKS 的三层拆分方案。该方案的完整设计记录在 [singbox-module-dev.legacy-hev-design.md](singbox-module-dev.legacy-hev-design.md),仅作**未来 fork/对比实验**的参考,不是当前实现的一部分(见第 17 节)。
 
 > ⚠️ 本文档分**架构层**(模块固有设计,写死)与**配置层**(用户经 UI 设置,不硬编码)。
@@ -17,7 +17,7 @@
 - **吞吐**:并发下载场景,sing-box 原生 TUN 比 hev+SOCKS 快了近 50%(7.96 MiB/s vs 5.35 MiB/s);单流场景两者接近。
 - **CPU 效率**:下载方向原生 TUN 每 MiB 耗 CPU 更低;上传方向 hev 略低,但差距在个位百分比。
 - **内存**:小负载下 hev 方案省 ~4MiB;但加压并发后反转,原生 TUN 涨到 ~73MiB,hev 方案稳定在 ~58MiB。
-- **架构复杂度**:Android 的 `VpnService` per-app 排除(`include_package`/`exclude_package`)是系统级机制,**排除的 APP 连 DNS 查询都不会进 VPN 接口**——这天然解决了旧文档第 3.5 节大段讨论的"DNS 不能按 uid 区分、需要两类独立 nft 规则"的问题。单进程原生 TUN 不需要手写 nftables 规则、不需要本机 SOCKS 入口、不需要凭据同步、不需要防回环 mark 方案。
+- **架构复杂度**:sing-box/sing-tun 的 Android package 规则会把 `include_package`/`exclude_package` 解析成 UID 路由规则,配合 `auto_route` 控制哪些应用进入 TUN。被排除 UID 的数据和常规 DNS 不会进入本模块的 TUN/DNS 路径,天然避免了旧文档第 3.5 节"DNS 全局 nft 重定向后不能按 uid 区分"的问题。单进程原生 TUN 不需要手写 nftables 规则、不需要本机 SOCKS 入口、不需要凭据同步、不需要防回环 mark 方案。
 
 **结论**:吞吐/CPU 数据没有压倒性地支持 hev 方案,而原生 TUN 在架构复杂度上大幅简化(少一个常驻进程、少一套 nft 规则、少一个本地协议接口要维护)。复杂度降低本身就是省电/省维护成本的收益,所以当前版本**全面采用 sing-box 原生 TUN**,不做三层拆分。
 
@@ -34,9 +34,9 @@ APP 流量 + DNS 查询
          │
          ▼
 ┌─────────────────────────────────────────────┐
-│ Android VpnService per-app 排除/包含          │
+│ sing-box/sing-tun Android package 规则       │
 │  (sing-box tun inbound 的 include_package/    │
-│   exclude_package,系统级,DNS 与数据流量一起处理)│
+│   exclude_package → UID policy routing)       │
 │  ├─ 不代理的 APP → 完全不经过 tun 接口         │
 │  └─ 要代理的 APP → 数据 + DNS 都进 tun         │
 └─────────────────────────────────────────────┘
@@ -47,7 +47,7 @@ APP 流量 + DNS 查询
                     ▼
             route 引擎
               ├─ protocol=dns → hijack-dns(交给 DNS 模块处理,不当数据转发)
-              ├─ sniff(SNI/HTTP Host,300ms)
+              ├─ 可选 sniff(SNI/HTTP Host,默认关闭)
               ├─ clash_mode Direct/Global 覆盖
               ├─ ip_is_private → direct
               ├─ domain_suffix cn / rule_set(geosite-cn, geoip-cn) → direct
@@ -63,12 +63,13 @@ APP 流量 + DNS 查询
 ```
 
 - 一个进程同时持有 tun、DNS、路由、协议出站,没有本机 SOCKS 中转,没有第二个常驻二进制。
-- per-app 决策和"进不进 tun"是 Android 系统层(`VpnService`)完成的,sing-box 看到的已经是"被代理的流量",不需要也不能再按 uid 分。
+- per-app 决策和"进不进 tun"由 sing-box/sing-tun 的 Android package 规则完成:包名先映射到 UID 范围,再通过 `auto_route` 下发 policy routing。sing-box route 层看到的是已经进入 TUN 的流量;不要把 route 里的 `package_name` 策略误解成"是否进入 TUN"。
 
-### 1.2 per-app(系统级,非 nft)
+### 1.2 per-app(UID 路由级,非 nft)
 
 - 用 sing-box tun inbound 的 `include_package`(白名单)或 `exclude_package`(黑名单)字段,对应模块的 `packages.include` / `packages.exclude` 文件,见 `module/defaults/`。
-- 这是 Android `VpnService` 原生能力,**排除的 APP 的数据和 DNS 都不会进入 tun 接口**,不存在旧文档里"DNS 全局接管、排除 APP 的 DNS 仍被拦截"的问题。
+- 在本模块这种 root CLI 形态下,这是 sing-tun 的 Android package 规则能力:包名解析为 UID 范围后由 `auto_route` 生成路由规则。**被排除 UID 的数据和常规 DNS 都不会进入本模块 tun 接口**,不存在旧文档里"DNS 全局接管、排除 APP 的 DNS 仍被拦截"的问题。
+- 进入 TUN 之后的"自动/代理/免流"不是入口控制,而是 sing-box route 层的出站策略。`packages.proxy` / `packages.free-flow` 会生成 `package_name` 路由条件,启用每连接包名/进程识别;大量短连接场景有额外性能成本,所以只建议给确实需要强制策略的少量应用使用。
 - 黑/白名单两种模式见 §3。
 
 ### 1.3 各组件职责
@@ -86,7 +87,7 @@ APP 流量 + DNS 查询
 
 **① 配置层 ↔ 架构层**
 - 协议、传输层、TLS/指纹、CDN、伪装、分流规则、per-app 名单、DNS、日志级别、MTU 等均经 `module/defaults/*` + 运行时 `/data/adb/singbox_tun_Magic/configs/*` 配置,不写进模块代码;改完跑 `magicctl reload` 生效(先校验,再重启)。
-- 架构层(本节固有设计):单进程 sing-box、`include_package`/`exclude_package` per-app、配置渲染管线、守护方式、WebUI 框架。
+- 架构层(本节固有设计):单进程 sing-box、`include_package`/`exclude_package` per-app 入口控制、配置渲染管线、守护方式、WebUI 框架。
 - 配置/规则放在可写的 `/data/adb/singbox_tun_Magic/`,不随二进制更新覆盖(见 `module/customize.sh` 的"已存在则跳过、否则写 `.default`"逻辑)。
 
 **② 代理子系统 ↔ root 隐藏子系统**
@@ -100,8 +101,10 @@ APP 流量 + DNS 查询
 
 ## 3. per-app 黑白名单
 
-- **黑名单模式(`SBMAGIC_PACKAGE_MODE=black`,默认)**:默认全部 APP 代理,排除 `packages.exclude` 里的 APP(它们完全不经过 tun,数据和 DNS 都走系统默认网络)。优先保证"装上就大多数应用可用"。
-- **白名单模式(`SBMAGIC_PACKAGE_MODE=white`)**:默认全部直连,只有 `packages.include` 里的 APP 走代理。省电收益最大(代理流量最小),长期常驻用户推荐切换。
+- **白名单模式(`SBMAGIC_PACKAGE_MODE=white`,默认)**:默认全部直连,只有 `packages.include` 里的 APP 进入 TUN。省电/性能收益最大,因为未列入的应用不会进入 sing-box/gvisor 热路径。
+- **黑名单模式(`SBMAGIC_PACKAGE_MODE=black`)**:默认全部 APP 进入 TUN,排除 `packages.exclude` 里的 APP(它们完全不经过 tun,数据和 DNS 都走系统默认网络)。适合临时全局接管或首次排障,但长期常驻成本更高。
+- 安装新应用不会自动切换黑/白名单。同步应用列表只更新 UI 可选项;新应用在黑名单模式下按"未排除"处理,在白名单模式下按"未包含"处理。
+- 白名单为空时必须保持"没有真实应用进入 TUN"。sing-tun 对空 `include_package` 不会生成 UID include filter,所以模块在白名单模式下额外写入一个 sentinel `include_uid`(`4294967294`),只用于激活 include 逻辑,避免空白名单退化成全局接管。
 - 默认排除列表 `module/defaults/packages.exclude` 已包含 root/模块管理类应用(`com.topjohnwu.magisk`、`me.weishu.kernelsu` 等)和 `com.termux`,避免管理工具自身被绕进隧道导致连不上自己。
 
 进入 TUN 之后还有第二层"应用策略",和黑/白名单不是同一个概念:
@@ -111,6 +114,7 @@ APP 流量 + DNS 查询
 - 两个文件都没有列出的应用使用自动/混合策略,按 `SBMAGIC_MIXED_RULE_PRIORITY` 决定代理规则和免流规则的展开顺序。
 - 同一个包名同时出现在 `packages.proxy` 与 `packages.free-flow` 会被 `magicctl render/check/start/reload` 拒绝。WebUI 保存应用策略时用 `magicctl config set-strategies` 原子写入两个文件,避免从"代理"切"免流"时出现中间态冲突。
 - `packages.proxy/free-flow` 只对已经进入 TUN 的应用生效;白名单模式下没加入 `packages.include` 的应用即使设置了策略也不会进入模块。
+- 性能注意:`packages.proxy/free-flow` 非空且对应规则模式开启时,运行配置会包含 `route.package_name` 条件。sing-box 为了匹配这些条件会对进入 TUN 的连接做包名/进程识别;这比纯目的地规则更贵。长期常驻/省电优先时,优先用黑/白名单决定"进不进 TUN",把强制应用策略列表保持短小。
 
 ---
 
@@ -119,7 +123,7 @@ APP 流量 + DNS 查询
 ### 4.1 基本原理
 
 - sing-box tun inbound 的路由规则里有 `{"protocol": "dns", "action": "hijack-dns"}`,会把所有经过 tun 的 DNS 查询接管,交给 sing-box 自己的 DNS 模块处理,而不是当成普通数据流量转发给出站。
-- 因为 per-app 排除发生在 `VpnService` 层,**被排除的 APP 的 DNS 查询根本不会经过 tun**,所以这里完全不需要旧文档里"系统层全局 nft 重定向 53"那套机制。
+- 因为 per-app 排除发生在 sing-tun 的 Android package/UID 路由层,**被排除 UID 的常规 DNS 查询不会经过本模块 tun**,所以这里完全不需要旧文档里"系统层全局 nft 重定向 53"那套机制。
 
 > **DNS server 用 sing-box 1.12+ 新格式**(`{"type":"udp","server":"223.5.5.5"}` / `{"type":"https","server":"1.1.1.1"}`),不是旧的 `{"address":"https://..."}` URL 写法——后者 1.14 移除。新格式 DNS server 自带 dial fields,本地直连解析器不再写 `detour:"direct"`(运行时会报 "detour to an empty direct outbound makes no sense");只有远程解析器显式 `detour:"proxy"`。规则也用 action 式(`{"...":..., "action":"route", "server":"local"}` / `{"query_type":["AAAA"],"action":"reject"}`)。已移除的旧字段(顶层 `dns.fakeip` 对象、`reverse_mapping`、`independent_cache`)都不再下发。
 
@@ -174,7 +178,7 @@ APP 流量 + DNS 查询
 
 - **不再有"是否配 tun"的争议**——当前架构下 tun 就是唯一入口,`module/common/magicctl` 的 `render_config` 直接生成 `inbounds: [{"type":"tun", ...}]`。
 - route 引擎用 1.13+ 的 action 式语法(`sniff`/`hijack-dns`/`reject`),避免已废弃字段。**特别注意**:`block` 和 `dns` 两种特殊出站在 sing-box **1.13 已移除**,所以默认 `outbounds.json` 里**不再有** `{"type":"block"}`/`{"type":"dns"}`,拦截一律用路由 `action: reject`、DNS 接管用 `action: hijack-dns`。装在 1.13 二进制上若带着这两个旧出站会直接 `check` 失败、服务起不来。
-- 路由顺序固定为:DNS 接管 → sniff → IPv6 禁用时 reject → 私网/LAN 恒直连 → clash Direct/Global → 强制代理应用规则 → 强制免流应用规则 → 自动/混合应用规则 → `final: direct`。`SBMAGIC_PROXY_RULE_MODE` 控制代理策略(`off/global/bypass-cn`),`SBMAGIC_FREE_FLOW_RULE_MODE` 控制免流策略(`off/global`),不要再用布尔式 `SBMAGIC_FREE_FLOW` 或把"国内直连"和"免流出口"混在一个开关里。私网恒直连是全局规则,不会被 `global` 代理或免流策略覆盖,避免路由器后台、局域网设备、强制门户被送进远端出口。
+- 路由顺序固定为:DNS 接管 → 可选 sniff → IPv6 禁用时 reject → 私网/LAN 恒直连 → clash Direct/Global → 强制代理应用规则 → 强制免流应用规则 → 自动/混合应用规则 → `final: direct`。`SBMAGIC_PROXY_RULE_MODE` 控制代理策略(`off/global/bypass-cn`),`SBMAGIC_FREE_FLOW_RULE_MODE` 控制免流策略(`off/global`),不要再用布尔式 `SBMAGIC_FREE_FLOW` 或把"国内直连"和"免流出口"混在一个开关里。私网恒直连是全局规则,不会被 `global` 代理或免流策略覆盖,避免路由器后台、局域网设备、强制门户被送进远端出口。`SBMAGIC_SNIFF=false` 是默认值,避免每个进 TUN 的首连都付 sniff 成本;只有遇到应用不走系统 DNS、域名分流缺失时再开启。
 - tun inbound 显式写了几个"显式优于隐式"的字段,不依赖版本默认值:
   - `endpoint_independent_nat: true` 只在 `SBMAGIC_STACK=gvisor` 时写入(官方说明该字段仅 gvisor 可用;其他 stack 默认就是 endpoint-independent NAT)。
   - `udp_timeout: "5m"`(UDP NAT 映射超时,避免大量短连接 UDP 把 NAT 表撑大,行为可预期)。
@@ -322,8 +326,8 @@ APP 流量 + DNS 查询
 
 ### 9.2 per-app 与应用策略
 - 黑/白名单模式切换(`SBMAGIC_PACKAGE_MODE`)
-- APP 列表勾选(WebUI 默认显示全部已安装应用,按应用名/包名搜索,点击行加入/移除当前模式名单)
-- 应用策略下拉:自动/代理/免流,分别落到 `packages.proxy` / `packages.free-flow` / 两者都不写。保存时原子写入两个策略文件。
+- APP 列表勾选(WebUI 默认显示全部已安装应用,按应用名/包名搜索,点击行加入/移除当前模式名单;默认白名单下只勾选需要进入 TUN 的应用)
+- 应用策略下拉:自动/代理/免流,分别落到 `packages.proxy` / `packages.free-flow` / 两者都不写。保存时原子写入两个策略文件。注意它只是"进入 TUN 后选择出站",不是"是否进入 TUN";真正的入口控制仍是黑/白名单。
 
 ### 9.3 分流
 - `SBMAGIC_PROXY_RULE_MODE`: `off` / `global` / `bypass-cn`
@@ -346,7 +350,8 @@ APP 流量 + DNS 查询
 - `SBMAGIC_MTU`、`SBMAGIC_INTERFACE`(默认 `utun0`,避免和模块 id 同名暴露身份)
 - `SBMAGIC_IPV6`
 - `SBMAGIC_STACK`(默认 `gvisor`;`system`/`mixed` 保留为实验选项,不作为默认)
-- `SBMAGIC_SNIFF_TIMEOUT`(默认 `100ms`;降低首连固定等待,极慢首包场景可适当调大)
+- `SBMAGIC_SNIFF`(默认 `false`;关闭时不写入 sniff action,降低所有进 TUN 应用的首连成本)
+- `SBMAGIC_SNIFF_TIMEOUT`(默认 `100ms`;仅 `SBMAGIC_SNIFF=true` 时生效,极慢首包场景可适当调大)
 
 ### 9.6 保活 / 省电
 - `SBMAGIC_INIT_SERVICE`:默认 `true`;开机时优先尝试 Android init service `netd_helper`,失败自动走 late_start 直接启动。
@@ -466,7 +471,7 @@ APP 流量 + DNS 查询
 - [ ] 配置渲染管线:`settings.env` + `outbounds.json` + packages 列表(`include/exclude/proxy/free-flow`) + dns-direct 列表 → `runtime/config.json`
 
 **省电**
-- [ ] 架构默认黑名单(可用性优先);白名单模式给长期常驻用户作为更省电选项
+- [ ] 架构默认白名单(性能/省电优先);黑名单模式仅作为临时全局接管选项
 - [ ] 默认优先 Android init service 托管启动,失败自动回退 late_start 直接启动
 - [ ] 守护用事件式 supervisor,正常运行不做周期性存活轮询;`SBMAGIC_WATCHDOG_INTERVAL` 只作为 last-good 提升延迟
 - [ ] 网络恢复用 `ip monitor` 事件触发,不做固定外网测速/常规轮询
