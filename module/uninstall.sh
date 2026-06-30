@@ -10,12 +10,18 @@
 DATA_DIR=/data/adb/singbox_tun_Magic
 PID_FILE="$DATA_DIR/runtime/sing-box.pid"
 WPID_FILE="$DATA_DIR/runtime/watchdog.pid"
+NPID_FILE="$DATA_DIR/runtime/netwatch.pid"
 PROCESS_FILE="$DATA_DIR/runtime/process.path"
 
 is_alive() { kill -0 "$1" 2>/dev/null; }
 
-# 1. Kill the watchdog first, otherwise it could resurrect sing-box while we
-#    are tearing it down.
+# 1. Stop module-owned supervisors first, otherwise they could resurrect
+#    sing-box while we are tearing it down.
+command -v setprop >/dev/null 2>&1 && setprop ctl.stop netd_helper 2>/dev/null
+
+npid="$(cat "$NPID_FILE" 2>/dev/null)"
+[ -n "$npid" ] && kill "$npid" 2>/dev/null
+
 wpid="$(cat "$WPID_FILE" 2>/dev/null)"
 [ -n "$wpid" ] && kill "$wpid" 2>/dev/null
 
@@ -40,9 +46,13 @@ fi
 BIN="$(cat "$PROCESS_FILE" 2>/dev/null)"
 [ -n "$BIN" ] || BIN="$DATA_DIR/bin/netd-helper"
 if command -v pgrep >/dev/null 2>&1; then
+  for pid in $(pgrep -f "$DATA_DIR/magicctl netwatch" 2>/dev/null); do kill "$pid" 2>/dev/null; done
+  for pid in $(pgrep -f "$DATA_DIR/magicctl watchdog" 2>/dev/null); do kill "$pid" 2>/dev/null; done
   for pid in $(pgrep -f "$BIN" 2>/dev/null); do kill "$pid" 2>/dev/null; done
   for pid in $(pgrep -f "$DATA_DIR/bin/" 2>/dev/null); do kill "$pid" 2>/dev/null; done
   sleep 1
+  for pid in $(pgrep -f "$DATA_DIR/magicctl netwatch" 2>/dev/null); do kill -9 "$pid" 2>/dev/null; done
+  for pid in $(pgrep -f "$DATA_DIR/magicctl watchdog" 2>/dev/null); do kill -9 "$pid" 2>/dev/null; done
   for pid in $(pgrep -f "$BIN" 2>/dev/null); do kill -9 "$pid" 2>/dev/null; done
   for pid in $(pgrep -f "$DATA_DIR/bin/" 2>/dev/null); do kill -9 "$pid" 2>/dev/null; done
 fi

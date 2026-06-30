@@ -11,5 +11,5 @@ done
 sleep 5
 
 if [ -x "$CTL" ]; then
-  "$CTL" boot >> "$DATA_DIR/logs/service.log" 2>&1 &
+  "$CTL" boot-dispatch >> "$DATA_DIR/logs/service.log" 2>&1 &
 fi

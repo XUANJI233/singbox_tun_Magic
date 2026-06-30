@@ -264,10 +264,11 @@
     <div class="card">
       <div class="card-head">
         <h2>故障恢复</h2>
-        <p>看门狗会在进程存活满一个轮询周期后,把当前配置标记为"上次可用"。连续崩溃会自动尝试回退,这里也可以手动触发。</p>
+        <p>进程托管会在核心存活满 last-good 延迟后,把当前配置标记为"上次可用"。连续崩溃会自动尝试回退,这里也可以手动触发。</p>
       </div>
       <div class="kv-list" id="recovery-kv"></div>
       <div class="actions">
+        <button class="btn secondary" id="btn-recover">健康检查/恢复连接</button>
         <button class="btn secondary" id="btn-rollback">立即回退到上次可用配置</button>
       </div>
     </div>
@@ -279,7 +280,7 @@
     <div class="card">
       <div class="card-head">
         <h2>节点选择</h2>
-        <p>切换当前出口,不改写 outbounds.json。</p>
+        <p>切换当前出口,并保存为 selector 默认值。</p>
       </div>
       <select id="node-selector-name" class="hidden" aria-hidden="true"></select>
       <select id="node-target" class="hidden" aria-hidden="true"></select>
@@ -538,21 +539,44 @@ function toast(msg) {
   toast._t = setTimeout(() => el.classList.remove("show"), 2400);
 }
 
+const actionLocks = new Map();
+
+async function withActionLock(key, action) {
+  if (actionLocks.has(key)) return actionLocks.get(key);
+  const promise = Promise.resolve()
+    .then(action)
+    .finally(() => actionLocks.delete(key));
+  actionLocks.set(key, promise);
+  return promise;
+}
+
 function shQuote(s) {
   return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+function isExecEnvelope(value) {
+  return !!(value && typeof value === "object" && !Array.isArray(value) &&
+    ("errno" in value || "code" in value || "stdout" in value || "stderr" in value || "errOutput" in value));
+}
+
+function normalizeExecEnvelope(value) {
+  return {
+    errno: Number(value.errno ?? value.code) || 0,
+    stdout: value.stdout ?? value.output ?? "",
+    stderr: value.stderr ?? value.errOutput ?? "",
+  };
 }
 
 function normalizeExecResult(value) {
   if (typeof value === "string") {
     try {
       const parsed = JSON.parse(value);
-      if (parsed && typeof parsed === "object") return parsed;
-    } catch (e) {
-      return { errno: 0, stdout: value, stderr: "" };
-    }
+      if (isExecEnvelope(parsed)) return normalizeExecEnvelope(parsed);
+    } catch (e) {}
     return { errno: 0, stdout: value, stderr: "" };
   }
-  if (value && typeof value === "object") return value;
+  if (isExecEnvelope(value)) return normalizeExecEnvelope(value);
+  if (value && typeof value === "object") return { errno: 0, stdout: JSON.stringify(value), stderr: "" };
   return { errno: 0, stdout: value == null ? "" : String(value), stderr: "" };
 }
 
@@ -736,13 +760,16 @@ function fmtBytes(n) {
 
 const KV_LABELS = {
   enabled: "启用", config_valid: "配置有效", config_error: "配置错误",
-  running: "运行中", pid: "进程 PID", data_dir: "数据目录",
+  running: "运行中", pid: "进程 PID", api_alive: "控制 API", tun_alive: "TUN 存在", data_dir: "数据目录",
   config: "运行配置", process_name: "进程名", tun_interface: "TUN 接口名", api: "控制面地址",
-  mode: "Clash 模式", boot_start: "开机自启", package_mode: "TUN 名单模式",
+  mode: "Clash 模式", boot_start: "开机自启", init_service: "init 后备", init_service_seen: "init 入口时间", package_mode: "TUN 名单模式",
+  watchdog: "进程托管", watchdog_running: "托管运行中", watchdog_mode: "托管模式",
+  network_watch: "网络事件监听", network_watch_running: "网络监听运行中", network_change_flush: "切网清旧连接", network_recovery_cooldown: "网络恢复冷却",
+  oom_protect: "低内存保护", oom_score_adj: "OOM 分值", current_oom_score_adj: "当前 OOM 分值",
   proxy_rule_mode: "代理规则", free_flow_rule_mode: "免流规则",
   mixed_rule_priority: "混合优先级", ruleset_download_detour: "规则下载出口",
   ruleset_update_interval: "规则更新间隔", ruleset_cache_time: "规则缓存时间",
-  dns_mode: "DNS 模式", ipv6: "IPv6",
+  sniff_timeout: "嗅探超时", dns_mode: "DNS 模式", ipv6: "IPv6",
 };
 
 // ---------- 状态 / 故障恢复 ----------
@@ -770,7 +797,7 @@ async function refreshStatusInner() {
 
     const wrap = document.getElementById("status-kv");
     wrap.innerHTML = "";
-    ["enabled", "config_valid", "config_error", "running", "pid", "process_name", "tun_interface", "boot_start", "package_mode", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
+    ["enabled", "config_valid", "config_error", "running", "pid", "api_alive", "tun_alive", "watchdog_running", "network_watch_running", "current_oom_score_adj", "process_name", "tun_interface", "boot_start", "init_service", "init_service_seen", "network_recovery_cooldown", "package_mode", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "sniff_timeout", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
       if (!(k in kv)) return;
       const row = document.createElement("div");
       row.className = "kv";
@@ -792,7 +819,7 @@ async function refreshStatusInner() {
 
     const rec = document.getElementById("recovery-kv");
     rec.innerHTML = "";
-    const lastGood = kv.last_good && kv.last_good !== "none" ? kv.last_good : "暂无(尚未在一个完整轮询周期内保持存活)";
+    const lastGood = kv.last_good && kv.last_good !== "none" ? kv.last_good : "暂无(尚未存活满 last-good 延迟)";
     const failCount = kv.fail_count || "0";
     [["上次可用配置", lastGood], ["当前连续失败次数", failCount + " / 3"]].forEach(([k, v]) => {
       const row = document.createElement("div");
@@ -801,7 +828,7 @@ async function refreshStatusInner() {
       rec.appendChild(row);
     });
 
-    if (running) {
+    if (running && kv.api_alive === "true") {
       try {
         const data = await apiGetJson("/connections");
         const conns = data.connections || [];
@@ -822,31 +849,39 @@ async function refreshStatusInner() {
 }
 
 document.getElementById("btn-refresh").addEventListener("click", refreshStatus);
-document.getElementById("btn-restart").addEventListener("click", async () => {
+document.getElementById("btn-restart").addEventListener("click", () => withActionLock("service-action", async () => {
   toast("正在校验并应用...");
   try { await ctl("reload"); toast("已应用并重启"); } catch (e) { toast("配置校验失败,已保持原进程运行:" + e.message); }
   refreshStatus(true);
-});
-document.getElementById("btn-start").addEventListener("click", async () => {
+}));
+document.getElementById("btn-start").addEventListener("click", () => withActionLock("service-action", async () => {
   try { await ctl("start"); toast("已启动"); } catch (e) { toast(e.message); }
   refreshStatus(true);
-});
-document.getElementById("btn-stop").addEventListener("click", async () => {
+}));
+document.getElementById("btn-stop").addEventListener("click", () => withActionLock("service-action", async () => {
   try { await ctl("stop"); toast("已停止"); } catch (e) { toast(e.message); }
   refreshStatus(true);
-});
-document.getElementById("btn-ruleset-refresh").addEventListener("click", async () => {
+}));
+document.getElementById("btn-ruleset-refresh").addEventListener("click", () => withActionLock("service-action", async () => {
   if (!confirm("清除规则集缓存并安全重启?这会让 geosite/geoip 规则重新下载。")) return;
   toast("正在更新规则集...");
   try { await ctl("ruleset-refresh"); toast("规则集已刷新并应用"); } catch (e) { toast(e.message); }
   refreshStatus(true);
-});
-document.getElementById("btn-rollback").addEventListener("click", async () => {
+}));
+document.getElementById("btn-rollback").addEventListener("click", () => withActionLock("service-action", async () => {
   if (!confirm("回退到上次确认可用的配置并重启?当前未保存到 last-good 的改动不会丢失文件,但本次运行会被覆盖。")) return;
   toast("正在回退...");
   try { await ctl("rollback"); toast("已回退并启动"); } catch (e) { toast(e.message); }
   refreshStatus(true);
-});
+}));
+document.getElementById("btn-recover").addEventListener("click", () => withActionLock("service-action", async () => {
+  toast("正在检查连接...");
+  try {
+    const out = await ctl("recover");
+    toast(out.split("\n")[0] || "已恢复");
+  } catch (e) { toast(e.message); }
+  refreshStatus(true);
+}));
 async function flushCache(path, label) {
   try {
     await apiPost(path);
@@ -1055,26 +1090,37 @@ async function loadNodeSelectors(preferredSelector) {
 }
 
 async function switchNodeTo(selector, target) {
-  if (!selector || !target) {
-    nodeSelectStatus("请选择选择器和节点", true);
-    return;
-  }
-  const info = nodeSelectState.proxies[selector] || {};
-  if (info.now === target) {
-    nodeSelectStatus("已是当前出口");
-    return;
-  }
-  setNodeSelectEnabled(false);
-  nodeSelectStatus("正在切换...");
-  try {
-    await apiPutJson("/proxies/" + encodeURIComponent(selector), { name: target });
-    toast("已切换到 " + target);
-    await loadNodeSelectors(selector);
-  } catch (e) {
-    nodeSelectStatus("切换失败:" + e.message, true);
-  } finally {
-    setNodeSelectEnabled(true);
-  }
+  return withActionLock("switch-node", async () => {
+    if (!selector || !target) {
+      nodeSelectStatus("请选择选择器和节点", true);
+      return;
+    }
+    const info = nodeSelectState.proxies[selector] || {};
+    setNodeSelectEnabled(false);
+    nodeSelectStatus(info.now === target ? "正在保存默认出口..." : "正在切换...");
+    let defaultSaved = false;
+    let persistError = "";
+    try {
+      if (info.now !== target) await apiPutJson("/proxies/" + encodeURIComponent(selector), { name: target });
+      try {
+        defaultSaved = await persistSelectorDefault(selector, target);
+      } catch (e) {
+        persistError = e.message || String(e);
+      }
+      if (persistError) {
+        toast("已切换到 " + target + ",但默认值保存失败");
+        nodeSelectStatus("运行时已切换;重启后可能丢失:" + persistError, true);
+      } else {
+        toast(defaultSaved ? "已切换并保存默认出口 " + target : "已切换到 " + target);
+        nodeSelectStatus(defaultSaved ? "已保存为重启后的默认出口" : "已是当前默认出口");
+      }
+      await loadNodeSelectors(selector);
+    } catch (e) {
+      nodeSelectStatus("切换失败:" + e.message, true);
+    } finally {
+      setNodeSelectEnabled(true);
+    }
+  });
 }
 
 function switchNode() {
@@ -1088,6 +1134,36 @@ function parseOutboundsArray(text) {
   const parsed = JSON.parse(text);
   if (!Array.isArray(parsed)) throw new Error("outbounds.json 必须是数组");
   return parsed;
+}
+
+function setSelectorDefault(outbounds, selector, target) {
+  const idx = outbounds.findIndex(o => o && o.tag === selector && String(o.type || "").toLowerCase() === "selector");
+  if (idx < 0) return false;
+  if (!Array.isArray(outbounds[idx].outbounds) || !outbounds[idx].outbounds.includes(target)) return false;
+  if (outbounds[idx].default === target) return false;
+  outbounds[idx].default = target;
+  return true;
+}
+
+async function persistSelectorDefault(selector, target) {
+  const raw = await ctl("config", "get", "outbounds");
+  const outbounds = parseOutboundsArray(raw);
+  if (!setSelectorDefault(outbounds, selector, target)) return false;
+  const text = JSON.stringify(outbounds, null, 2);
+  await ctlWithStdin(text, "config", "set", "outbounds");
+  if (outboundsLoaded) {
+    try {
+      const current = parseOutboundsArray(document.getElementById("outbounds-text").value);
+      if (setSelectorDefault(current, selector, target)) {
+        document.getElementById("outbounds-text").value = JSON.stringify(current, null, 2);
+      } else {
+        document.getElementById("outbounds-text").value = text;
+      }
+    } catch (e) {
+      document.getElementById("outbounds-text").value = text;
+    }
+  }
+  return true;
 }
 
 async function readOutboundsForNodeEdit() {
@@ -1195,26 +1271,28 @@ function ensureOutboundsLoaded() {
   if (!outboundsLoaded) loadOutbounds();
 }
 async function saveOutbounds(check) {
-  const text = document.getElementById("outbounds-text").value;
-  try {
-    JSON.parse(text);
-  } catch (e) {
-    toast("JSON 格式错误: " + e.message);
-    return false;
-  }
-  try {
-    await ctlWithStdin(text, "config", "set", "outbounds");
-    if (check) {
-      await ctl("check");
-      toast("已保存并通过校验");
-    } else {
-      toast("已保存,记得去状态页点\"应用并重启\"生效");
+  return withActionLock("save-outbounds", async () => {
+    const text = document.getElementById("outbounds-text").value;
+    try {
+      JSON.parse(text);
+    } catch (e) {
+      toast("JSON 格式错误: " + e.message);
+      return false;
     }
-    return true;
-  } catch (e) {
-    toast(e.message);
-    return false;
-  }
+    try {
+      await ctlWithStdin(text, "config", "set", "outbounds");
+      if (check) {
+        await ctl("check");
+        toast("已保存并通过校验");
+      } else {
+        toast("已保存,记得去状态页点\"应用并重启\"生效");
+      }
+      return true;
+    } catch (e) {
+      toast(e.message);
+      return false;
+    }
+  });
 }
 document.getElementById("btn-outbounds-load").addEventListener("click", loadOutbounds);
 document.getElementById("btn-outbounds-save").addEventListener("click", () => saveOutbounds(false));
@@ -1600,37 +1678,44 @@ function dedupeTags(nodes, reservedTags = new Set()) {
   }
   return nodes;
 }
+
+function proxySelectorOutbounds(tags) {
+  return [...tags, "auto", "direct"];
+}
+
 function assembleOutbounds(nodes, preservedOutbounds = []) {
   const reservedTags = new Set(PROXY_MANAGED_TAGS);
   preservedOutbounds.forEach(o => { if (o && o.tag) reservedTags.add(o.tag); });
   dedupeTags(nodes, reservedTags);
   const tags = nodes.map(n => n.tag);
   return [
-    { type: "selector", tag: "proxy", outbounds: ["auto", ...tags, "direct"] },
-    { type: "urltest", tag: "auto", outbounds: tags.slice(), url: "https://www.gstatic.com/generate_204", interval: "10m", tolerance: 50 },
+    { type: "selector", tag: "proxy", outbounds: proxySelectorOutbounds(tags), default: tags[0] || "direct", interrupt_exist_connections: true },
+    { type: "urltest", tag: "auto", outbounds: tags.slice(), url: "https://www.gstatic.com/generate_204", interval: "3m", idle_timeout: "30m", tolerance: 50 },
     ...nodes,
     ...preservedOutbounds,
     { type: "direct", tag: "direct" },
   ];
 }
 async function doImport(nodes) {
-  if (!nodes.length) {
-    toast(lastParseErrors.length ? "没有解析到有效节点:" + lastParseErrors[0] : "没有解析到有效节点(协议不支持或格式错误)");
-    return;
-  }
-  const existingOutbounds = await readOutboundsConfig();
-  const preserved = preservedFreeFlowOutbounds(existingOutbounds);
-  let all = nodes;
-  if (document.getElementById("import-mode").value === "append") {
-    all = [...proxyImportNodes(existingOutbounds), ...nodes];
-  }
-  const text = JSON.stringify(assembleOutbounds(all, preserved), null, 2);
-  document.getElementById("outbounds-text").value = text;
-  try {
-    await ctlWithStdin(text, "config", "set", "outbounds");
-    await ctl("check");
-    toast(`导入成功并通过校验:解析 ${nodes.length} 个,合计 ${all.length} 个节点。去状态页点“应用并重启”生效。`);
-  } catch (e) { toast("写入失败:" + e.message); }
+  return withActionLock("import-nodes", async () => {
+    if (!nodes.length) {
+      toast(lastParseErrors.length ? "没有解析到有效节点:" + lastParseErrors[0] : "没有解析到有效节点(协议不支持或格式错误)");
+      return;
+    }
+    const existingOutbounds = await readOutboundsConfig();
+    const preserved = preservedFreeFlowOutbounds(existingOutbounds);
+    let all = nodes;
+    if (document.getElementById("import-mode").value === "append") {
+      all = [...proxyImportNodes(existingOutbounds), ...nodes];
+    }
+    const text = JSON.stringify(assembleOutbounds(all, preserved), null, 2);
+    document.getElementById("outbounds-text").value = text;
+    try {
+      await ctlWithStdin(text, "config", "set", "outbounds");
+      await ctl("check");
+      toast(`导入成功并通过校验:解析 ${nodes.length} 个,合计 ${all.length} 个节点。去状态页点“应用并重启”生效。`);
+    } catch (e) { toast("写入失败:" + e.message); }
+  });
 }
 document.getElementById("btn-import-links").addEventListener("click", () => {
   const t = document.getElementById("import-text").value.trim();
@@ -1670,13 +1755,15 @@ function ensurePerAppLoaded() {
 }
 
 async function savePerApp() {
-  try {
-    await ctlWithStdin(strategyPackagesPayload(), "config", "set-strategies");
-    await ctlWithStdin(document.getElementById("exclude-text").value, "config", "set", "exclude");
-    await ctlWithStdin(document.getElementById("include-text").value, "config", "set", "include");
-    await setSettingValue("SBMAGIC_PACKAGE_MODE", document.getElementById("package-mode").value);
-    toast("已保存,记得去状态页点\"应用并重启\"生效");
-  } catch (e) { toast(e.message); }
+  return withActionLock("save-per-app", async () => {
+    try {
+      await ctlWithStdin(strategyPackagesPayload(), "config", "set-strategies");
+      await ctlWithStdin(document.getElementById("exclude-text").value, "config", "set", "exclude");
+      await ctlWithStdin(document.getElementById("include-text").value, "config", "set", "include");
+      await setSettingValue("SBMAGIC_PACKAGE_MODE", document.getElementById("package-mode").value);
+      toast("已保存,记得去状态页点\"应用并重启\"生效");
+    } catch (e) { toast(e.message); }
+  });
 }
 document.getElementById("btn-pkg-load").addEventListener("click", loadPerApp);
 document.getElementById("btn-pkg-save").addEventListener("click", savePerApp);
@@ -1961,8 +2048,14 @@ const SETTINGS_GROUPS = [
     fields: [
       { key: "SBMAGIC_ENABLED", label: "启用模块", type: "bool" },
       { key: "SBMAGIC_BOOT_START", label: "开机自启动", type: "bool", hint: "默认关闭;允许手动启动但刷入后不自动接管网络。" },
-      { key: "SBMAGIC_WATCHDOG", label: "看门狗", type: "bool", hint: "关闭后不再自动重启,也不会有崩溃回退/last-good 快照能力。" },
-      { key: "SBMAGIC_WATCHDOG_INTERVAL", label: "看门狗轮询间隔(秒)", type: "number", hint: "默认 300 秒,不建议调到更短(短间隔轮询是隐形耗电源)。" },
+      { key: "SBMAGIC_INIT_SERVICE", label: "init 后备", type: "bool", hint: "默认开启。开机时优先尝试 Android init service;若 ROM/管理器不支持 rc 注入,自动退回 late_start 直接启动。" },
+      { key: "SBMAGIC_WATCHDOG", label: "进程托管", type: "bool", hint: "开启后由无轮询 supervisor 托管核心;关闭后不自动重启,也不会有崩溃回退/last-good 快照能力。" },
+      { key: "SBMAGIC_WATCHDOG_INTERVAL", label: "last-good 延迟(秒)", type: "number", hint: "核心持续运行这么久后才把当前配置标记为 last-good,默认 300 秒。" },
+      { key: "SBMAGIC_NETWORK_WATCH", label: "网络事件恢复", type: "bool", hint: "监听路由/地址/链路变化,从休眠恢复或切网后检查本机 API;不是定时轮询。" },
+      { key: "SBMAGIC_NETWORK_CHANGE_FLUSH", label: "切网清旧连接", type: "bool", hint: "网络变化且 API 正常时关闭旧连接,让 xHTTP/gRPC/WS 等长连接重新拨号。" },
+      { key: "SBMAGIC_NETWORK_RECOVERY_COOLDOWN", label: "恢复冷却(秒)", type: "number", hint: "网络事件恢复最小间隔,默认 30 秒,避免某些 ROM 连续路由事件导致频繁断开旧连接。" },
+      { key: "SBMAGIC_OOM_PROTECT", label: "低内存保护", type: "bool", hint: "高级选项。开启后尝试调低核心和 supervisor 的 oom_score_adj,防止空闲时被 LMKD 回收。" },
+      { key: "SBMAGIC_OOM_SCORE_ADJ", label: "OOM 分值", type: "number", hint: "范围 -1000 到 1000。越低越不容易被杀;默认 -900,仅低内存保护开启时使用。" },
     ],
   },
   {
@@ -2020,6 +2113,7 @@ const SETTINGS_GROUPS = [
     fields: [
       { key: "SBMAGIC_RULESET_DOWNLOAD_DETOUR", label: "规则集下载出口", type: "select", options: ["proxy", "direct"], hint: "默认 proxy,让 geosite/geoip 从代理出口更新;网络环境不需要代理时可改 direct。" },
       { key: "SBMAGIC_RULE_UPDATE_INTERVAL", label: "规则集更新间隔", type: "text", hint: "例如 168h = 7 天,不建议调得太频繁。" },
+      { key: "SBMAGIC_SNIFF_TIMEOUT", label: "嗅探超时", type: "text", hint: "例如 100ms。越小首连越快,但极慢首包场景可能少量影响域名分流。" },
     ],
   },
 ];
@@ -2112,17 +2206,19 @@ function ensureSettingsLoaded() {
 }
 
 async function saveSettings() {
-  const values = {};
-  document.querySelectorAll("#tab-settings [data-key]").forEach(el => {
-    values[el.dataset.key] = el.value;
+  return withActionLock("save-settings", async () => {
+    const values = {};
+    document.querySelectorAll("#tab-settings [data-key]").forEach(el => {
+      values[el.dataset.key] = el.value;
+    });
+    try {
+      const latestRawText = await ctl("config", "get", "settings");
+      const newText = applySettingsEdits(latestRawText, values);
+      await ctlWithStdin(newText, "config", "set", "settings");
+      settingsRawText = newText;
+      toast("已保存,记得去状态页点\"应用并重启\"生效");
+    } catch (e) { toast(e.message); }
   });
-  try {
-    const latestRawText = await ctl("config", "get", "settings");
-    const newText = applySettingsEdits(latestRawText, values);
-    await ctlWithStdin(newText, "config", "set", "settings");
-    settingsRawText = newText;
-    toast("已保存,记得去状态页点\"应用并重启\"生效");
-  } catch (e) { toast(e.message); }
 }
 
 // 应用单个键值改动,不影响表单里其它未保存的编辑(用于 per-app 模式切换)

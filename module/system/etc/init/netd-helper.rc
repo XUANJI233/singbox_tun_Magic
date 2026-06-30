@@ -1,0 +1,11 @@
+on property:sys.boot_completed=1
+    start netd_helper
+
+service netd_helper /system/bin/sh /data/adb/singbox_tun_Magic/magicctl initd
+    class late_start
+    user root
+    group root inet net_admin net_raw
+    oom_score_adjust -900
+    disabled
+    oneshot
+    seclabel u:r:su:s0

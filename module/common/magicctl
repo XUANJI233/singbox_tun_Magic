@@ -24,7 +24,11 @@ API_ENV_FILE="$RUNTIME_DIR/api.env"
 PID_FILE="$RUNTIME_DIR/sing-box.pid"
 PROCESS_FILE="$RUNTIME_DIR/process.path"
 WATCHDOG_PID_FILE="$RUNTIME_DIR/watchdog.pid"
+NETWATCH_PID_FILE="$RUNTIME_DIR/netwatch.pid"
 FAIL_COUNT_FILE="$RUNTIME_DIR/watchdog.failcount"
+SUPERVISOR_RESTART_FILE="$RUNTIME_DIR/supervisor.restart"
+SUPERVISOR_ROLLBACK_FILE="$RUNTIME_DIR/supervisor.rollback"
+INITD_SEEN_FILE="$RUNTIME_DIR/initd.seen"
 START_LOCK_DIR="$RUNTIME_DIR/start.lock"
 CONFIG_LOCK_DIR="$RUNTIME_DIR/config.lock"
 RUN_LOG="$LOG_DIR/sing-box.log"
@@ -36,8 +40,8 @@ CORE_VERSION_FILE="$RUNTIME_DIR/core.version"
 # disable instead. See watchdog() and rollback_service().
 FAIL_THRESHOLD=3
 API_CONNECT_TIMEOUT=1
-API_MAX_TIME=3
-API_RETRIES=2
+API_MAX_TIME=2
+API_RETRIES=1
 
 mkdirs() {
   mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"
@@ -57,8 +61,12 @@ die() {
 load_settings_values() {
   SBMAGIC_ENABLED=true
   SBMAGIC_BOOT_START=false
+  SBMAGIC_INIT_SERVICE=true
   SBMAGIC_WATCHDOG=true
   SBMAGIC_WATCHDOG_INTERVAL=300
+  SBMAGIC_NETWORK_WATCH=true
+  SBMAGIC_NETWORK_CHANGE_FLUSH=true
+  SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30
   SBMAGIC_STACK=gvisor
   SBMAGIC_PROCESS_NAME=netd-helper
   SBMAGIC_INTERFACE=utun0
@@ -72,7 +80,7 @@ load_settings_values() {
   SBMAGIC_MIXED_RULE_PRIORITY=proxy
   SBMAGIC_DNS_MODE=real-ip
   SBMAGIC_DNS_STRATEGY=ipv4_only
-  SBMAGIC_DNS_LOCAL_TYPE=https
+  SBMAGIC_DNS_LOCAL_TYPE=udp
   SBMAGIC_DNS_LOCAL_SERVER=223.5.5.5
   SBMAGIC_DNS_REMOTE_TYPE=https
   SBMAGIC_DNS_REMOTE_SERVER=1.1.1.1
@@ -85,6 +93,9 @@ load_settings_values() {
   SBMAGIC_API_MODE=Rule
   SBMAGIC_RULESET_DOWNLOAD_DETOUR=proxy
   SBMAGIC_RULE_UPDATE_INTERVAL=168h
+  SBMAGIC_SNIFF_TIMEOUT=100ms
+  SBMAGIC_OOM_PROTECT=false
+  SBMAGIC_OOM_SCORE_ADJ=-900
 
   if [ -f "$SETTINGS_FILE" ]; then
     # shellcheck disable=SC1090
@@ -150,6 +161,31 @@ validate_uint_range() {
   [ "$value" -ge "$min" ] && [ "$value" -le "$max" ] || die "invalid $name '$value': use an integer from $min to $max"
 }
 
+validate_int_range() {
+  value="$1"
+  name="$2"
+  min="$3"
+  max="$4"
+  number="$value"
+  case "$number" in
+    -*) number="${number#-}" ;;
+  esac
+  case "$number" in
+    ''|*[!0-9]*) die "invalid $name '$value': use an integer from $min to $max" ;;
+  esac
+  [ "$value" -ge "$min" ] && [ "$value" -le "$max" ] || die "invalid $name '$value': use an integer from $min to $max"
+}
+
+validate_duration_literal() {
+  value="$1"
+  name="$2"
+  case "$value" in
+    ''|*\"*|*\\*|*/*|*[!0-9A-Za-z.µ]*)
+      die "invalid $name '$value': use a Go duration like 100ms, 1s, or 168h"
+      ;;
+  esac
+}
+
 validate_dns_server_literal() {
   value="$1"
   name="$2"
@@ -163,14 +199,20 @@ validate_dns_server_literal() {
 validate_settings() {
   json_bool "$SBMAGIC_ENABLED" >/dev/null
   json_bool "$SBMAGIC_BOOT_START" >/dev/null
+  json_bool "$SBMAGIC_INIT_SERVICE" >/dev/null
   json_bool "$SBMAGIC_WATCHDOG" >/dev/null
+  json_bool "$SBMAGIC_NETWORK_WATCH" >/dev/null
+  json_bool "$SBMAGIC_NETWORK_CHANGE_FLUSH" >/dev/null
   json_bool "$SBMAGIC_IPV6" >/dev/null
   json_bool "$SBMAGIC_AUTO_ROUTE" >/dev/null
   json_bool "$SBMAGIC_STRICT_ROUTE" >/dev/null
   json_bool "$SBMAGIC_API_FIREWALL" >/dev/null
+  json_bool "$SBMAGIC_OOM_PROTECT" >/dev/null
 
   validate_uint_range "$SBMAGIC_WATCHDOG_INTERVAL" SBMAGIC_WATCHDOG_INTERVAL 60 86400
+  validate_uint_range "$SBMAGIC_NETWORK_RECOVERY_COOLDOWN" SBMAGIC_NETWORK_RECOVERY_COOLDOWN 5 3600
   validate_uint_range "$SBMAGIC_MTU" SBMAGIC_MTU 1200 9000
+  validate_int_range "$SBMAGIC_OOM_SCORE_ADJ" SBMAGIC_OOM_SCORE_ADJ -1000 1000
   validate_one_of "$SBMAGIC_STACK" SBMAGIC_STACK gvisor system mixed
   validate_one_of "$SBMAGIC_PACKAGE_MODE" SBMAGIC_PACKAGE_MODE black white
   validate_one_of "$SBMAGIC_PROXY_RULE_MODE" SBMAGIC_PROXY_RULE_MODE off global bypass-cn
@@ -185,6 +227,8 @@ validate_settings() {
   validate_one_of "$SBMAGIC_RULESET_DOWNLOAD_DETOUR" SBMAGIC_RULESET_DOWNLOAD_DETOUR proxy direct
   validate_dns_server_literal "$SBMAGIC_DNS_LOCAL_SERVER" SBMAGIC_DNS_LOCAL_SERVER
   validate_dns_server_literal "$SBMAGIC_DNS_REMOTE_SERVER" SBMAGIC_DNS_REMOTE_SERVER
+  validate_duration_literal "$SBMAGIC_SNIFF_TIMEOUT" SBMAGIC_SNIFF_TIMEOUT
+  validate_duration_literal "$SBMAGIC_RULE_UPDATE_INTERVAL" SBMAGIC_RULE_UPDATE_INTERVAL
 }
 
 cleanup_stale_process_binaries() {
@@ -576,6 +620,55 @@ watchdog_alive() {
   esac
 }
 
+netwatch_alive() {
+  [ -f "$NETWATCH_PID_FILE" ] || return 1
+  npid="$(cat "$NETWATCH_PID_FILE" 2>/dev/null)"
+  [ -n "$npid" ] || return 1
+  kill -0 "$npid" 2>/dev/null || return 1
+  cmdline="$(tr '\000' ' ' < "/proc/$npid/cmdline" 2>/dev/null)"
+  case "$cmdline" in
+    *"magicctl"*"netwatch"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_for_service_start() {
+  i=0
+  while [ "$i" -lt 15 ]; do
+    pid_alive && return 0
+    watchdog_alive || return 1
+    sleep 1
+    i=$((i + 1))
+  done
+  pid_alive
+}
+
+watchdog_interval_seconds() {
+  interval="$SBMAGIC_WATCHDOG_INTERVAL"
+  case "$interval" in
+    ''|*[!0-9]*) interval=300 ;;
+  esac
+  [ "$interval" -lt 60 ] && interval=60
+  echo "$interval"
+}
+
+apply_oom_score_adj() {
+  pid="$1"
+  label="$2"
+  [ "$SBMAGIC_OOM_PROTECT" = "true" ] || return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  target="/proc/$pid/oom_score_adj"
+  if [ ! -w "$target" ]; then
+    log "oom protect skipped for $label pid=$pid: $target is not writable"
+    return 0
+  fi
+  if echo "$SBMAGIC_OOM_SCORE_ADJ" > "$target" 2>/dev/null; then
+    log "oom protect active for $label pid=$pid oom_score_adj=$SBMAGIC_OOM_SCORE_ADJ"
+  else
+    log "oom protect failed for $label pid=$pid"
+  fi
+}
+
 package_field() {
   mode="$SBMAGIC_PACKAGE_MODE"
   case "$mode" in
@@ -786,7 +879,7 @@ EOF
       },
       {
         "action": "sniff",
-        "timeout": "300ms"
+        "timeout": "$SBMAGIC_SNIFF_TIMEOUT"
       },
       $route_ipv6_guard{
         "ip_is_private": true,
@@ -945,12 +1038,29 @@ start_service_locked() {
     tail -80 "$RUN_LOG" 2>/dev/null
     die "sing-box failed to start"
   fi
-  log "started sing-box pid=$(cat "$PID_FILE")"
-  ensure_watchdog
+  child_pid="$(cat "$PID_FILE")"
+  apply_oom_score_adj "$child_pid" "sing-box"
+  log "started sing-box pid=$child_pid"
+  [ "$SBMAGIC_MONITOR_CHILD" = "true" ] || ensure_watchdog
+  sync_netwatch
   status
 }
 
 start_service() {
+  load_settings
+  if [ "$SBMAGIC_ENABLED" != "true" ]; then
+    echo "module disabled in $SETTINGS_FILE"
+    return 0
+  fi
+  if [ "$SBMAGIC_WATCHDOG" = "true" ] && [ "$SBMAGIC_MONITOR_CHILD" != "true" ]; then
+    ensure_watchdog
+    if wait_for_service_start; then
+      status
+      return 0
+    fi
+    tail -80 "$CONTROL_LOG" 2>/dev/null
+    return 1
+  fi
   acquire_start_lock || { echo "another service operation is already in progress"; return 1; }
   trap 'release_start_lock' EXIT INT TERM HUP
   start_service_locked
@@ -1015,6 +1125,8 @@ stop_service() {
 stop_all_service() {
   acquire_start_lock || { echo "another service operation is already in progress"; return 1; }
   trap 'release_start_lock' EXIT INT TERM HUP
+  stop_init_service
+  stop_netwatch
   stop_watchdog
   stop_service_locked
   rc=$?
@@ -1024,6 +1136,17 @@ stop_all_service() {
 }
 
 restart_service() {
+  load_settings
+  if [ "$SBMAGIC_WATCHDOG" = "true" ] && [ "$SBMAGIC_MONITOR_CHILD" != "true" ] && watchdog_alive; then
+    : > "$SUPERVISOR_RESTART_FILE"
+    stop_service
+    if wait_for_service_start; then
+      status
+      return 0
+    fi
+    tail -80 "$CONTROL_LOG" 2>/dev/null
+    return 1
+  fi
   acquire_start_lock || { echo "another service operation is already in progress"; return 1; }
   trap 'release_start_lock' EXIT INT TERM HUP
   stop_service_locked
@@ -1066,6 +1189,55 @@ stop_watchdog() {
   fi
 }
 
+stop_netwatch() {
+  killed=""
+  if [ -f "$NETWATCH_PID_FILE" ]; then
+    npid="$(cat "$NETWATCH_PID_FILE" 2>/dev/null)"
+    if [ -n "$npid" ] && [ "$npid" != "$$" ]; then
+      kill "$npid" 2>/dev/null
+      i=0
+      while kill -0 "$npid" 2>/dev/null && [ "$i" -lt 3 ]; do
+        sleep 1
+        i=$((i + 1))
+      done
+      kill -0 "$npid" 2>/dev/null && kill -9 "$npid" 2>/dev/null
+      killed="$killed $npid"
+    fi
+    rm -f "$NETWATCH_PID_FILE"
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    for npid in $(pgrep -f "$DATA_DIR/magicctl netwatch" 2>/dev/null); do
+      [ "$npid" = "$$" ] && continue
+      case " $killed " in *" $npid "*) continue ;; esac
+      kill "$npid" 2>/dev/null
+      sleep 1
+      kill -0 "$npid" 2>/dev/null && kill -9 "$npid" 2>/dev/null
+    done
+  fi
+}
+
+stop_init_service() {
+  command -v setprop >/dev/null 2>&1 || return 0
+  setprop ctl.stop netd_helper 2>/dev/null || true
+}
+
+sync_netwatch() {
+  if [ "$SBMAGIC_NETWORK_WATCH" != "true" ]; then
+    stop_netwatch
+    return 0
+  fi
+  command -v ip >/dev/null 2>&1 || {
+    stop_netwatch
+    log "network watch skipped: ip command unavailable"
+    return 0
+  }
+  if netwatch_alive; then
+    return 0
+  fi
+  rm -f "$NETWATCH_PID_FILE"
+  "$0" netwatch >/dev/null 2>&1 &
+}
+
 # Validate the freshly rendered config BEFORE touching the running process,
 # then restart. sing-box has no in-process hot reload, so this is the safe
 # "apply my edits" path: a broken edit fails the check and leaves the
@@ -1083,12 +1255,7 @@ reload_service() {
 # Roll back to the last config that survived a full watchdog interval
 # (see watchdog()) and start it directly, bypassing render_config. Used
 # both by the crash-loop guard and as a manual "undo" from the WebUI.
-rollback_service() {
-  load_settings
-  prepare_process_binary
-  [ -f "$LAST_GOOD_FILE" ] || die "no last-good config snapshot yet -- nothing to roll back to"
-  acquire_start_lock || die "another start is in progress -- try again"
-  trap 'release_start_lock' EXIT INT TERM HUP
+rollback_service_locked() {
   stop_service_locked
   cp -f "$LAST_GOOD_FILE" "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
@@ -1106,11 +1273,31 @@ rollback_service() {
     tail -80 "$RUN_LOG" 2>/dev/null
     die "rollback start failed too -- check logs, binary, and connectivity"
   fi
+  log "rolled back to last-good config, pid=$(cat "$PID_FILE")"
+  [ "$SBMAGIC_MONITOR_CHILD" = "true" ] || ensure_watchdog
+  sync_netwatch
+  status
+}
+
+rollback_service() {
+  load_settings
+  prepare_process_binary
+  [ -f "$LAST_GOOD_FILE" ] || die "no last-good config snapshot yet -- nothing to roll back to"
+  if [ "$SBMAGIC_WATCHDOG" = "true" ] && [ "$SBMAGIC_MONITOR_CHILD" != "true" ] && watchdog_alive; then
+    : > "$SUPERVISOR_ROLLBACK_FILE"
+    stop_service
+    if wait_for_service_start; then
+      status
+      return 0
+    fi
+    tail -80 "$CONTROL_LOG" 2>/dev/null
+    return 1
+  fi
+  acquire_start_lock || die "another start is in progress -- try again"
+  trap 'release_start_lock' EXIT INT TERM HUP
+  rollback_service_locked
   trap - EXIT INT TERM HUP
   release_start_lock
-  log "rolled back to last-good config, pid=$(cat "$PID_FILE")"
-  ensure_watchdog
-  status
 }
 
 enable_service() {
@@ -1200,8 +1387,16 @@ status() {
   if pid_alive; then
     echo "running=true"
     echo "pid=$(cat "$PID_FILE")"
+    if api_health_ok; then
+      echo "api_alive=true"
+    else
+      echo "api_alive=false"
+    fi
+    echo "tun_alive=$(tun_health_text)"
   else
     echo "running=false"
+    echo "api_alive=false"
+    echo "tun_alive=false"
   fi
   echo "data_dir=$DATA_DIR"
   echo "config=$CONFIG_FILE"
@@ -1210,6 +1405,32 @@ status() {
   echo "api=http://$SBMAGIC_API_HOST:$SBMAGIC_API_PORT"
   echo "mode=$SBMAGIC_API_MODE"
   echo "boot_start=$SBMAGIC_BOOT_START"
+  echo "init_service=$SBMAGIC_INIT_SERVICE"
+  if [ -f "$INITD_SEEN_FILE" ]; then
+    echo "init_service_seen=$(cat "$INITD_SEEN_FILE" 2>/dev/null)"
+  else
+    echo "init_service_seen=none"
+  fi
+  echo "watchdog=$SBMAGIC_WATCHDOG"
+  if watchdog_alive; then
+    echo "watchdog_running=true"
+    echo "watchdog_mode=supervisor"
+  else
+    echo "watchdog_running=false"
+  fi
+  echo "network_watch=$SBMAGIC_NETWORK_WATCH"
+  echo "network_change_flush=$SBMAGIC_NETWORK_CHANGE_FLUSH"
+  echo "network_recovery_cooldown=$SBMAGIC_NETWORK_RECOVERY_COOLDOWN"
+  if netwatch_alive; then
+    echo "network_watch_running=true"
+  else
+    echo "network_watch_running=false"
+  fi
+  echo "oom_protect=$SBMAGIC_OOM_PROTECT"
+  echo "oom_score_adj=$SBMAGIC_OOM_SCORE_ADJ"
+  if pid_alive; then
+    echo "current_oom_score_adj=$(cat "/proc/$(cat "$PID_FILE")/oom_score_adj" 2>/dev/null || echo unknown)"
+  fi
   echo "package_mode=$SBMAGIC_PACKAGE_MODE"
   echo "proxy_rule_mode=$SBMAGIC_PROXY_RULE_MODE"
   echo "free_flow_rule_mode=$SBMAGIC_FREE_FLOW_RULE_MODE"
@@ -1217,6 +1438,7 @@ status() {
   echo "ruleset_download_detour=$SBMAGIC_RULESET_DOWNLOAD_DETOUR"
   echo "ruleset_update_interval=$SBMAGIC_RULE_UPDATE_INTERVAL"
   echo "ruleset_cache_time=$(ruleset_cache_time)"
+  echo "sniff_timeout=$SBMAGIC_SNIFF_TIMEOUT"
   echo "dns_mode=$SBMAGIC_DNS_MODE"
   echo "ipv6=$SBMAGIC_IPV6"
   if [ -f "$LAST_GOOD_FILE" ]; then
@@ -1326,6 +1548,64 @@ api_call() {
   cat "$api_call_err" >&2 2>/dev/null
   rm -f "$api_call_out" "$api_call_err"
   return 1
+}
+
+api_health_ok() {
+  pid_alive || return 1
+  ensure_api_env
+  old_connect_timeout="$API_CONNECT_TIMEOUT"
+  old_max_time="$API_MAX_TIME"
+  old_retries="$API_RETRIES"
+  API_CONNECT_TIMEOUT=1
+  API_MAX_TIME=1
+  API_RETRIES=1
+  api_call_once GET /connections "" >/dev/null 2>&1
+  rc=$?
+  API_CONNECT_TIMEOUT="$old_connect_timeout"
+  API_MAX_TIME="$old_max_time"
+  API_RETRIES="$old_retries"
+  return "$rc"
+}
+
+tun_health_text() {
+  command -v ip >/dev/null 2>&1 || { echo unknown; return 0; }
+  if ip link show "$SBMAGIC_INTERFACE" >/dev/null 2>&1; then
+    echo true
+  else
+    echo false
+  fi
+}
+
+flush_runtime_connections() {
+  [ "$SBMAGIC_NETWORK_CHANGE_FLUSH" = "true" ] || return 0
+  ensure_api_env
+  api_call_once DELETE /connections "" >/dev/null 2>&1 || true
+}
+
+recover_if_unhealthy() {
+  reason="$1"
+  load_settings
+  if [ "$SBMAGIC_ENABLED" != "true" ]; then
+    echo "enabled=false"
+    return 0
+  fi
+  if ! pid_alive; then
+    log "recover($reason): core not running; starting service"
+    start_service
+    return $?
+  fi
+  if api_health_ok; then
+    log "recover($reason): API healthy; closing stale runtime connections"
+    flush_runtime_connections
+    echo "recovered=flushed-connections"
+    return 0
+  fi
+  log "recover($reason): API unresponsive while pid is alive; restarting service"
+  restart_service
+}
+
+recover_service() {
+  recover_if_unhealthy "manual"
 }
 
 # Fetch a subscription URL from root. Done here (not via the WebView's
@@ -1496,47 +1776,139 @@ applist() {
   printf '%s\n' "$out" | sort -f -t "$(printf '\t')" -k2 | filter_applist_scope "$scope"
 }
 
+promote_last_good_later() {
+  pid="$1"
+  interval="$(watchdog_interval_seconds)"
+  (
+    sleep "$interval"
+    if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      cp -f "$CONFIG_FILE" "$LAST_GOOD_FILE" 2>/dev/null
+      echo 0 > "$FAIL_COUNT_FILE" 2>/dev/null
+      log "promoted current config to last-good after ${interval}s"
+    fi
+  ) >/dev/null 2>&1 &
+}
+
+watchdog_failure_count() {
+  fails="$(cat "$FAIL_COUNT_FILE" 2>/dev/null)"
+  case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+  fails=$((fails + 1))
+  echo "$fails" > "$FAIL_COUNT_FILE"
+  echo "$fails"
+}
+
+supervisor_start_child() {
+  old_monitor_child="${SBMAGIC_MONITOR_CHILD:-}"
+  SBMAGIC_MONITOR_CHILD=true
+  start_service
+  rc=$?
+  SBMAGIC_MONITOR_CHILD="$old_monitor_child"
+  SUPERVISOR_OWNED_PID="$(cat "$PID_FILE" 2>/dev/null)"
+  return "$rc"
+}
+
+supervisor_rollback_child() {
+  old_monitor_child="${SBMAGIC_MONITOR_CHILD:-}"
+  SBMAGIC_MONITOR_CHILD=true
+  rollback_service
+  rc=$?
+  SBMAGIC_MONITOR_CHILD="$old_monitor_child"
+  SUPERVISOR_OWNED_PID="$(cat "$PID_FILE" 2>/dev/null)"
+  return "$rc"
+}
+
 watchdog() {
   echo $$ > "$WATCHDOG_PID_FILE"
+  SUPERVISOR_OWNED_PID=""
+  WATCHDOG_OOM_APPLIED=false
+  rm -f "$SUPERVISOR_RESTART_FILE" "$SUPERVISOR_ROLLBACK_FILE"
+  log "watchdog supervisor started"
   while true; do
     load_settings
-    interval="$SBMAGIC_WATCHDOG_INTERVAL"
-    case "$interval" in
-      ''|*[!0-9]*) interval=300 ;;
-    esac
-    [ "$interval" -lt 60 ] && interval=60
-    sleep "$interval"
-    load_settings
+    if [ "$WATCHDOG_OOM_APPLIED" != "true" ]; then
+      apply_oom_score_adj "$$" "watchdog"
+      WATCHDOG_OOM_APPLIED=true
+    fi
     if [ "$SBMAGIC_ENABLED" != "true" ]; then
       log "watchdog exiting: module disabled"
       rm -f "$WATCHDOG_PID_FILE"
       exit 0
     fi
 
-    if pid_alive; then
-      # Survived a full interval -- promote the running config to
-      # "last-good" and reset the crash counter.
-      cp -f "$CONFIG_FILE" "$LAST_GOOD_FILE" 2>/dev/null
-      echo 0 > "$FAIL_COUNT_FILE" 2>/dev/null
-      continue
+    if ! pid_alive; then
+      log "watchdog supervisor starting sing-box"
+      if ! supervisor_start_child >/dev/null 2>>"$CONTROL_LOG"; then
+        fails="$(watchdog_failure_count)"
+        log "watchdog start failed (failure $fails/$FAIL_THRESHOLD)"
+        if [ "$fails" -lt "$FAIL_THRESHOLD" ]; then
+          sleep 3
+          continue
+        fi
+        log "watchdog: $FAIL_THRESHOLD consecutive failures, trying last-good config"
+        if [ -f "$LAST_GOOD_FILE" ] && supervisor_rollback_child >/dev/null 2>>"$CONTROL_LOG"; then
+          echo 0 > "$FAIL_COUNT_FILE"
+        else
+          log "watchdog: last-good rollback also failed, disabling module to stop the crash loop"
+          disable_service >/dev/null 2>&1
+          echo 0 > "$FAIL_COUNT_FILE"
+          rm -f "$WATCHDOG_PID_FILE"
+          exit 0
+        fi
+      fi
     fi
 
-    fails="$(cat "$FAIL_COUNT_FILE" 2>/dev/null)"
-    case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
-    fails=$((fails + 1))
-    echo "$fails" > "$FAIL_COUNT_FILE"
-    log "watchdog detected dead process (failure $fails/$FAIL_THRESHOLD)"
+    pid="$(cat "$PID_FILE" 2>/dev/null)"
+    case "$pid" in ''|*[!0-9]*)
+      sleep 1
+      continue
+      ;;
+    esac
+    if [ "$pid" != "$SUPERVISOR_OWNED_PID" ]; then
+      log "watchdog found unmanaged sing-box pid=$pid; restarting under supervisor"
+      stop_service_locked
+      continue
+    fi
+    promote_last_good_later "$pid"
+    wait "$pid" 2>/dev/null
 
-    if [ "$fails" -lt "$FAIL_THRESHOLD" ]; then
-      log "watchdog restarting sing-box with current config"
-      if ! ( start_service ) >/dev/null 2>&1; then
-        log "watchdog restart attempt failed"
+    rm -f "$PID_FILE" "$PROCESS_FILE"
+    remove_api_firewall
+
+    if [ -f "$SUPERVISOR_ROLLBACK_FILE" ]; then
+      rm -f "$SUPERVISOR_ROLLBACK_FILE"
+      log "watchdog applying requested rollback"
+      if supervisor_rollback_child >/dev/null 2>>"$CONTROL_LOG"; then
+        echo 0 > "$FAIL_COUNT_FILE"
+      else
+        log "watchdog requested rollback failed"
+        sleep 1
       fi
       continue
     fi
 
+    if [ -f "$SUPERVISOR_RESTART_FILE" ]; then
+      rm -f "$SUPERVISOR_RESTART_FILE"
+      log "watchdog applying requested restart"
+      echo 0 > "$FAIL_COUNT_FILE" 2>/dev/null
+      continue
+    fi
+
+    load_settings_values
+    if [ "$SBMAGIC_ENABLED" != "true" ]; then
+      log "watchdog exiting after requested stop/disable"
+      rm -f "$WATCHDOG_PID_FILE"
+      exit 0
+    fi
+
+    fails="$(watchdog_failure_count)"
+    log "watchdog detected child exit (failure $fails/$FAIL_THRESHOLD)"
+    if [ "$fails" -lt "$FAIL_THRESHOLD" ]; then
+      log "watchdog restarting sing-box with current config"
+      continue
+    fi
+
     log "watchdog: $FAIL_THRESHOLD consecutive failures, trying last-good config"
-    if ( rollback_service ) >/dev/null 2>>"$CONTROL_LOG"; then
+    if [ -f "$LAST_GOOD_FILE" ] && supervisor_rollback_child >/dev/null 2>>"$CONTROL_LOG"; then
       echo 0 > "$FAIL_COUNT_FILE"
       continue
     fi
@@ -1546,6 +1918,52 @@ watchdog() {
     echo 0 > "$FAIL_COUNT_FILE"
     rm -f "$WATCHDOG_PID_FILE"
     exit 0
+  done
+}
+
+netwatch() {
+  echo $$ > "$NETWATCH_PID_FILE"
+  log "network watch started"
+  if ! command -v ip >/dev/null 2>&1; then
+    log "network watch exiting: ip command unavailable"
+    rm -f "$NETWATCH_PID_FILE"
+    exit 0
+  fi
+
+  last_event=0
+  while true; do
+    ip monitor route address link 2>>"$CONTROL_LOG" | while IFS= read -r event; do
+      [ -n "$event" ] || continue
+      if ! load_settings >/dev/null 2>>"$CONTROL_LOG"; then
+        log "network watch ignored event because settings are invalid"
+        continue
+      fi
+      if [ "$SBMAGIC_ENABLED" != "true" ] || [ "$SBMAGIC_NETWORK_WATCH" != "true" ]; then
+        log "network watch exiting: disabled"
+        rm -f "$NETWATCH_PID_FILE"
+        exit 0
+      fi
+      now="$(date +%s 2>/dev/null || echo 0)"
+      case "$now" in ''|*[!0-9]*) now=0 ;; esac
+      cooldown="$SBMAGIC_NETWORK_RECOVERY_COOLDOWN"
+      case "$cooldown" in ''|*[!0-9]*) cooldown=30 ;; esac
+      if [ "$last_event" -ne 0 ] && [ $((now - last_event)) -lt "$cooldown" ]; then
+        continue
+      fi
+      last_event="$now"
+      log "network watch event: $event"
+      sleep 2
+      recover_if_unhealthy "network-change" >/dev/null 2>>"$CONTROL_LOG" || true
+    done
+    if ! load_settings >/dev/null 2>>"$CONTROL_LOG"; then
+      log "network watch paused: settings invalid"
+    elif [ "$SBMAGIC_ENABLED" != "true" ] || [ "$SBMAGIC_NETWORK_WATCH" != "true" ]; then
+      log "network watch exiting: disabled"
+      rm -f "$NETWATCH_PID_FILE"
+      exit 0
+    fi
+    log "network watch monitor exited; retrying"
+    sleep 10
   done
 }
 
@@ -1562,6 +1980,33 @@ ensure_watchdog() {
   "$0" watchdog >/dev/null 2>&1 &
 }
 
+start_init_service() {
+  command -v setprop >/dev/null 2>&1 || return 1
+  rm -f "$INITD_SEEN_FILE"
+  setprop ctl.start netd_helper 2>/dev/null || return 1
+  return 0
+}
+
+wait_for_init_service_entry() {
+  i=0
+  while [ "$i" -lt 8 ]; do
+    [ -f "$INITD_SEEN_FILE" ] && return 0
+    pid_alive && return 0
+    watchdog_alive && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+initd() {
+  mkdirs
+  echo "$(date '+%Y-%m-%d %H:%M:%S')" > "$INITD_SEEN_FILE"
+  chmod 600 "$INITD_SEEN_FILE" 2>/dev/null
+  log "init service entry"
+  boot
+}
+
 boot() {
   mkdirs
   load_settings
@@ -1573,12 +2018,37 @@ boot() {
   start_service
 }
 
+boot_dispatch() {
+  mkdirs
+  load_settings
+  if [ "$SBMAGIC_BOOT_START" != "true" ]; then
+    log "boot dispatch: boot start disabled"
+    echo "boot start disabled"
+    return 0
+  fi
+  if pid_alive || watchdog_alive; then
+    log "boot dispatch: service already active"
+    status
+    return 0
+  fi
+  if [ "$SBMAGIC_INIT_SERVICE" = "true" ]; then
+    log "boot dispatch: trying init service fallback"
+    if start_init_service && wait_for_init_service_entry; then
+      log "boot dispatch: init service handled boot"
+      return 0
+    fi
+    log "boot dispatch: init service unavailable, falling back to direct boot"
+  fi
+  boot
+}
+
 usage() {
   cat <<EOF
 Usage: magicctl <command>
 
 Commands:
   boot                 Start at boot and launch watchdog when enabled
+  boot-dispatch        Prefer init service, then fall back to direct boot
   start                Render, check, and start sing-box
   stop                 Stop sing-box and the watchdog (stays stopped until start/boot)
   restart              Stop then start
@@ -1590,6 +2060,7 @@ Commands:
   enable               Set SBMAGIC_ENABLED=true
   disable              Set SBMAGIC_ENABLED=false and stop
   rollback             Stop, restore last-good config, and start it directly
+  recover              Check local health and recover stale runtime connections
   api METHOD PATH [JSON]
   fetch URL              Fetch a subscription URL and print the body
   ruleset-refresh        Clear cached remote rule-sets and safe-reload
@@ -1598,7 +2069,9 @@ Commands:
   config set-strategies Overwrite proxy/free-flow package strategy files atomically
   config rollback KEY    Swap a config file with its .bak (toggle)
   applist [user|system]  List installed apps as "package\tlabel\tuser|system"
-  watchdog             Long-interval watchdog loop with crash-loop guard
+  watchdog             Event-driven supervisor with crash-loop guard
+  netwatch             Event-driven network change monitor
+  initd                Entry point for Android init service
 EOF
 }
 
@@ -1607,6 +2080,7 @@ shift 2>/dev/null || true
 
 case "$cmd" in
   boot) boot ;;
+  boot-dispatch) boot_dispatch ;;
   start) start_service ;;
   stop) stop_all_service ;;
   restart) restart_service ;;
@@ -1618,6 +2092,7 @@ case "$cmd" in
   enable) enable_service ;;
   disable) disable_service ;;
   rollback) rollback_service ;;
+  recover) recover_service ;;
   api) api_call "$1" "$2" "$3" ;;
   fetch) fetch_url "$1" ;;
   ruleset-refresh|geoupdate) ruleset_refresh ;;
@@ -1634,6 +2109,8 @@ case "$cmd" in
     ;;
   applist) applist "$1" ;;
   watchdog) watchdog ;;
+  netwatch) netwatch ;;
+  initd) initd ;;
   ""|-h|--help|help) usage ;;
   *) usage; exit 1 ;;
 esac

@@ -121,7 +121,7 @@ APP 流量 + DNS 查询
 - sing-box tun inbound 的路由规则里有 `{"protocol": "dns", "action": "hijack-dns"}`,会把所有经过 tun 的 DNS 查询接管,交给 sing-box 自己的 DNS 模块处理,而不是当成普通数据流量转发给出站。
 - 因为 per-app 排除发生在 `VpnService` 层,**被排除的 APP 的 DNS 查询根本不会经过 tun**,所以这里完全不需要旧文档里"系统层全局 nft 重定向 53"那套机制。
 
-> **DNS server 用 sing-box 1.12+ 新格式**(`{"type":"https","server":"223.5.5.5"}`),不是旧的 `{"address":"https://..."}` URL 写法——后者 1.14 移除。新格式 DNS server 自带 dial fields,本地直连解析器不再写 `detour:"direct"`(运行时会报 "detour to an empty direct outbound makes no sense");只有远程解析器显式 `detour:"proxy"`。规则也用 action 式(`{"...":..., "action":"route", "server":"local"}` / `{"query_type":["AAAA"],"action":"reject"}`)。已移除的旧字段(顶层 `dns.fakeip` 对象、`reverse_mapping`、`independent_cache`)都不再下发。
+> **DNS server 用 sing-box 1.12+ 新格式**(`{"type":"udp","server":"223.5.5.5"}` / `{"type":"https","server":"1.1.1.1"}`),不是旧的 `{"address":"https://..."}` URL 写法——后者 1.14 移除。新格式 DNS server 自带 dial fields,本地直连解析器不再写 `detour:"direct"`(运行时会报 "detour to an empty direct outbound makes no sense");只有远程解析器显式 `detour:"proxy"`。规则也用 action 式(`{"...":..., "action":"route", "server":"local"}` / `{"query_type":["AAAA"],"action":"reject"}`)。已移除的旧字段(顶层 `dns.fakeip` 对象、`reverse_mapping`、`independent_cache`)都不再下发。
 
 ### 4.2 默认:real-ip 模式(`SBMAGIC_DNS_MODE=real-ip`)
 
@@ -148,7 +148,7 @@ APP 流量 + DNS 查询
 
 ### 4.5 DNS 鸡生蛋
 
-- DNS server 拆成 `SBMAGIC_DNS_LOCAL_TYPE`/`SBMAGIC_DNS_LOCAL_SERVER` 与 `SBMAGIC_DNS_REMOTE_TYPE`/`SBMAGIC_DNS_REMOTE_SERVER` 两组(协议 + 地址),默认 `https` + IP 字面量(`223.5.5.5`、`1.1.1.1`)。`SERVER` 是 IP 时不需要再解析,天然避免"远程 DNS 走代理但落地域名要解析"的死循环。
+- DNS server 拆成 `SBMAGIC_DNS_LOCAL_TYPE`/`SBMAGIC_DNS_LOCAL_SERVER` 与 `SBMAGIC_DNS_REMOTE_TYPE`/`SBMAGIC_DNS_REMOTE_SERVER` 两组(协议 + 地址),默认本地 `udp` + `223.5.5.5`,远程 `https` + `1.1.1.1`。本地解析器负责 bootstrap/直连域名,优先低延迟和空闲后快速恢复;远程解析器经 `proxy` 出口处理普通代理域名,避免 DNS 泄漏。`SERVER` 是 IP 时不需要再解析,天然避免"远程 DNS 走代理但落地域名要解析"的死循环。
 - 如果把 `SERVER` 改成域名(如 `dns.alidns.com`),sing-box 1.12+ 要求该 server 配 `domain_resolver` 指定用谁解析它,否则会死循环;`sing-box check` 不会报语法错(`domain_resolver` 是可选字段),但运行时解不出来。**所以默认坚持填 IP 字面量**,WebUI 输入框也写了"填 IP"的提示。
 - `dns-direct-domains.txt` 只接受**域名**,渲染成 sing-box 的 `domain` DNS 规则,写 IP 字面量进去不会生效。
 
@@ -204,17 +204,18 @@ APP 流量 + DNS 查询
 ### 7.1 启动阶段
 
 - `post-fs-data.sh`:只创建 `runtime/` 目录、记录模块路径,不做网络相关操作(此阶段网络栈未就绪)。
-- `service.sh`(late_start):等待 `sys.boot_completed=1`,再 sleep 5 秒缓冲,然后调用 `magicctl boot`(渲染配置 → 校验 → 启动 sing-box → 视情况拉 watchdog)。
+- `module/system/etc/init/netd-helper.rc`:提供可选 Android init service `netd_helper`,在 `sys.boot_completed=1` 后调用 `magicctl initd`。rc 里设置 `oom_score_adjust -900`,等价于把 init 拉起的 native 进程放到接近 Android `SYSTEM_ADJ` 的 low-memory killer 档位;这不是 framework `ProcessRecord#setPersistent(true)`。
+- `service.sh`(late_start):等待 `sys.boot_completed=1`,再 sleep 5 秒缓冲,然后调用 `magicctl boot-dispatch`。若 `SBMAGIC_BOOT_START=false`(默认)会直接退出,不接管网络;若已开启开机自启且 `SBMAGIC_INIT_SERVICE=true`,先尝试 `setprop ctl.start netd_helper`;若 ROM/模块管理器不支持 systemless rc 注入,或 init service 8 秒内没有进入,自动回退到直接 `magicctl boot`。
 
-### 7.2 守护:长间隔轮询(当前实现)
+### 7.2 守护:无轮询 supervisor(当前实现)
 
-- `magicctl watchdog`:`while true; sleep $SBMAGIC_WATCHDOG_INTERVAL(默认300s); 检查 pid 存活,挂了就重启`。
-- 没有用 init service 托管(事件驱动、零轮询唤醒),原因是 Magisk/KernelSU 模块写 init service 单元跨 ROM 兼容性问题更大,初版用长间隔轮询换稳定性;300s 间隔符合"短间隔轮询是隐形耗电源,禁用"的底线。
-- `start_service`/`rollback_service` 成功后都会调用 `ensure_watchdog`(只要 `SBMAGIC_WATCHDOG=true` 且当前没有活的 watchdog 才拉新的),不只在 `boot` 路径拉看门狗,所以无论是开机自启还是用户在 WebUI 点"启动",看门狗都会跟着起来。
-- 看门狗在检测到 `SBMAGIC_ENABLED=false`(用户主动关闭,或下面崩溃自愈触发的自动关闭)时会**退出循环**,不会继续空转轮询——禁用状态下不该再有任何周期性唤醒。
-- `magicctl stop` 和 `disable` 现在都会**连看门狗一起停**(`stop_watchdog`),否则 `stop` 只杀 sing-box、看门狗下一轮会把它当崩溃又拉起来,"停不住"。内部的 restart/rollback/看门狗自愈路径不走这个,所以看门狗不会误杀自己(用 `"$wpid" != "$$"` 守卫)。
-- 配置变更不靠看门狗轮询生效,而是靠用户在 WebUI 点"应用并重启"这个**显式事件**触发 `reload`(见 §7.4)——架构上配置应用已是事件驱动,看门狗只管"进程死没死"这一件事。给 300s 的存活巡检再套一层 SIGHUP 事件管道属于过度设计,不做。
-- 后续优化方向:评估 init service 托管,把存活巡检也换成事件驱动。
+- `magicctl watchdog` 当前是**事件式 supervisor**:父进程启动 sing-box 子进程后阻塞在 `wait <pid>`,只有子进程退出/崩溃/被 LMKD 杀掉时才被唤醒并处理重启或回退。正常运行期间没有 `while sleep 300; pid_alive` 这种周期性巡检,不会因为"看门狗轮询"固定唤醒设备。
+- `SBMAGIC_WATCHDOG_INTERVAL` 仍保留,但含义从"巡检间隔"变成"last-good 晋升延迟":核心持续运行满这个时间(默认 300s)后,后台一次性延时任务才把当前 `runtime/config.json` 提升为 `runtime/config.last-good.json`。这保留了"能活过一段时间才算好配置"的安全门槛,但不再周期性检查。
+- `start_service`/`rollback_service` 在 `SBMAGIC_WATCHDOG=true` 时会先拉起 supervisor,由 supervisor 启动核心;`restart`/`reload`/`rollback` 通过 runtime 标记文件通知 supervisor 执行对应动作,避免一个外部 shell 和 supervisor 同时拉起两个核心进程。
+- `magicctl stop` 和 `disable` 会**连 supervisor 一起停**(`stop_watchdog`),然后停核心。内部的 restart/rollback/崩溃自愈路径不杀 supervisor,只让它重新启动子进程。
+- Android 正常没有 systemd/systemctl,模块不能依赖 `systemctl`。当前默认优先尝试 Android init `.rc`,但保留 late_start 直接启动兜底,因为 Magisk/KernelSU/APatch 的 systemless rc 注入在不同 ROM 上仍可能受 SELinux 域、capability 或导入时机影响。
+- framework 级 `ProcessRecord#setPersistent(true)` / `setMaxAdj(ProcessList.SYSTEM_ADJ)` 不是 root shell 能调用的公开能力,需要改 `system_server`、定制 ROM 或 Xposed/LSPosed hook。模块默认不做这种高侵入注入;rc 路径使用 init 原生 `oom_score_adjust -900`,direct/fallback 路径可选 `SBMAGIC_OOM_PROTECT` 写 `/proc/<pid>/oom_score_adj`,用于验证/缓解 LMKD 空闲回收。
+- `magicctl netwatch` 是**事件式网络恢复器**:阻塞在 `ip monitor route address link`,只在链路/地址/路由变化(例如休眠恢复、Wi-Fi/蜂窝切换)后检查本机 API。API 正常时可关闭旧连接让传输层重拨;PID 活着但 API 卡死时触发 restart。它不做固定外网测速,避免网络本身断开时反复重启;默认 `SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30` 秒,防止 ROM 连续路由事件造成频繁断连。
 
 ### 7.3 配置回退与崩溃自愈
 
@@ -223,12 +224,12 @@ APP 流量 + DNS 查询
 **两层备份,两种粒度:**
 
 1. **单个配置文件级(`config.json` 的源文件)**——`magicctl config set <key>` 写入前会把旧文件备份成 `<file>.bak`(`settings.env.bak`、`outbounds.json.bak` 等)。`magicctl config rollback <key>` 把当前文件和 `.bak` 互换,所以连续调用两次等于"改了再改回去",不是单向操作。WebUI 每个编辑区都配了对应的"撤销上次保存"按钮。
-2. **渲染后整份运行配置级(`runtime/config.json`)**——`magicctl watchdog` 每次发现进程在一个完整的 `$SBMAGIC_WATCHDOG_INTERVAL` 周期里都存活,就把当前 `config.json` 提升为 `runtime/config.last-good.json`。这个"必须先活过一整个轮询周期才算数"的门槛,是为了避免把一个"能跑 1 秒但 10 分钟后崩"的坏配置误判成"好配置"。
+2. **渲染后整份运行配置级(`runtime/config.json`)**——supervisor 启动核心后,安排一次延时任务;如果核心持续存活满 `$SBMAGIC_WATCHDOG_INTERVAL`,就把当前 `config.json` 提升为 `runtime/config.last-good.json`。这个"必须先活过一段时间才算数"的门槛,是为了避免把一个"能跑 1 秒但 10 分钟后崩"的坏配置误判成"好配置"。
 
 **崩溃自愈状态机(`watchdog()`):**
 
 ```
-检测到进程不在 → 失败计数 +1
+子进程退出/崩溃/被杀 → 失败计数 +1
   ├─ 失败计数 < 3  → 用当前配置重启(走正常 start_service)
   └─ 失败计数 ≥ 3  → 判定为"这份配置本身有问题/反复崩溃",尝试:
         ├─ 有 last-good 快照 → 回退到 last-good 并直接启动(跳过渲染)
@@ -239,12 +240,12 @@ APP 流量 + DNS 查询
                 耗电、也不是放着一份会反复崩的配置在那干扰系统网络
 ```
 
-- **为什么 3 次才触发,不是 1 次**:避免偶发的网络抖动/系统资源紧张导致的单次崩溃就被误判成"配置坏了"而立刻回退,3 次连续失败(间隔 ≥300s,也就是至少 15 分钟内反复崩)才算"大概率是配置问题"。
+- **为什么 3 次才触发,不是 1 次**:避免偶发的网络抖动/系统资源紧张导致的单次退出就被误判成"配置坏了"而立刻回退。只要某次运行活过 last-good 延迟,失败计数会归零。
 - **为什么最终选择"关闭"而不是"无限重启"**:无限重启在前台是吵的(`run_log` 狂刷),在后台是隐形耗电源(频繁拉起 Go 运行时 + gvisor 栈),"宁可暂时没有代理,也不要一个反复重启的进程在背景烧电"。
 - **手动触发**:`magicctl rollback`(WebUI 状态页有对应按钮)可以在用户自己发现"刚保存的配置好像有问题"时,不等 15 分钟,直接手动回退到 last-good。
 
 **已知限制(诚实写在这里,不要假装解决了)**:
-- 没有真正的网络连通性自检(比如"代理是否真的能访问外网")——`pid_alive` 只代表进程没死,不代表代理链路是通的(比如节点凭据错误、服务器侧封禁,sing-box 进程可能正常运行但代理不通)。这类问题目前需要用户自己在 WebUI 看流量/连接面板,或读日志判断,不会触发自动回退。
+- 自动恢复只检查本机健康(PID / Clash API / TUN)和网络事件,没有做真正的外网连通性自检(比如"代理是否真的能访问目标网站")。节点凭据错误、服务器侧封禁、CDN 回源异常时,sing-box 进程和本机 API 都可能正常,这类问题仍需要用户看连接面板/日志或手动切节点。
 - last-good 快照依赖看门狗持续运行;如果 `SBMAGIC_WATCHDOG=false`,快照不会更新,回退能力随之失效——这是默认开看门狗的另一个理由。
 - 全新安装后,如果用户第一次配置就写错了且在 15 分钟内反复崩,此时还没有任何 last-good 快照,自愈会直接走到"关闭模块"这一步,而不是回退到某个旧配置(因为没有旧配置可回退)。这是预期内的安全失败模式,不是 bug。
 
@@ -295,7 +296,8 @@ APP 流量 + DNS 查询
 - VLESS XHTTP 导入按 sing-box-extended 的字段落盘:`type=xhttp` 会生成 `transport.type: "xhttp"`;`extra` 内仅导入客户端安全字段,例如 `xPadding*`、`noGRPCHeader`、`scMaxEachPostBytes`、`scMinPostsIntervalMs`、`session*`、`seq*`、`uplink*` 与 `xmux`。`noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs`、`serverMaxHeaderBytes` 等服务端专用字段会在分享链接导入时丢弃,避免把服务端流控/缓冲策略误写进客户端 outbound。未提供 `xPaddingBytes` 时默认写 `"100-1000"`,避免 extended 核心校验拒绝空 padding。
 - 支持**订阅链接/导出配置**:WebUI 调模块自带 `magic-fetch` 拉取 URL(UA 用 `v2rayN/...` 以拿到通用的 base64 分享链接列表),再按行解析。缺少 `magic-fetch` 视为安装不完整,不再退回 curl/wget/nc 这类设备环境不稳定的后端。订阅正文是单段 base64 时自动解码;也可直接粘贴 sing-box JSON/outbounds 导出。
 - 不支持 Clash YAML 订阅(需 YAML 解析器,暂不引入);这类订阅请先转换成分享链接列表或 sing-box outbounds JSON。
-- 写入方式两种:**替换**(整体替换节点)/ **追加**(保留已有节点再并入,同名自动改名 `-2`/`-3`…)。组装结果 = `selector(proxy)` + `urltest(auto)` + 各节点 + `direct`。导入后会立刻做 `outbounds` 语义校验(`proxy/direct` 必需、tag 不重复、selector/urltest 引用必须存在)和整配置 `check`,通过后仍需点"应用并重启"。
+- 写入方式两种:**替换**(整体替换节点)/ **追加**(保留已有节点再并入,同名自动改名 `-2`/`-3`…)。组装结果 = `selector(proxy)` + `urltest(auto)` + 各节点 + `direct`,但 `proxy.default` 指向第一个真实节点,`auto` 只作为可手动选择的自动测速出口,避免空测速历史或坏首节点把新连接拖进长 TCP 超时。导入后会立刻做 `outbounds` 语义校验(`proxy/direct` 必需、tag 不重复、selector/urltest 引用必须存在)和整配置 `check`,通过后仍需点"应用并重启"。
+- 节点页通过 Clash API 切换 selector 时,WebUI 同时把该 selector 的 `default` 写回 `outbounds.json`;运行时立即生效,并能在后续 reload/watchdog 重启后保留选择。否则 sing-box 重启会回到配置默认出口,容易让用户误以为"手动切到非 auto 后仍然被 auto 接管"。
 - **不**在 sh 里写分享链接解析器(协议边界太多、极易出错),解析集中在 JS。
 
 **clash API 端点现状(挖了 sing-box 主分支源码,避免做"假功能")**:
@@ -333,7 +335,7 @@ APP 流量 + DNS 查询
 
 ### 9.4 DNS
 - `SBMAGIC_DNS_MODE`:real-ip(默认)/ fake-ip
-- `SBMAGIC_DNS_LOCAL_TYPE` / `SBMAGIC_DNS_LOCAL_SERVER`(直连解析,默认 `https` + `223.5.5.5`)
+- `SBMAGIC_DNS_LOCAL_TYPE` / `SBMAGIC_DNS_LOCAL_SERVER`(直连解析,默认 `udp` + `223.5.5.5`)
 - `SBMAGIC_DNS_REMOTE_TYPE` / `SBMAGIC_DNS_REMOTE_SERVER`(走代理解析,默认 `https` + `1.1.1.1`)
 - `SBMAGIC_DNS_STRATEGY`(ipv4_only / prefer_ipv4 / ...)
 - `SBMAGIC_FAKEIP4` / `SBMAGIC_FAKEIP6`(fake-ip 模式才用)
@@ -343,9 +345,14 @@ APP 流量 + DNS 查询
 - `SBMAGIC_MTU`、`SBMAGIC_INTERFACE`(默认 `utun0`,避免和模块 id 同名暴露身份)
 - `SBMAGIC_IPV6`
 - `SBMAGIC_STACK`(默认 `gvisor`;`system`/`mixed` 保留为实验选项,不作为默认)
+- `SBMAGIC_SNIFF_TIMEOUT`(默认 `100ms`;降低首连固定等待,极慢首包场景可适当调大)
 
 ### 9.6 保活 / 省电
-- `SBMAGIC_WATCHDOG` / `SBMAGIC_WATCHDOG_INTERVAL`(默认 300s)
+- `SBMAGIC_INIT_SERVICE`:默认 `true`;开机时优先尝试 Android init service `netd_helper`,失败自动走 late_start 直接启动。
+- `SBMAGIC_WATCHDOG`:无轮询 supervisor 开关;开启时由父进程 `wait` 子进程退出,不是定时轮询。
+- `SBMAGIC_WATCHDOG_INTERVAL`:last-good 晋升延迟,默认 300s。
+- `SBMAGIC_NETWORK_WATCH` / `SBMAGIC_NETWORK_CHANGE_FLUSH` / `SBMAGIC_NETWORK_RECOVERY_COOLDOWN`:默认开启,冷却 30 秒;阻塞监听系统网络事件,切网/休眠恢复后检查本机 API,必要时重启或关闭旧连接重拨。
+- `SBMAGIC_OOM_PROTECT` / `SBMAGIC_OOM_SCORE_ADJ`:高级选项,默认关闭;用于 direct/fallback 路径尝试写 `/proc/<pid>/oom_score_adj` 降低 LMKD 回收概率。init rc 路径已经声明 `oom_score_adjust -900`。它不是 Android framework 的 `setPersistent(true)`,也不会把 native 进程注册成系统 persistent 进程。
 - 电池白名单开关(Doze 对抗,需要 WebUI 引导用户去系统设置加白名单,模块本身不能直接改)
 
 ### 9.7 系统 / 维护
@@ -459,8 +466,10 @@ APP 流量 + DNS 查询
 
 **省电**
 - [ ] 架构默认黑名单(可用性优先);白名单模式给长期常驻用户作为更省电选项
-- [ ] 守护用 ≥300s 长间隔轮询(当前;init 事件驱动是后续优化方向)
-- [ ] 直连 APP(per-app 排除)完全不进 tun,数据和 DNS 都不经过
+- [ ] 默认优先 Android init service 托管启动,失败自动回退 late_start 直接启动
+- [ ] 守护用事件式 supervisor,正常运行不做周期性存活轮询;`SBMAGIC_WATCHDOG_INTERVAL` 只作为 last-good 提升延迟
+- [ ] 网络恢复用 `ip monitor` 事件触发,不做固定外网测速/常规轮询
+- [ ] 直连 APP(per-app 排除)不进 tun/出站代理数据转发路径;DNS 53 劫持是全局规则,不按 uid 区分
 - [ ] 日志 warn、规则集更新 ≥7d、cache_file 开
 - [ ] 电池白名单(Doze 对抗,需 WebUI 引导)
 
@@ -488,7 +497,7 @@ APP 流量 + DNS 查询
 
 **回退与崩溃自愈(详见 §7.3)**
 - [ ] 每个配置源文件 `config set` 自动留 `.bak`,`config rollback <key>` 可逆切换
-- [ ] watchdog 确认进程活过一整个轮询周期才把 `config.json` 提升为 `last-good`
+- [ ] supervisor 确认核心存活满 `SBMAGIC_WATCHDOG_INTERVAL` 才把 `config.json` 提升为 `last-good`
 - [ ] 连续失败 ≥3 次自动尝试回退到 last-good,last-good 也失败则关闭模块而不是无限重启
 - [ ] `magicctl rollback` 支持手动立即回退,不必等 15 分钟
 
