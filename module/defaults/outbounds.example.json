@@ -44,7 +44,7 @@
       "type": "xhttp",
       "host": "example.com",
       "path": "/CloudSync.DriveService.v2/update",
-      "mode": "auto",
+      "mode": "packet-up",
       "x_padding_bytes": "100-1000",
       "x_padding_obfs_mode": true,
       "x_padding_header": "X-Correlation-ID",
@@ -55,9 +55,7 @@
       "seq_placement": "cookie",
       "seq_key": "X-Request-Seq",
       "sc_max_each_post_bytes": "1000000",
-      "sc_max_buffered_posts": 30,
-      "sc_stream_up_server_secs": "20-80",
-      "server_max_header_bytes": 8192,
+      "sc_min_posts_interval_ms": "30",
       "uplink_http_method": "POST"
     }
   },

@@ -291,7 +291,8 @@ APP 流量 + DNS 查询
 **节点导入(对标 v2rayN 的"导入"体验)**——在 WebUI 的"节点"Tab:
 - 解析在**页面 JS** 里完成(JS 自带 base64/URL/JSON 能力,比 sh 干净可靠),把分享链接转成 sing-box 原生 outbound,再 `config set outbounds` 写入。
 - 支持协议:`vmess` / `vless`(含 reality、flow、`encryption`、ws/grpc/http/xhttp 传输、uTLS 指纹)/ `trojan` / `ss`(SIP002 与旧版全 base64 两种写法,含 plugin)/ `hysteria2`(含 salamander obfs)/ `tuic` / `anytls`。
-- VLESS XHTTP 导入按 sing-box-extended 的字段落盘:`type=xhttp` 会生成 `transport.type: "xhttp"`;`extra` 内的 `xPadding*`、`sc*`、`session*`、`seq*`、`uplink*` 字段走白名单转换为 snake_case。未提供 `xPaddingBytes` 时默认写 `"100-1000"`,避免 extended 核心校验拒绝空 padding。
+- VLESS `encryption` 在导入阶段按当前 sing-box-extended 的 `mlkem768x25519plus.<native|xorpub|random>.<0rtt|1rtt>.<key...>` 规则做本地预校验,key 必须是 base64url 解码后 32 或 1184 字节;不符合时拒绝该节点并在 UI 显示具体原因,避免写出 `sing-box check` 必炸的配置。
+- VLESS XHTTP 导入按 sing-box-extended 的字段落盘:`type=xhttp` 会生成 `transport.type: "xhttp"`;`extra` 内仅导入客户端安全字段,例如 `xPadding*`、`noGRPCHeader`、`scMaxEachPostBytes`、`scMinPostsIntervalMs`、`session*`、`seq*`、`uplink*` 与 `xmux`。`noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs`、`serverMaxHeaderBytes` 等服务端专用字段会在分享链接导入时丢弃,避免把服务端流控/缓冲策略误写进客户端 outbound。未提供 `xPaddingBytes` 时默认写 `"100-1000"`,避免 extended 核心校验拒绝空 padding。
 - 支持**订阅链接/导出配置**:WebUI 调模块自带 `magic-fetch` 拉取 URL(UA 用 `v2rayN/...` 以拿到通用的 base64 分享链接列表),再按行解析。缺少 `magic-fetch` 视为安装不完整,不再退回 curl/wget/nc 这类设备环境不稳定的后端。订阅正文是单段 base64 时自动解码;也可直接粘贴 sing-box JSON/outbounds 导出。
 - 不支持 Clash YAML 订阅(需 YAML 解析器,暂不引入);这类订阅请先转换成分享链接列表或 sing-box outbounds JSON。
 - 写入方式两种:**替换**(整体替换节点)/ **追加**(保留已有节点再并入,同名自动改名 `-2`/`-3`…)。组装结果 = `selector(proxy)` + `urltest(auto)` + 各节点 + `direct`。导入后会立刻做 `outbounds` 语义校验(`proxy/direct` 必需、tag 不重复、selector/urltest 引用必须存在)和整配置 `check`,通过后仍需点"应用并重启"。
