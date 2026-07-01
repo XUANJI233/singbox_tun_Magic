@@ -112,7 +112,7 @@ APP 流量 + DNS 查询
 - `packages.proxy`:这些应用进入 TUN 后只展开代理策略规则。
 - `packages.free-flow`:这些应用进入 TUN 后只展开免流策略规则。
 - 两个文件都没有列出的应用使用自动/混合策略,按 `SBMAGIC_MIXED_RULE_PRIORITY` 决定代理规则和免流规则的展开顺序。
-- 同一个包名同时出现在 `packages.proxy` 与 `packages.free-flow` 会被 `magicctl render/check/start/reload` 拒绝。WebUI 保存应用策略时用 `magicctl config set-strategies` 原子写入两个文件,避免从"代理"切"免流"时出现中间态冲突。
+- 同一个包名同时出现在 `packages.proxy` 与 `packages.free-flow` 会被 `magicctl render/check/start/reload` 拒绝。WebUI 保存应用页时用 `magicctl config set-per-app` 原子写入 `SBMAGIC_PACKAGE_MODE`、入口名单和两个强制策略文件,只做一次临时渲染 + `sing-box check`,避免连续多次校验造成 UI 卡顿,也避免从"代理"切"免流"时出现中间态冲突。
 - `packages.proxy/free-flow` 只对已经进入 TUN 的应用生效;白名单模式下没加入 `packages.include` 的应用即使设置了策略也不会进入模块。
 - 性能注意:`packages.proxy/free-flow` 非空且对应规则模式开启时,运行配置会包含 `route.package_name` 条件。sing-box 为了匹配这些条件会对进入 TUN 的连接做包名/进程识别;这比纯目的地规则更贵。长期常驻/省电优先时,优先用黑/白名单决定"进不进 TUN",把强制应用策略列表保持短小。
 
@@ -125,16 +125,19 @@ APP 流量 + DNS 查询
 - sing-box tun inbound 的路由规则里有 `{"protocol": "dns", "action": "hijack-dns"}`,会把所有经过 tun 的 DNS 查询接管,交给 sing-box 自己的 DNS 模块处理,而不是当成普通数据流量转发给出站。
 - 因为 per-app 排除发生在 sing-tun 的 Android package/UID 路由层,**被排除 UID 的常规 DNS 查询不会经过本模块 tun**,所以这里完全不需要旧文档里"系统层全局 nft 重定向 53"那套机制。
 
-> **DNS server 用 sing-box 1.12+ 新格式**(`{"type":"udp","server":"223.5.5.5"}` / `{"type":"https","server":"1.1.1.1"}`),不是旧的 `{"address":"https://..."}` URL 写法——后者 1.14 移除。新格式 DNS server 自带 dial fields,本地直连解析器不再写 `detour:"direct"`(运行时会报 "detour to an empty direct outbound makes no sense");只有远程解析器显式 `detour:"proxy"`。规则也用 action 式(`{"...":..., "action":"route", "server":"local"}` / `{"query_type":["AAAA"],"action":"reject"}`)。已移除的旧字段(顶层 `dns.fakeip` 对象、`reverse_mapping`、`independent_cache`)都不再下发。
+> **DNS server 用 sing-box 1.12+ 新格式**(`{"type":"udp","server":"223.5.5.5"}` / `{"type":"https","server":"1.1.1.1"}`),不是旧的 `{"address":"https://..."}` URL 写法——后者 1.14 移除。新格式 DNS server 自带 dial fields,本地直连解析器不再写 `detour:"direct"`(运行时会报 "detour to an empty direct outbound makes no sense");只有远程解析器显式 `detour:"proxy"`。规则也用 action 式(`{"...":..., "action":"route", "server":"local"}` / `{"query_type":["AAAA"],"action":"reject"}`)。已移除的旧字段主要是顶层 `dns.fakeip` 对象;`reverse_mapping` 仍存在且默认开启。
+
+`https` = DoH,`tls` = DoT,当前扩展核心能通过 `check`。风险不在"不支持 DoH/DoT",而在用户换成任意 provider IP 时,该 IP 的 TLS 证书可能不包含 IP SAN;当前模块坚持 DNS server 填 IP 字面量,不允许 URL/域名/端口,就是为了避免 bootstrap 域名解析的鸡生蛋。加密 DNS 通过 `SBMAGIC_DNS_*_TLS_SERVER_NAME` 下发 `tls.server_name`,用于 SNI/证书校验,在 sing-box 中也会成为 DoH Host,所以 `8.8.8.8 + dns.google`、`9.9.9.9 + dns.quad9.net` 这类组合不会因为缺 IP SAN 静默失败。默认本地 DNS 仍用 UDP,是为了亮屏/切网/空闲恢复时更快解析代理节点域名;需要更强本地 DNS 隐私时可把 local 改为 `https` 或 `tls` 并填写 TLS 名称。
 
 ### 4.2 默认:real-ip 模式(`SBMAGIC_DNS_MODE=real-ip`)
 
-- `dns.final` = `remote`,本地 DNS(`local`,直连 dialer)处理 `dns-direct-domains.txt` 里列出的域名和 `*.cn`,其余走 `remote`(detour `proxy`)。
+- `dns.final` = `remote`,本地 DNS(`local`,直连 dialer)处理 `dns-direct-domains.txt` 里列出的域名、`geosite-cn` 和 `*.cn`,其余走 `remote`(detour `proxy`)。
 - 返回真实 IP,不返回 fake-ip,语义最清晰、兼容性最好。
+- `dns.reverse_mapping=true` 默认开启。real-ip 模式下 route 层看到的目标通常已经是 IP;反向映射会把 DNS 响应保存成 IP→域名缓存,让后续 `domain_suffix` / `geosite-cn` 等域名路由规则仍然能命中,同时保持 `SBMAGIC_SNIFF=false` 的低首连成本。
 
 ### 4.3 可选:fake-ip 高级模式(`SBMAGIC_DNS_MODE=fake-ip`)
 
-- `magicctl` 渲染时会加一个 `{"type":"fakeip","tag":"fakeip",...}` DNS server(1.12+ 新格式,不再用顶层 `dns.fakeip` 对象),并在直连/CN 规则之后追加 `query_type: A/AAAA -> server: fakeip` 的 DNS 规则。`dns.final` 仍保持 `remote`/`local`。**不能**把 `dns.final` 设成 `fakeip`;sing-box 1.13 会拒绝启动(`default server cannot be fakeip`)。
+- `magicctl` 渲染时会加一个 `{"type":"fakeip","tag":"fakeip",...}` DNS server(1.12+ 新格式,不再用顶层 `dns.fakeip` 对象),并在直连/CN 规则之后追加 `query_type: A/AAAA -> server: fakeip` 的 DNS 规则。`dns.final` 仍保持 `remote`/`local`。**不能**把 `dns.final` 设成 `fakeip`;sing-box 1.13 会拒绝启动(`default server cannot be fakeip`)。`SBMAGIC_FAKEIP4` / `SBMAGIC_FAKEIP6` 在模块层先做 CIDR 校验,坏值不会等到核心启动时才暴露。
 - fake-ip 模式下渲染会显式写 `cache_file.store_fakeip: true`,把 fake-ip↔域名映射持久化到 `cache.db`,避免重启后旧映射失效导致正在用 fake-ip 的连接断开(该字段默认值在不同 sing-box 版本间不一致,所以显式写死)。
 - 因为所有流量都在 tun 内(没有"排除 APP 拿到假 IP 但流量不进 tun"的问题——排除的 APP 本来就不查这个 DNS),fake-ip 在当前架构下**不存在旧文档里 per-app 冲突的那套顾虑**,可以放心用来恢复域名级分流精度。
 - IPv6 关闭时(`SBMAGIC_IPV6=false`,默认),AAAA 已被 DNS 规则最前面的 `reject` 全局拦掉(见 §4.4),所以 fake-ip 自然只产出 v4,不会下发 fake v6 段。
@@ -180,11 +183,14 @@ APP 流量 + DNS 查询
 - route 引擎用 1.13+ 的 action 式语法(`sniff`/`hijack-dns`/`reject`),避免已废弃字段。**特别注意**:`block` 和 `dns` 两种特殊出站在 sing-box **1.13 已移除**,所以默认 `outbounds.json` 里**不再有** `{"type":"block"}`/`{"type":"dns"}`,拦截一律用路由 `action: reject`、DNS 接管用 `action: hijack-dns`。装在 1.13 二进制上若带着这两个旧出站会直接 `check` 失败、服务起不来。
 - 路由顺序固定为:DNS 接管 → 可选 sniff → IPv6 禁用时 reject → 私网/LAN 恒直连 → clash Direct/Global → 强制代理应用规则 → 强制免流应用规则 → 自动/混合应用规则 → `final: direct`。`SBMAGIC_PROXY_RULE_MODE` 控制代理策略(`off/global/bypass-cn`),`SBMAGIC_FREE_FLOW_RULE_MODE` 控制免流策略(`off/global`),不要再用布尔式 `SBMAGIC_FREE_FLOW` 或把"国内直连"和"免流出口"混在一个开关里。私网恒直连是全局规则,不会被 `global` 代理或免流策略覆盖,避免路由器后台、局域网设备、强制门户被送进远端出口。`SBMAGIC_SNIFF=false` 是默认值,避免每个进 TUN 的首连都付 sniff 成本;只有遇到应用不走系统 DNS、域名分流缺失时再开启。
 - tun inbound 显式写了几个"显式优于隐式"的字段,不依赖版本默认值:
-  - `endpoint_independent_nat: true` 只在 `SBMAGIC_STACK=gvisor` 时写入(官方说明该字段仅 gvisor 可用;其他 stack 默认就是 endpoint-independent NAT)。
+  - `auto_redirect: true` 默认开启,在 Android 上主要加速 IPv4 TCP:让符合条件的 TCP 转发走内核 fast path,减少 userspace/gVisor L3/L4 转换成本。UDP、IPv6 以及 sing-box 自己发起的 Hysteria2/TUIC/QUIC 出站 socket 不吃这条优化。
+  - `endpoint_independent_nat: true` 只在 `SBMAGIC_STACK=gvisor` 且 `SBMAGIC_ENDPOINT_INDEPENDENT_NAT=true` 时写入;默认关闭,因为 Full Cone NAT 对 P2P/语音/游戏有帮助,但官方说明有轻微吞吐成本。
   - `udp_timeout: "5m"`(UDP NAT 映射超时,避免大量短连接 UDP 把 NAT 表撑大,行为可预期)。
+- `SBMAGIC_REJECT_QUIC=false` 默认关闭。开启时会拒绝公共 UDP/443,迫使浏览器/多数应用从 HTTP/3/QUIC 回退到 TCP,从而让应用侧 Web 流量尽量吃到 `auto_redirect` 的 TCP 快路径。它是性能/省电取舍开关,不是无副作用优化:弱网下 QUIC 可能更稳,所以需要真机 A/B 后再长期启用。
 - `SBMAGIC_STACK` 默认 `gvisor`,不是 sing-box 官方在带 gVisor tag 时的默认 `mixed`。原因是 `bench/results/avd-stack-benchmark-2026-06-30.md` 在 `Pixel_9_API_36_1_root` AVD 上验证: `system`/`mixed` 能通过 `check` 并启动,但 TCP 流量没有进入 tun inbound;`mixed` 的 TCP 半边也是 `system`,所以同样不可用。`system` 理论上少一层虚拟栈,但当前模块不把"理论更快"置于"实测可用"之前。
 - `cache_file` 开启;fake-ip 模式额外写 `store_fakeip: true`(见 §4.3)。
-- 规则集(geosite-cn / geoip-cn,`.srs` 格式)远程拉取,默认 `download_detour: proxy`(`SBMAGIC_RULESET_DOWNLOAD_DETOUR=proxy`),更新间隔默认 `168h`(7 天)。这就是"geofiles 自动更新"——sing-box 按间隔重下。clash API 没有可用的强制更新端点,所以模块提供 `magicctl ruleset-refresh` / WebUI"更新规则集":清掉规则集缓存后走安全 `reload` 触发重新下载(见 §8.4)。状态页的"规则缓存时间"来自本地 `cache.db`/规则缓存文件的最新 mtime,用于判断当前设备上的规则大致是什么时候落盘的。
+- 规则集(geosite-cn / geoip-cn,`.srs` 格式)按"本地预置优先,远程兜底"处理:`scripts/package-module.py` 打包前下载规则集到 `module/defaults/rulesets`,安装时 `customize.sh` 复制到 `$CACHE_DIR/rulesets`,渲染配置时优先生成 `type: "local"` 的 `rule_set`。这样全新安装第一次启动不需要现场下载 geofile,也不会把 CN 分流冷启动绑到代理出口。只有本地规则文件缺失时才回退到 `type: "remote"`;远程兜底默认 `download_detour: direct`(`SBMAGIC_RULESET_DOWNLOAD_DETOUR=direct`),直连无法访问规则源时可切到 `proxy`。
+- `magicctl ruleset-refresh` / WebUI"更新规则集"会主动下载新的本地 `.srs` 文件并原子替换;如果当前 `bypass-cn` 分流启用且核心正在运行,会先校验配置再安全 reload 以加载新文件,否则只预取文件不重启。状态页的"规则文件时间"优先来自本地 `.srs` mtime,用于判断当前设备上的规则大致是什么时候落盘的。
 
 ### 5.2 版本
 
@@ -217,10 +223,11 @@ APP 流量 + DNS 查询
 - `magicctl watchdog` 当前是**事件式 supervisor**:父进程启动 sing-box 子进程后阻塞在 `wait <pid>`,只有子进程退出/崩溃/被 LMKD 杀掉时才被唤醒并处理重启或回退。正常运行期间没有 `while sleep 300; pid_alive` 这种周期性巡检,不会因为"看门狗轮询"固定唤醒设备。
 - `SBMAGIC_WATCHDOG_INTERVAL` 仍保留,但含义从"巡检间隔"变成"last-good 晋升延迟":核心持续运行满这个时间(默认 300s)后,后台一次性延时任务才把当前 `runtime/config.json` 提升为 `runtime/config.last-good.json`。这保留了"能活过一段时间才算好配置"的安全门槛,但不再周期性检查。
 - `start_service`/`rollback_service` 在 `SBMAGIC_WATCHDOG=true` 时会先拉起 supervisor,由 supervisor 启动核心;`restart`/`reload`/`rollback` 通过 runtime 标记文件通知 supervisor 执行对应动作,避免一个外部 shell 和 supervisor 同时拉起两个核心进程。
+- `start_service_locked` 拉起子进程后会等待 API(`/configs`)和 TUN 接口同时就绪(最多 15 秒)再输出状态。watchdog 模式下外层 `start` 会容忍 supervisor 刚 fork、`watchdog.pid` 尚未写入的短暂竞态,随后等 runtime ready,并在网络事件监听开启时等 `netwatch` 可见,而不是只看到 PID 文件就返回。超时只记录 warning/保留活着的核心,不杀掉仍在下载规则集/初始化中的进程,避免把"启动慢"误判成崩溃。
 - `magicctl stop` 和 `disable` 会**连 supervisor 一起停**(`stop_watchdog`),然后停核心。内部的 restart/rollback/崩溃自愈路径不杀 supervisor,只让它重新启动子进程。
 - Android 正常没有 systemd/systemctl,模块不能依赖 `systemctl`。当前默认优先尝试 Android init `.rc`,但保留 late_start 直接启动兜底,因为 Magisk/KernelSU/APatch 的 systemless rc 注入在不同 ROM 上仍可能受 SELinux 域、capability 或导入时机影响。
 - framework 级 `ProcessRecord#setPersistent(true)` / `setMaxAdj(ProcessList.SYSTEM_ADJ)` 不是 root shell 能调用的公开能力,需要改 `system_server`、定制 ROM 或 Xposed/LSPosed hook。模块默认不做这种高侵入注入;rc 路径使用 init 原生 `oom_score_adjust -900`,direct/fallback 路径可选 `SBMAGIC_OOM_PROTECT` 写 `/proc/<pid>/oom_score_adj`,用于验证/缓解 LMKD 空闲回收。
-- `magicctl netwatch` 是**事件式网络恢复器**:阻塞在 `ip monitor route address link`,只在链路/地址/路由变化(例如休眠恢复、Wi-Fi/蜂窝切换)后检查本机 API。API 正常时可关闭旧连接让传输层重拨;PID 活着但 API 卡死时触发 restart。它不做固定外网测速,避免网络本身断开时反复重启;默认 `SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30` 秒,防止 ROM 连续路由事件造成频繁断连。
+- `magicctl netwatch` 是**事件式网络恢复器**:阻塞在 `ip monitor route address link`,只在链路/地址/路由变化(例如休眠恢复、Wi-Fi/蜂窝切换)后检查本机 API 与 TUN 状态。健康检查用轻量 `/configs`,并在重启前做短重试;健康的自身 TUN 事件会被忽略,避免 auto_route/TUN 维护事件反过来触发恢复检查。API 健康但 TUN 接口明确不存在时也会 restart,覆盖"进程没死但代理路径坏"的半坏状态。默认不会在 API/TUN 健康时关闭长连接;`SBMAGIC_NETWORK_CHANGE_FLUSH=true` 时才会主动关闭旧连接让传输层重拨。它不做固定外网测速,避免网络本身断开时反复重启;默认 `SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30` 秒,防止 ROM 连续路由事件造成频繁断连。`ip monitor` 子进程会写入 `runtime/netwatch.monitor.pid`,stop/uninstall/trap 都会清理,避免管道子进程孤儿化。
 
 ### 7.3 配置回退与崩溃自愈
 
@@ -228,7 +235,7 @@ APP 流量 + DNS 查询
 
 **两层备份,两种粒度:**
 
-1. **单个配置文件级(`config.json` 的源文件)**——`magicctl config set <key>` 写入前会把旧文件备份成 `<file>.bak`(`settings.env.bak`、`outbounds.json.bak` 等)。`magicctl config rollback <key>` 把当前文件和 `.bak` 互换,所以连续调用两次等于"改了再改回去",不是单向操作。WebUI 每个编辑区都配了对应的"撤销上次保存"按钮。
+1. **单个配置文件级(`config.json` 的源文件)**——`magicctl config set <key>` 写入前会把旧文件备份成 `<file>.bak`(`settings.env.bak`、`outbounds.json.bak` 等)。`magicctl config rollback <key>` 把当前文件和 `.bak` 互换,所以连续调用两次等于"改了再改回去",不是单向操作。WebUI 每个编辑区都配了对应的"撤销上次保存"按钮。应用页用 `config set-per-app` 把模式、入口名单、策略名单作为一个批量事务写入,避免 3-4 次 `sing-box check`。
 2. **渲染后整份运行配置级(`runtime/config.json`)**——supervisor 启动核心后,安排一次延时任务;如果核心持续存活满 `$SBMAGIC_WATCHDOG_INTERVAL`,就把当前 `config.json` 提升为 `runtime/config.last-good.json`。这个"必须先活过一段时间才算数"的门槛,是为了避免把一个"能跑 1 秒但 10 分钟后崩"的坏配置误判成"好配置"。
 
 **崩溃自愈状态机(`watchdog()`):**
@@ -301,13 +308,13 @@ APP 流量 + DNS 查询
 - VLESS XHTTP 导入按 sing-box-extended 的字段落盘:`type=xhttp` 会生成 `transport.type: "xhttp"`;`extra` 内仅导入客户端安全字段,例如 `xPadding*`、`noGRPCHeader`、`scMaxEachPostBytes`、`scMinPostsIntervalMs`、`session*`、`seq*`、`uplink*` 与 `xmux`。`noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs`、`serverMaxHeaderBytes` 等服务端专用字段会在分享链接导入时丢弃,避免把服务端流控/缓冲策略误写进客户端 outbound。未提供 `xPaddingBytes` 时默认写 `"100-1000"`,避免 extended 核心校验拒绝空 padding。
 - 支持**订阅链接/导出配置**:WebUI 调模块自带 `magic-fetch` 拉取 URL(UA 用 `v2rayN/...` 以拿到通用的 base64 分享链接列表),再按行解析。缺少 `magic-fetch` 视为安装不完整,不再退回 curl/wget/nc 这类设备环境不稳定的后端。订阅正文是单段 base64 时自动解码;也可直接粘贴 sing-box JSON/outbounds 导出。
 - 不支持 Clash YAML 订阅(需 YAML 解析器,暂不引入);这类订阅请先转换成分享链接列表或 sing-box outbounds JSON。
-- 写入方式两种:**替换**(整体替换节点)/ **追加**(保留已有节点再并入,同名自动改名 `-2`/`-3`…)。组装结果 = `selector(proxy)` + `urltest(auto)` + 各节点 + `direct`,但 `proxy.default` 指向第一个真实节点,`auto` 只作为可手动选择的自动测速出口,避免空测速历史或坏首节点把新连接拖进长 TCP 超时。导入后会立刻做 `outbounds` 语义校验(`proxy/direct` 必需、tag 不重复、selector/urltest 引用必须存在)和整配置 `check`,通过后仍需点"应用并重启"。
+- 写入方式两种:**替换**(整体替换节点)/ **追加**(保留已有节点再并入,同名自动改名 `-2`/`-3`…)。组装结果 = `selector(proxy)` + `urltest(auto)` + 各节点 + `direct`,但 `proxy.default` 指向第一个真实节点,`auto` 只作为可手动选择的自动测速出口,避免空测速历史或坏首节点把新连接拖进长 TCP 超时。自动测速默认 `interval=10m`、`tolerance=100`,偏向移动端省电和减少节点抖动。导入后会立刻做 `outbounds` 语义校验(`proxy/direct` 必需、tag 不重复、selector/urltest 引用必须存在)和整配置 `check`,通过后仍需点"应用并重启"。
 - 节点页通过 Clash API 切换 selector 时,WebUI 同时把该 selector 的 `default` 写回 `outbounds.json`;运行时立即生效,并能在后续 reload/watchdog 重启后保留选择。否则 sing-box 重启会回到配置默认出口,容易让用户误以为"手动切到非 auto 后仍然被 auto 接管"。
 - **不**在 sh 里写分享链接解析器(协议边界太多、极易出错),解析集中在 JS。
 
 **clash API 端点现状(挖了 sing-box 主分支源码,避免做"假功能")**:
 - `PUT /configs` = 空桩(不 reload);`PATCH /configs` 只改 mode → 所以**没有**热重载,配置应用走 `reload`(§7.4)。
-- `PUT /providers/rules/*`(规则集 provider 更新)= 整段被注释掉、`findRuleProviderByName` 永远 404 → **规则集无法经 clash API 强制更新**。模块的手动更新按钮走 `magicctl ruleset-refresh`:清 cache 后安全重启,不是 API 热更新。
+- `PUT /providers/rules/*`(规则集 provider 更新)= 整段被注释掉、`findRuleProviderByName` 永远 404 → **规则集无法经 clash API 强制更新**。模块的手动更新按钮走 `magicctl ruleset-refresh`:下载本地 `.srs` 后在规则集正在使用且核心运行时安全重启,不是 API 热更新。
 - `POST /cache/dns/flush`、`POST /cache/fakeip/flush` = **真实现** → WebUI 状态页据此提供"清空 DNS / fake-ip 缓存"按钮(改了分流规则后清缓存,新查询立即按新规则走;但新增 server/节点仍需"应用并重启")。
 
 ---
@@ -333,8 +340,8 @@ APP 流量 + DNS 查询
 - `SBMAGIC_PROXY_RULE_MODE`: `off` / `global` / `bypass-cn`
 - `SBMAGIC_FREE_FLOW_RULE_MODE`: `off` / `global`
 - `SBMAGIC_MIXED_RULE_PRIORITY`: `proxy` / `free-flow`
-- `SBMAGIC_RULESET_DOWNLOAD_DETOUR`: `proxy` / `direct`,默认 `proxy`
-- 规则集订阅源 + 更新间隔(`SBMAGIC_RULE_UPDATE_INTERVAL`,默认 168h;按间隔自动重下,无强制立即更新端点,见 §8.4)
+- `SBMAGIC_RULESET_DOWNLOAD_DETOUR`: `direct` / `proxy`,默认 `direct`
+- 规则集本地预置 + 远程兜底更新间隔(`SBMAGIC_RULE_UPDATE_INTERVAL`,默认 168h;打包时预取,缺文件时才由 sing-box 远程兜底,手动更新走 `ruleset-refresh`,见 §8.4)
 - 自定义直连域名(`dns-direct-domains.txt`)
 - `clash_mode` 全局/规则/直连切换(走 clash API `default_mode` / `PATCH /configs`,这个 PATCH 改 mode 是真实现)
 
@@ -342,7 +349,9 @@ APP 流量 + DNS 查询
 - `SBMAGIC_DNS_MODE`:real-ip(默认)/ fake-ip
 - `SBMAGIC_DNS_LOCAL_TYPE` / `SBMAGIC_DNS_LOCAL_SERVER`(直连解析,默认 `udp` + `223.5.5.5`)
 - `SBMAGIC_DNS_REMOTE_TYPE` / `SBMAGIC_DNS_REMOTE_SERVER`(走代理解析,默认 `https` + `1.1.1.1`)
+- `SBMAGIC_DNS_LOCAL_TLS_SERVER_NAME` / `SBMAGIC_DNS_REMOTE_TLS_SERVER_NAME`(加密 DNS 的 SNI/证书名和 DoH Host;远程默认 `cloudflare-dns.com`)
 - `SBMAGIC_DNS_STRATEGY`(ipv4_only / prefer_ipv4 / ...)
+- `SBMAGIC_DNS_REVERSE_MAPPING`(默认 true,让 real-ip 模式下的域名路由规则能用 DNS 缓存回查域名)
 - `SBMAGIC_FAKEIP4` / `SBMAGIC_FAKEIP6`(fake-ip 模式才用)
 
 ### 9.5 网络 / tun
@@ -357,7 +366,7 @@ APP 流量 + DNS 查询
 - `SBMAGIC_INIT_SERVICE`:默认 `true`;开机时优先尝试 Android init service `netd_helper`,失败自动走 late_start 直接启动。
 - `SBMAGIC_WATCHDOG`:无轮询 supervisor 开关;开启时由父进程 `wait` 子进程退出,不是定时轮询。
 - `SBMAGIC_WATCHDOG_INTERVAL`:last-good 晋升延迟,默认 300s。
-- `SBMAGIC_NETWORK_WATCH` / `SBMAGIC_NETWORK_CHANGE_FLUSH` / `SBMAGIC_NETWORK_RECOVERY_COOLDOWN`:默认开启,冷却 30 秒;阻塞监听系统网络事件,切网/休眠恢复后检查本机 API,必要时重启或关闭旧连接重拨。
+- `SBMAGIC_NETWORK_WATCH` / `SBMAGIC_NETWORK_CHANGE_FLUSH` / `SBMAGIC_NETWORK_RECOVERY_COOLDOWN`:网络事件监听默认开启,冷却 30 秒;`SBMAGIC_NETWORK_CHANGE_FLUSH` 默认关闭,所以 API 健康时不会主动切断 xHTTP/gRPC/WS 长连接。只有设备切网后旧连接经常假活时才建议打开 flush。
 - `SBMAGIC_OOM_PROTECT` / `SBMAGIC_OOM_SCORE_ADJ`:高级选项,默认关闭;用于 direct/fallback 路径尝试写 `/proc/<pid>/oom_score_adj` 降低 LMKD 回收概率。init rc 路径已经声明 `oom_score_adjust -900`。它不是 Android framework 的 `setPersistent(true)`,也不会把 native 进程注册成系统 persistent 进程。
 - 电池白名单开关(Doze 对抗,需要 WebUI 引导用户去系统设置加白名单,模块本身不能直接改)
 
@@ -442,7 +451,7 @@ APP 流量 + DNS 查询
 - `magicctl stop/disable` 不依赖 `validate_settings` 成功,只要 PID 文件还在就能清理进程、watchdog 和本机控制端口防火墙。对接管全网的模块来说,"配置坏了还能关"优先级高于严格失败。
 
 ### 14.9 以为能"热重载 / 强制更新规则集"
-- sing-box 的 clash API `PUT /configs` 是空桩、rule-provider 更新被注释掉(见 §8.4),所以**没有**进程内热重载、也**没有**强制立即更新规则集的接口。配置改动一律走 `reload`(校验后重启,§7.4),规则集靠 `update_interval` 自动更新。能即时生效的只有 `POST /cache/*/flush` 清缓存。
+- sing-box 的 clash API `PUT /configs` 是空桩、rule-provider 更新被注释掉(见 §8.4),所以**没有**进程内热重载,也**没有**经 clash API 强制更新规则集的接口。配置改动一律走 `reload`(校验后重启,§7.4)。规则集默认随 zip 预置为本地文件;手动更新由 `magicctl ruleset-refresh` 下载新 `.srs`,并且只在规则集正在使用且核心运行时 reload。能即时生效且不重启的只有 `POST /cache/*/flush` 清缓存。
 
 ### 14.10 升到 sing-box 1.14 前注意
 - 当前 DNS 已用 1.12+ 新 server 格式(§4.1),但 `route` 里若残留任何 1.14 才移除的旧字段需提前迁移;升级二进制后务必先 `magicctl check` 再 `reload`。`block`/`dns` 旧出站已在 1.13 清除(§5.1),不要在 `outbounds.json` 里加回来。
@@ -456,7 +465,7 @@ APP 流量 + DNS 查询
 ## 15. 构建与发布
 
 - 模块 ID 固定为 `singbox_tun_Magic`,展示名为 `星盘`,运行目录为 `/data/adb/singbox_tun_Magic`。
-- 本地打包产物名固定为 `星盘.zip`:先运行 `scripts/build-helpers.ps1` 重建 `magic-fetch`(arm64-v8a/x86_64)和 `applist.dex`,再运行 `python scripts/package-module.py --output dist/星盘.zip`。x86_64 Go/Android helper 需要 Android NDK clang wrapper,脚本会从 `ANDROID_HOME`/`ANDROID_SDK_ROOT` 下自动查找。
+- 本地打包产物名固定为 `星盘.zip`:先运行 `scripts/build-helpers.ps1` 重建 `magic-fetch`(arm64-v8a/x86_64)和 `applist.dex`,再运行 `python scripts/package-module.py --output dist/星盘.zip`。打包脚本会自动拉取 geosite-cn / geoip-cn `.srs` 并放入 zip 的 `defaults/rulesets`,使全新安装首次启动直接使用本地规则集。x86_64 Go/Android helper 需要 Android NDK clang wrapper,脚本会从 `ANDROID_HOME`/`ANDROID_SDK_ROOT` 下自动查找。
 - `scripts/write-update-json.py` 生成 Magisk update metadata,`module.prop` 的 `updateJson` 指向 GitHub latest release 的 `update.json`;该 JSON 的 `zipUrl` 指向同一 release 下的 `星盘.zip`。
 - GitHub Actions `.github/workflows/release.yml` 在 tag `v*` 推送时自动构建、打包、生成 `update.json`,并把 `星盘.zip` 与 `update.json` 发布为 release 资产。workflow_dispatch 也可手动构建 artifacts。
 
@@ -485,10 +494,10 @@ APP 流量 + DNS 查询
 
 **配置版本**
 - [ ] sing-box-extended `extended` 分支核心,配置语法与版本匹配
-- [ ] DNS 用 1.12+ 新 server 格式(type+server)、规则用 action 式;旧字段(`address` URL、顶层 `fakeip`、`reverse_mapping`、`independent_cache`)不下发
+- [ ] DNS 用 1.12+ 新 server 格式(type+server)、规则用 action 式;旧字段(`address` URL、顶层 `fakeip`)不下发,`reverse_mapping` 默认开启
 - [ ] `block`/`dns` 旧特殊出站已移除(1.13 删除),拦截用 `action: reject`、DNS 用 `hijack-dns`
 - [ ] `route.default_domain_resolver` 已设(多 DNS server 时解析节点域名必需,见 §4.6)
-- [ ] tun 在 gvisor stack 下显式 `endpoint_independent_nat: true`,所有 stack 显式 `udp_timeout: "5m"`;fake-ip 模式显式 `store_fakeip: true`
+- [ ] tun 默认 `auto_redirect=true` 加速 IPv4 TCP;`SBMAGIC_REJECT_QUIC=false` 仅作为可选 HTTP/3 回退开关;gvisor stack 下仅按需启用 `endpoint_independent_nat`,默认关闭以降低转发成本;所有 stack 显式 `udp_timeout: "5m"`;fake-ip 模式显式 `store_fakeip: true`
 
 **应用配置 / 并发(详见 §7.4)**
 - [ ] 配置改动走 `reload`(校验后重启),不依赖 clash API 热重载(那是空桩)
@@ -503,6 +512,7 @@ APP 流量 + DNS 查询
 
 **回退与崩溃自愈(详见 §7.3)**
 - [ ] 每个配置源文件 `config set` 自动留 `.bak`,`config rollback <key>` 可逆切换
+- [ ] 应用页批量保存走 `config set-per-app`,一次锁、一次临时渲染、一次 `sing-box check`
 - [ ] supervisor 确认核心存活满 `SBMAGIC_WATCHDOG_INTERVAL` 才把 `config.json` 提升为 `last-good`
 - [ ] 连续失败 ≥3 次自动尝试回退到 last-good,last-good 也失败则关闭模块而不是无限重启
 - [ ] `magicctl rollback` 支持手动立即回退,不必等 15 分钟

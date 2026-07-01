@@ -88,7 +88,13 @@
   }
   .field-row:last-child { border-bottom: none; }
   .field-main { flex: 1; min-width: 0; }
+  .field-label-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .field-main label { display: block; font-size: 13px; color: var(--text); font-weight: 500; }
+  .field-badge {
+    flex: none; font-size: 10px; line-height: 15px; padding: 0 5px; border-radius: 999px;
+    border: 1px solid rgba(245,185,79,.35); color: var(--warn); background: var(--warn-soft);
+    font-weight: 650; letter-spacing: 0;
+  }
   .field-hint { color: var(--muted); font-size: 11.5px; margin-top: 3px; line-height: 1.45; }
   .field-hint.warn { color: var(--warn); }
   .field-control { flex: none; padding-top: 1px; }
@@ -247,7 +253,7 @@
     <div class="card">
       <div class="card-head">
         <h2>实时流量</h2>
-        <p>来自 sing-box 本机 clash API,仅统计当前活跃连接</p>
+        <p>来自本机 Clash API,只统计当前活跃连接</p>
       </div>
       <div class="stat-grid">
         <div class="stat-box"><div class="label">上行</div><div class="value" id="traffic-up">-</div></div>
@@ -264,11 +270,11 @@
     <div class="card">
       <div class="card-head">
         <h2>故障恢复</h2>
-        <p>进程托管会在核心存活满 last-good 延迟后,把当前配置标记为"上次可用"。连续崩溃会自动尝试回退,这里也可以手动触发。</p>
+        <p>核心稳定运行满设定时间后,当前配置会被标记为"上次可用"。连续崩溃会自动回退,这里也可以手动触发。</p>
       </div>
       <div class="kv-list" id="recovery-kv"></div>
       <div class="actions">
-        <button class="btn secondary" id="btn-recover">健康检查/恢复连接</button>
+        <button class="btn secondary" id="btn-recover">检查并恢复连接</button>
         <button class="btn secondary" id="btn-rollback">立即回退到上次可用配置</button>
       </div>
     </div>
@@ -387,7 +393,7 @@
       <div class="field-row">
         <div class="field-main">
           <label>模式</label>
-          <div class="field-hint">白名单只让点选应用进入 TUN,性能/省电最好;黑名单适合临时全局接管。安装新应用不会切换模式。</div>
+          <div class="field-hint">白名单只让点选应用进入 TUN,性能/省电最好;黑名单适合临时全局接管。</div>
         </div>
         <div class="field-control">
           <select id="package-mode">
@@ -410,7 +416,7 @@
     <div class="card">
       <div class="card-head">
         <h2>应用选择器</h2>
-        <p id="pkg-picker-hint">名单决定是否进入 TUN;自动/代理/免流只决定进入 TUN 后的出站策略。</p>
+        <p id="pkg-picker-hint">名单决定哪些应用进入 TUN;自动/代理/免流决定进入 TUN 后怎么出站。</p>
       </div>
       <div class="pkg-tools" id="pkg-tools">
         <input type="text" id="pkg-filter" placeholder="搜索应用名 / 包名" autocomplete="off" />
@@ -556,7 +562,12 @@ function shQuote(s) {
 
 function isExecEnvelope(value) {
   return !!(value && typeof value === "object" && !Array.isArray(value) &&
-    ("errno" in value || "code" in value || "stdout" in value || "stderr" in value || "errOutput" in value));
+    ("errno" in value || "code" in value || hasExecOutputField(value)));
+}
+
+function hasExecOutputField(value) {
+  return !!(value && typeof value === "object" &&
+    ("stdout" in value || "stderr" in value || "output" in value || "errOutput" in value));
 }
 
 function normalizeExecEnvelope(value) {
@@ -571,7 +582,7 @@ function normalizeExecResult(value) {
   if (typeof value === "string") {
     try {
       const parsed = JSON.parse(value);
-      if (isExecEnvelope(parsed)) return normalizeExecEnvelope(parsed);
+      if (hasExecOutputField(parsed)) return normalizeExecEnvelope(parsed);
     } catch (e) {}
     return { errno: 0, stdout: value, stderr: "" };
   }
@@ -697,7 +708,12 @@ async function ctl(...args) {
 }
 
 async function ctlWithStdin(stdinText, ...args) {
-  const cmd = [CTL, ...args.map(shQuote)].join(" ") + " <<'SBMAGIC_EOF'\n" + stdinText.replace(/\r\n/g, "\n") + "\nSBMAGIC_EOF";
+  const text = String(stdinText).replace(/\r\n/g, "\n");
+  let marker = "SBMAGIC_EOF_" + Date.now().toString(36) + "_" + Math.random().toString(16).slice(2);
+  while (text.split("\n").includes(marker)) {
+    marker += "_x";
+  }
+  const cmd = [CTL, ...args.map(shQuote)].join(" ") + " <<'" + marker + "'\n" + text + "\n" + marker;
   return run(cmd);
 }
 
@@ -765,13 +781,14 @@ const KV_LABELS = {
   mode: "Clash 模式", boot_start: "开机自启", init_service: "init 后备", init_service_seen: "init 入口时间", package_mode: "TUN 名单模式",
   package_database_readable: "包数据库可读",
   watchdog: "进程托管", watchdog_running: "托管运行中", watchdog_mode: "托管模式",
-  network_watch: "网络事件监听", network_watch_running: "网络监听运行中", network_change_flush: "切网清旧连接", network_recovery_cooldown: "网络恢复冷却",
-  oom_protect: "低内存保护", oom_score_adj: "OOM 分值", current_oom_score_adj: "当前 OOM 分值",
+  network_watch: "网络事件监听", network_watch_running: "网络监听运行中", network_change_flush: "切换网络断开旧连接", network_recovery_cooldown: "网络恢复冷却",
+  oom_protect: "低内存保护", oom_score_adj: "保留分值", current_oom_score_adj: "当前保留分值",
   proxy_rule_mode: "代理规则", free_flow_rule_mode: "免流规则",
-  mixed_rule_priority: "混合优先级", ruleset_download_detour: "规则下载出口",
-  ruleset_update_interval: "规则更新间隔", ruleset_cache_time: "规则缓存时间",
-  strategy_package_count: "强制策略应用数", strategy_process_lookup: "包名识别热路径",
-  sniff: "路由嗅探", sniff_timeout: "嗅探超时", dns_mode: "DNS 模式", ipv6: "IPv6",
+  mixed_rule_priority: "混合优先级", auto_redirect: "TCP 快路径", endpoint_independent_nat: "Full Cone NAT", reject_quic: "拒绝 QUIC", udp_timeout: "UDP 超时", ruleset_active: "规则集启用",
+  ruleset_download_detour: "规则下载出口",
+  ruleset_update_interval: "规则更新间隔", ruleset_cache_time: "规则文件时间",
+  strategy_package_count: "强制策略应用数", strategy_process_lookup: "包名识别",
+  sniff: "域名嗅探", sniff_timeout: "嗅探超时", dns_mode: "DNS 模式", dns_reverse_mapping: "DNS 域名记录", ipv6: "IPv6",
 };
 
 // ---------- 状态 / 故障恢复 ----------
@@ -799,7 +816,7 @@ async function refreshStatusInner() {
 
     const wrap = document.getElementById("status-kv");
     wrap.innerHTML = "";
-    ["enabled", "config_valid", "config_error", "running", "pid", "api_alive", "tun_alive", "watchdog_running", "network_watch_running", "current_oom_score_adj", "process_name", "tun_interface", "boot_start", "init_service", "init_service_seen", "network_recovery_cooldown", "package_mode", "package_database_readable", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "strategy_package_count", "strategy_process_lookup", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "sniff", "sniff_timeout", "dns_mode", "ipv6", "mode", "api"].forEach(k => {
+    ["enabled", "config_valid", "config_error", "running", "pid", "api_alive", "tun_alive", "watchdog", "watchdog_running", "network_watch", "network_watch_running", "network_change_flush", "current_oom_score_adj", "oom_protect", "oom_score_adj", "process_name", "tun_interface", "boot_start", "init_service", "init_service_seen", "network_recovery_cooldown", "package_mode", "package_database_readable", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "strategy_package_count", "strategy_process_lookup", "auto_redirect", "endpoint_independent_nat", "reject_quic", "udp_timeout", "ruleset_active", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "sniff", "sniff_timeout", "dns_mode", "dns_reverse_mapping", "ipv6", "mode", "api", "data_dir", "config"].forEach(k => {
       if (!(k in kv)) return;
       const row = document.createElement("div");
       row.className = "kv";
@@ -821,7 +838,7 @@ async function refreshStatusInner() {
 
     const rec = document.getElementById("recovery-kv");
     rec.innerHTML = "";
-    const lastGood = kv.last_good && kv.last_good !== "none" ? kv.last_good : "暂无(尚未存活满 last-good 延迟)";
+    const lastGood = kv.last_good && kv.last_good !== "none" ? kv.last_good : "暂无(核心还没稳定运行满设定时间)";
     const failCount = kv.fail_count || "0";
     [["上次可用配置", lastGood], ["当前连续失败次数", failCount + " / 3"]].forEach(([k, v]) => {
       const row = document.createElement("div");
@@ -852,12 +869,13 @@ async function refreshStatusInner() {
 
 document.getElementById("btn-refresh").addEventListener("click", refreshStatus);
 document.getElementById("btn-restart").addEventListener("click", () => withActionLock("service-action", async () => {
-  toast("正在校验并应用...");
-  try { await ctl("reload"); toast("已应用并重启"); } catch (e) { toast("配置校验失败,已保持原进程运行:" + e.message); }
+  toast("正在校验配置并应用…");
+  try { await ctl("reload"); toast("配置已应用,核心已重启并运行 ✓"); } catch (e) { toast("配置校验失败,已保持原核心运行:" + e.message); }
   refreshStatus(true);
 }));
 document.getElementById("btn-start").addEventListener("click", () => withActionLock("service-action", async () => {
-  try { await ctl("start"); toast("已启动"); } catch (e) { toast(e.message); }
+  toast("正在启动核心…");
+  try { await ctl("start"); toast("核心已启动并运行 ✓"); } catch (e) { toast("核心启动失败:" + e.message); }
   refreshStatus(true);
 }));
 document.getElementById("btn-stop").addEventListener("click", () => withActionLock("service-action", async () => {
@@ -865,13 +883,20 @@ document.getElementById("btn-stop").addEventListener("click", () => withActionLo
   refreshStatus(true);
 }));
 document.getElementById("btn-ruleset-refresh").addEventListener("click", () => withActionLock("service-action", async () => {
-  if (!confirm("清除规则集缓存并安全重启?这会让 geosite/geoip 规则重新下载。")) return;
-  toast("正在更新规则集...");
-  try { await ctl("ruleset-refresh"); toast("规则集已刷新并应用"); } catch (e) { toast(e.message); }
+  if (!confirm("更新本地 geosite/geoip 规则集?当前启用分流且核心运行时会重启以加载新文件。")) return;
+  toast("正在下载本地规则集…");
+  try {
+    const out = await ctl("ruleset-refresh");
+    toast(out.includes("ruleset_refreshed=true") ? "规则集已更新 ✓" : "规则集已更新并应用 ✓");
+  } catch (e) {
+    toast("规则集更新失败:" + e.message);
+    refreshStatus(true);
+    return;
+  }
   refreshStatus(true);
 }));
 document.getElementById("btn-rollback").addEventListener("click", () => withActionLock("service-action", async () => {
-  if (!confirm("回退到上次确认可用的配置并重启?当前未保存到 last-good 的改动不会丢失文件,但本次运行会被覆盖。")) return;
+  if (!confirm("回退到上次可用配置并重启?当前文件不会丢,但本次运行会被覆盖。")) return;
   toast("正在回退...");
   try { await ctl("rollback"); toast("已回退并启动"); } catch (e) { toast(e.message); }
   refreshStatus(true);
@@ -1281,13 +1306,14 @@ async function saveOutbounds(check) {
       toast("JSON 格式错误: " + e.message);
       return false;
     }
+    toast(check ? "正在保存并校验节点…" : "正在保存节点…");
     try {
       await ctlWithStdin(text, "config", "set", "outbounds");
       if (check) {
         await ctl("check");
-        toast("已保存并通过校验");
+        toast("节点已保存并通过校验 ✓");
       } else {
-        toast("已保存,记得去状态页点\"应用并重启\"生效");
+        toast("节点已保存,去状态页点\"应用并重启\"生效");
       }
       return true;
     } catch (e) {
@@ -1299,9 +1325,9 @@ async function saveOutbounds(check) {
 document.getElementById("btn-outbounds-load").addEventListener("click", loadOutbounds);
 document.getElementById("btn-outbounds-save").addEventListener("click", () => saveOutbounds(false));
 document.getElementById("btn-outbounds-check").addEventListener("click", () => saveOutbounds(true));
-document.getElementById("btn-outbounds-undo").addEventListener("click", async () => {
+document.getElementById("btn-outbounds-undo").addEventListener("click", () => withActionLock("undo-outbounds", async () => {
   try { await ctl("config", "rollback", "outbounds"); toast("已撤销"); loadOutbounds(); } catch (e) { toast(e.message); }
-});
+}));
 
 // ---------- 节点导入(v2rayN 风格分享链接 / 订阅) ----------
 function importStatus(msg) { document.getElementById("import-status").textContent = msg || ""; }
@@ -1692,7 +1718,7 @@ function assembleOutbounds(nodes, preservedOutbounds = []) {
   const tags = nodes.map(n => n.tag);
   return [
     { type: "selector", tag: "proxy", outbounds: proxySelectorOutbounds(tags), default: tags[0] || "direct", interrupt_exist_connections: true },
-    { type: "urltest", tag: "auto", outbounds: tags.slice(), url: "https://www.gstatic.com/generate_204", interval: "3m", idle_timeout: "30m", tolerance: 50 },
+    { type: "urltest", tag: "auto", outbounds: tags.slice(), url: "https://www.gstatic.com/generate_204", interval: "10m", idle_timeout: "1h", tolerance: 100 },
     ...nodes,
     ...preservedOutbounds,
     { type: "direct", tag: "direct" },
@@ -1727,7 +1753,7 @@ document.getElementById("btn-import-links").addEventListener("click", () => {
 document.getElementById("btn-import-sub").addEventListener("click", async () => {
   const url = (document.getElementById("import-text").value.trim().split(/\r?\n/)[0] || "").trim();
   if (!/^https?:\/\//.test(url)) { toast("请粘贴 http/https 订阅链接"); return; }
-  importStatus("正在拉取订阅…(若服务未运行将走系统直连)");
+  importStatus("正在拉取订阅…(若核心未运行将走系统直连)");
   let body;
   try { body = await ctl("fetch", url); }
   catch (e) { importStatus(""); toast("拉取失败:" + e.message); return; }
@@ -1760,31 +1786,26 @@ function ensurePerAppLoaded() {
 
 async function savePerApp() {
   return withActionLock("save-per-app", async () => {
+    toast("正在保存应用名单…");
     try {
-      await ctlWithStdin(strategyPackagesPayload(), "config", "set-strategies");
-      await ctlWithStdin(document.getElementById("exclude-text").value, "config", "set", "exclude");
-      await ctlWithStdin(document.getElementById("include-text").value, "config", "set", "include");
-      const currentPackageMode = document.getElementById("package-mode").value;
-      if (currentPackageMode !== loadedPackageMode) {
-        await setSettingValue("SBMAGIC_PACKAGE_MODE", currentPackageMode);
-        loadedPackageMode = currentPackageMode;
-      }
-      toast("已保存,记得去状态页点\"应用并重启\"生效");
-    } catch (e) { toast(e.message); }
+      await ctlWithStdin(perAppPayload(), "config", "set-per-app");
+      loadedPackageMode = document.getElementById("package-mode").value;
+      toast("应用名单已保存,去状态页点\"应用并重启\"生效");
+    } catch (e) { toast("名单保存失败:" + e.message); }
   });
 }
 document.getElementById("btn-pkg-load").addEventListener("click", loadPerApp);
 document.getElementById("btn-pkg-save").addEventListener("click", savePerApp);
-document.getElementById("btn-pkg-undo").addEventListener("click", async () => {
+document.getElementById("btn-pkg-undo").addEventListener("click", () => withActionLock("undo-per-app", async () => {
   try {
-    for (const key of ["exclude", "include", "proxy-packages", "free-flow-packages"]) {
+    for (const key of ["settings", "exclude", "include", "proxy-packages", "free-flow-packages"]) {
       try { await ctl("config", "rollback", key); }
       catch (e) { if (!String(e.message).includes("no backup")) throw e; }
     }
     toast("已撤销");
     loadPerApp();
   } catch (e) { toast(e.message); }
-});
+}));
 const APP_LIST_PACKAGES_KEY = "singbox_tun_Magic.app.seenPackages";
 let appListCache = [];
 let appListLoaded = false;
@@ -1821,9 +1842,16 @@ function writePackageSetTo(id, set) {
   ta.value = [...comments, ...packages].join("\n") + (comments.length || packages.length ? "\n" : "");
 }
 
-function strategyPackagesPayload() {
-  return document.getElementById("proxy-packages-text").value.replace(/\r\n/g, "\n") +
-    "\n__SBMAGIC_FREE_FLOW_PACKAGES__\n" +
+function perAppPayload() {
+  return "__SBMAGIC_PACKAGE_MODE__\n" +
+    document.getElementById("package-mode").value + "\n" +
+    "__SBMAGIC_EXCLUDE_PACKAGES__\n" +
+    document.getElementById("exclude-text").value.replace(/\r\n/g, "\n") + "\n" +
+    "__SBMAGIC_INCLUDE_PACKAGES__\n" +
+    document.getElementById("include-text").value.replace(/\r\n/g, "\n") + "\n" +
+    "__SBMAGIC_PROXY_PACKAGES__\n" +
+    document.getElementById("proxy-packages-text").value.replace(/\r\n/g, "\n") + "\n" +
+    "__SBMAGIC_FREE_FLOW_PACKAGES__\n" +
     document.getElementById("free-flow-packages-text").value.replace(/\r\n/g, "\n");
 }
 
@@ -2055,54 +2083,60 @@ const SETTINGS_GROUPS = [
     id: "group-basic",
     fields: [
       { key: "SBMAGIC_ENABLED", label: "启用模块", type: "bool" },
-      { key: "SBMAGIC_BOOT_START", label: "开机自启动", type: "bool", hint: "默认关闭;允许手动启动但刷入后不自动接管网络。" },
-      { key: "SBMAGIC_INIT_SERVICE", label: "init 后备", type: "bool", hint: "默认开启。开机时优先尝试 Android init service;若 ROM/管理器不支持 rc 注入,自动退回 late_start 直接启动。" },
-      { key: "SBMAGIC_WATCHDOG", label: "进程托管", type: "bool", hint: "开启后由无轮询 supervisor 托管核心;关闭后不自动重启,也不会有崩溃回退/last-good 快照能力。" },
-      { key: "SBMAGIC_WATCHDOG_INTERVAL", label: "last-good 延迟(秒)", type: "number", hint: "核心持续运行这么久后才把当前配置标记为 last-good,默认 300 秒。" },
-      { key: "SBMAGIC_NETWORK_WATCH", label: "网络事件恢复", type: "bool", hint: "监听路由/地址/链路变化,从休眠恢复或切网后检查本机 API;不是定时轮询。" },
-      { key: "SBMAGIC_NETWORK_CHANGE_FLUSH", label: "切网清旧连接", type: "bool", hint: "网络变化且 API 正常时关闭旧连接,让 xHTTP/gRPC/WS 等长连接重新拨号。" },
-      { key: "SBMAGIC_NETWORK_RECOVERY_COOLDOWN", label: "恢复冷却(秒)", type: "number", hint: "网络事件恢复最小间隔,默认 30 秒,避免某些 ROM 连续路由事件导致频繁断开旧连接。" },
-      { key: "SBMAGIC_OOM_PROTECT", label: "低内存保护", type: "bool", hint: "高级选项。开启后尝试调低核心和 supervisor 的 oom_score_adj,防止空闲时被 LMKD 回收。" },
-      { key: "SBMAGIC_OOM_SCORE_ADJ", label: "OOM 分值", type: "number", hint: "范围 -1000 到 1000。越低越不容易被杀;默认 -900,仅低内存保护开启时使用。" },
+      { key: "SBMAGIC_BOOT_START", label: "开机自启动", type: "bool" },
+      { key: "SBMAGIC_INIT_SERVICE", label: "init 后备", type: "bool", hint: "优先交给系统启动;不支持时走普通开机脚本。" },
+      { key: "SBMAGIC_WATCHDOG", label: "进程托管", type: "bool", hint: "核心退出后自动重启;多次失败会回退配置。" },
+      { key: "SBMAGIC_WATCHDOG_INTERVAL", label: "上次可用延迟(秒)", type: "number", hint: "核心稳定运行到这个时间后,配置才记为上次可用。" },
+      { key: "SBMAGIC_NETWORK_WATCH", label: "网络事件恢复", type: "bool", hint: "阻塞监听路由/地址变化;变化后检查 API 和 TUN。" },
+      { key: "SBMAGIC_NETWORK_CHANGE_FLUSH", label: "切换网络断开旧连接", type: "bool", badge: "Beta" },
+      { key: "SBMAGIC_NETWORK_RECOVERY_COOLDOWN", label: "恢复冷却(秒)", type: "number", hint: "两次网络恢复之间的最小间隔。" },
+      { key: "SBMAGIC_OOM_PROTECT", label: "低内存保护", type: "bool", badge: "Beta", hint: "降低核心被系统后台清理的概率。" },
+      { key: "SBMAGIC_OOM_SCORE_ADJ", label: "保留分值", type: "number", hint: "数值越低越不容易被清理;只在低内存保护开启时使用。" },
     ],
   },
   {
     id: "group-network",
     fields: [
-      { key: "SBMAGIC_PROCESS_NAME", label: "进程名", type: "text", hint: "运行时二进制文件名,仅允许 A-Z a-z 0-9 . _ -,用于避开固定进程名检测。" },
-      { key: "SBMAGIC_STACK", label: "TUN 栈", type: "select", options: ["gvisor", "system", "mixed"] },
-      { key: "SBMAGIC_INTERFACE", label: "TUN 接口名", type: "text", hint: "最多 15 字节,仅允许 A-Z a-z 0-9 . _ -,建议用低调名。" },
-      { key: "SBMAGIC_MTU", label: "MTU", type: "number" },
-      { key: "SBMAGIC_AUTO_ROUTE", label: "自动路由", type: "bool" },
-      { key: "SBMAGIC_STRICT_ROUTE", label: "严格路由", type: "bool" },
+      { key: "SBMAGIC_PROCESS_NAME", label: "进程名", type: "text", hint: "下次启动生效。" },
+      { key: "SBMAGIC_STACK", label: "TUN 栈", type: "select", options: ["gvisor", "system", "mixed"], hint: "默认 gvisor;system/mixed 需真机验证。" },
+      { key: "SBMAGIC_INTERFACE", label: "TUN 接口名", type: "text", hint: "创建 TUN 时使用;最多 15 字节。" },
+      { key: "SBMAGIC_MTU", label: "MTU", type: "number", hint: "TUN 包大小上限;默认 1400。" },
+      { key: "SBMAGIC_AUTO_ROUTE", label: "自动路由", type: "bool", hint: "自动写入 TUN 路由。" },
+      { key: "SBMAGIC_AUTO_REDIRECT", label: "TCP 快路径", type: "bool", hint: "用内核转发 IPv4 TCP;UDP/IPv6 不走这条快路径。" },
+      { key: "SBMAGIC_STRICT_ROUTE", label: "严格路由", type: "bool", hint: "收紧系统路由,减少流量绕过 TUN。" },
+      { key: "SBMAGIC_ENDPOINT_INDEPENDENT_NAT", label: "Full Cone NAT", type: "bool", badge: "Beta", hint: "利于游戏/语音穿透;可能略降速度。" },
+      { key: "SBMAGIC_REJECT_QUIC", label: "拒绝 QUIC", type: "bool", defaultValue: "false", badge: "Beta", hint: "拒绝代理路径 UDP/443,让多数应用回退 TCP。" },
       {
         key: "SBMAGIC_IPV6", label: "IPv6", type: "bool",
-        hint: "关闭时不是\"不管 IPv6\",而是接管 IPv6 路由后整体拦截,防止真机有 v6 出口时绕过代理泄漏。开启后还需要在下面 DNS 卡片里把\"DNS 策略\"从 ipv4_only 改掉,否则不会真正解析到 IPv6 地址。",
+        hint: "关闭时接管后拦截 IPv6;开启后还要调整 DNS 策略。",
       },
     ],
   },
   {
     id: "group-freeflow",
     fields: [
-      { key: "SBMAGIC_PROXY_RULE_MODE", label: "代理规则模式", type: "select", options: ["off", "global", "bypass-cn"], hint: "bypass-cn:私网/CN 直连,其余走 proxy;global:全部走 proxy;off:不生成代理规则。" },
-      { key: "SBMAGIC_FREE_FLOW_RULE_MODE", label: "免流规则模式", type: "select", options: ["off", "global"], hint: "免流规则只决定是否走 free-flow 出口;free-flow 出站本身仍要在 outbounds.json 里配置。" },
-      { key: "SBMAGIC_MIXED_RULE_PRIORITY", label: "混合优先级", type: "select", options: ["proxy", "free-flow"], hint: "仅影响策略为“自动”的应用;强制代理/免流应用不受这个顺序影响。" },
+      { key: "SBMAGIC_PROXY_RULE_MODE", label: "代理规则模式", type: "select", options: ["bypass-cn", "global", "off"], hint: "bypass-cn 国内直连;global 全走代理;off 不加代理规则。" },
+      { key: "SBMAGIC_FREE_FLOW_RULE_MODE", label: "免流规则模式", type: "select", options: ["off", "global"], hint: "决定免流应用是否走免流出口。" },
+      { key: "SBMAGIC_MIXED_RULE_PRIORITY", label: "混合优先级", type: "select", options: ["proxy", "free-flow"], hint: "只影响策略为自动的应用。" },
     ],
   },
   {
     id: "group-dns",
     fields: [
-      { key: "SBMAGIC_DNS_MODE", label: "DNS 模式", type: "select", options: ["real-ip", "fake-ip"] },
+      { key: "SBMAGIC_DNS_MODE", label: "DNS 模式", type: "select", options: ["real-ip", "fake-ip"], hint: "real-ip 直接返回真实地址;fake-ip 用虚拟地址映射域名。" },
       {
         key: "SBMAGIC_DNS_STRATEGY", label: "DNS 策略", type: "select",
         options: ["ipv4_only", "prefer_ipv4", "prefer_ipv6", "ipv6_only"],
-        hint: "只有在上面网络卡片里打开了 IPv6,把这里改成 prefer_ipv4/prefer_ipv6 才会真正解析到 IPv6 地址。",
+        hint: "决定返回 IPv4、IPv6,还是优先其中一种。",
       },
-      { key: "SBMAGIC_DNS_LOCAL_TYPE", label: "本地 DNS 协议(直连)", type: "select", options: ["https", "tls", "quic", "h3", "udp", "tcp"] },
-      { key: "SBMAGIC_DNS_LOCAL_SERVER", label: "本地 DNS 地址", type: "text", hint: "填 IP(如 223.5.5.5),不填域名、协议头或端口。" },
-      { key: "SBMAGIC_DNS_REMOTE_TYPE", label: "远程 DNS 协议(代理)", type: "select", options: ["https", "tls", "quic", "h3", "udp", "tcp"] },
-      { key: "SBMAGIC_DNS_REMOTE_SERVER", label: "远程 DNS 地址", type: "text", hint: "填 IP(如 1.1.1.1),不填域名、协议头或端口;解析走代理、防 DNS 泄漏。" },
-      { key: "SBMAGIC_DNS_FINAL", label: "DNS 默认出口", type: "select", options: ["remote", "local"] },
+      { key: "SBMAGIC_DNS_LOCAL_TYPE", label: "本地 DNS 协议(直连)", type: "select", options: ["https", "tls", "quic", "h3", "udp", "tcp"], hint: "直连域名走这里。" },
+      { key: "SBMAGIC_DNS_LOCAL_SERVER", label: "本地 DNS 地址", type: "text", hint: "只填 IP,不填协议头或端口。" },
+      { key: "SBMAGIC_DNS_LOCAL_TLS_SERVER_NAME", label: "本地 DNS TLS 名称", type: "text", hint: "加密 DNS 的证书名;udp/tcp 留空。" },
+      { key: "SBMAGIC_DNS_REMOTE_TYPE", label: "远程 DNS 协议(代理)", type: "select", options: ["https", "tls", "quic", "h3", "udp", "tcp"], hint: "代理域名走这里。" },
+      { key: "SBMAGIC_DNS_REMOTE_SERVER", label: "远程 DNS 地址", type: "text", hint: "只填 IP,解析请求经 proxy 出口。" },
+      { key: "SBMAGIC_DNS_REMOTE_TLS_SERVER_NAME", label: "远程 DNS TLS 名称", type: "text", hint: "加密 DNS 的证书名;默认 cloudflare-dns.com。" },
+      { key: "SBMAGIC_DNS_FINAL", label: "DNS 默认出口", type: "select", options: ["remote", "local"], hint: "未命中 DNS 规则时使用哪个 DNS。" },
+      { key: "SBMAGIC_DNS_REVERSE_MAPPING", label: "DNS 域名记录", type: "bool", defaultValue: "true", hint: "记录 IP 对应域名,用于按域名分流。" },
       { key: "SBMAGIC_FAKEIP4", label: "fake-ip v4 CIDR", type: "text", hint: "仅 DNS 模式为 fake-ip 时生效。" },
       { key: "SBMAGIC_FAKEIP6", label: "fake-ip v6 CIDR", type: "text", hint: "仅 DNS 模式为 fake-ip 且 IPv6 已开启时生效。" },
     ],
@@ -2110,19 +2144,20 @@ const SETTINGS_GROUPS = [
   {
     id: "group-api",
     fields: [
-      { key: "SBMAGIC_API_HOST", label: "监听地址", type: "text", hint: "保持 127.0.0.1,不要改成对外地址。" },
-      { key: "SBMAGIC_API_PORT", label: "监听端口", type: "text", hint: "默认 auto,首次启动生成随机高端口;仅在需要固定端口时填数字。" },
-      { key: "SBMAGIC_API_FIREWALL", label: "限制控制端口", type: "bool", hint: "开启后用本机防火墙只允许 root/shell 访问控制端口,普通应用扫端口拿不到 401 指纹。" },
-      { key: "SBMAGIC_API_MODE", label: "Clash 模式", type: "select", options: ["Rule", "Global", "Direct"] },
+      { key: "SBMAGIC_API_HOST", label: "监听地址", type: "text", hint: "API 绑定地址;默认只监听本机。" },
+      { key: "SBMAGIC_API_PORT", label: "监听端口", type: "text", hint: "auto 会生成随机端口;固定端口填数字。" },
+      { key: "SBMAGIC_API_FIREWALL", label: "限制控制端口", type: "bool", hint: "启动时限制 API 端口,只放行 root/shell。" },
+      { key: "SBMAGIC_API_MODE", label: "Clash 模式", type: "select", options: ["Rule", "Global", "Direct"], hint: "Rule 按规则;Global 全代理;Direct 全直连。" },
     ],
   },
   {
     id: "group-maint",
     fields: [
-      { key: "SBMAGIC_RULESET_DOWNLOAD_DETOUR", label: "规则集下载出口", type: "select", options: ["proxy", "direct"], hint: "默认 proxy,让 geosite/geoip 从代理出口更新;网络环境不需要代理时可改 direct。" },
-      { key: "SBMAGIC_RULE_UPDATE_INTERVAL", label: "规则集更新间隔", type: "text", hint: "例如 168h = 7 天,不建议调得太频繁。" },
-      { key: "SBMAGIC_SNIFF", label: "路由嗅探", type: "bool", defaultValue: "false", hint: "默认关闭以降低首连延迟。仅当某些应用不走系统 DNS、域名分流明显缺失时再开启。" },
-      { key: "SBMAGIC_SNIFF_TIMEOUT", label: "嗅探超时", type: "text", hint: "例如 100ms。越小首连越快;路由嗅探关闭时此项不会写入运行配置。" },
+      { key: "SBMAGIC_RULESET_DOWNLOAD_DETOUR", label: "规则集下载出口", type: "select", options: ["direct", "proxy"], hint: "本地规则缺失或手动更新时使用。" },
+      { key: "SBMAGIC_RULE_UPDATE_INTERVAL", label: "规则集更新间隔", type: "text", hint: "远程兜底规则的自动更新间隔。" },
+      { key: "SBMAGIC_UDP_TIMEOUT", label: "UDP 超时", type: "text", hint: "UDP 映射空闲多久后回收。" },
+      { key: "SBMAGIC_SNIFF", label: "域名嗅探", type: "bool", defaultValue: "false", badge: "Beta", hint: "从连接开头读取域名,补充分流判断。" },
+      { key: "SBMAGIC_SNIFF_TIMEOUT", label: "嗅探超时", type: "text", hint: "等待域名信息的最长时间。" },
     ],
   },
 ];
@@ -2137,9 +2172,19 @@ function buildFieldRow(f, current) {
 
   const main = document.createElement("div");
   main.className = "field-main";
+  const labelLine = document.createElement("div");
+  labelLine.className = "field-label-line";
   const label = document.createElement("label");
   label.textContent = f.label;
-  main.appendChild(label);
+  labelLine.appendChild(label);
+  if (f.badge) {
+    const badge = document.createElement("span");
+    badge.className = "field-badge";
+    badge.textContent = f.badge;
+    badge.title = "收益依赖设备或使用场景,建议实测后再长期开启";
+    labelLine.appendChild(badge);
+  }
+  main.appendChild(labelLine);
   if (f.hint) {
     const hint = document.createElement("div");
     hint.className = "field-hint" + (f.key === "SBMAGIC_IPV6" ? " warn" : "");
@@ -2221,28 +2266,22 @@ async function saveSettings() {
     document.querySelectorAll("#tab-settings [data-key]").forEach(el => {
       values[el.dataset.key] = el.value;
     });
+    toast("正在保存设置…");
     try {
       const latestRawText = await ctl("config", "get", "settings");
       const newText = applySettingsEdits(latestRawText, values);
       await ctlWithStdin(newText, "config", "set", "settings");
       settingsRawText = newText;
-      toast("已保存,记得去状态页点\"应用并重启\"生效");
-    } catch (e) { toast(e.message); }
+      toast("设置已保存,去状态页点\"应用并重启\"生效");
+    } catch (e) { toast("设置保存失败:" + e.message); }
   });
-}
-
-// 应用单个键值改动,不影响表单里其它未保存的编辑(用于 per-app 模式切换)
-async function setSettingValue(key, value) {
-  const raw = await ctl("config", "get", "settings");
-  const newText = applySettingsEdits(raw, { [key]: value });
-  await ctlWithStdin(newText, "config", "set", "settings");
 }
 
 document.getElementById("btn-settings-load").addEventListener("click", loadSettings);
 document.getElementById("btn-settings-save").addEventListener("click", saveSettings);
-document.getElementById("btn-settings-undo").addEventListener("click", async () => {
+document.getElementById("btn-settings-undo").addEventListener("click", () => withActionLock("undo-settings", async () => {
   try { await ctl("config", "rollback", "settings"); toast("已撤销"); loadSettings(); } catch (e) { toast(e.message); }
-});
+}));
 
 // ---------- 日志 ----------
 async function loadLogs() {

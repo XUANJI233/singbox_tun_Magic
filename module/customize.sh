@@ -26,8 +26,9 @@ CONFIG_DIR="$DATA_DIR/configs"
 RUNTIME_DIR="$DATA_DIR/runtime"
 LOG_DIR="$DATA_DIR/logs"
 CACHE_DIR="$DATA_DIR/cache"
+RULESET_DIR="$CACHE_DIR/rulesets"
 
-mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"
+mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR" "$RULESET_DIR"
 
 cp -f "$MODPATH/bin/$SBMAGIC_ABI/sing-box" "$BIN_DIR/.core"
 [ -f "$MODPATH/bin/$SBMAGIC_ABI/magic-fetch" ] && cp -f "$MODPATH/bin/$SBMAGIC_ABI/magic-fetch" "$BIN_DIR/magic-fetch"
@@ -55,6 +56,10 @@ for name in settings.env outbounds.json packages.exclude packages.include packag
 done
 
 cp -f "$MODPATH/defaults/outbounds.example.json" "$CONFIG_DIR/outbounds.example.json"
+if [ -d "$MODPATH/defaults/rulesets" ]; then
+  cp -f "$MODPATH/defaults/rulesets/"*.srs "$RULESET_DIR/" 2>/dev/null || true
+  chmod 600 "$RULESET_DIR/"*.srs 2>/dev/null || true
+fi
 echo "$MODPATH" > "$RUNTIME_DIR/module.path"
 
 chmod 700 "$DATA_DIR" "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"

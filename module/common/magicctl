@@ -6,6 +6,7 @@ CONFIG_DIR="$DATA_DIR/configs"
 RUNTIME_DIR="$DATA_DIR/runtime"
 LOG_DIR="$DATA_DIR/logs"
 CACHE_DIR="$DATA_DIR/cache"
+RULESET_DIR="$CACHE_DIR/rulesets"
 
 CORE_BIN="$BIN_DIR/.core"
 SING_BOX="$BIN_DIR/netd-helper"
@@ -18,6 +19,10 @@ INCLUDE_FILE="$CONFIG_DIR/packages.include"
 PROXY_PACKAGES_FILE="$CONFIG_DIR/packages.proxy"
 FREE_FLOW_PACKAGES_FILE="$CONFIG_DIR/packages.free-flow"
 DNS_DIRECT_FILE="$CONFIG_DIR/dns-direct-domains.txt"
+GEOSITE_CN_RULESET="$RULESET_DIR/geosite-cn.srs"
+GEOIP_CN_RULESET="$RULESET_DIR/geoip-cn.srs"
+GEOSITE_CN_RULESET_URL="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs"
+GEOIP_CN_RULESET_URL="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs"
 CONFIG_FILE="$RUNTIME_DIR/config.json"
 LAST_GOOD_FILE="$RUNTIME_DIR/config.last-good.json"
 API_ENV_FILE="$RUNTIME_DIR/api.env"
@@ -25,15 +30,18 @@ PID_FILE="$RUNTIME_DIR/sing-box.pid"
 PROCESS_FILE="$RUNTIME_DIR/process.path"
 WATCHDOG_PID_FILE="$RUNTIME_DIR/watchdog.pid"
 NETWATCH_PID_FILE="$RUNTIME_DIR/netwatch.pid"
+NETWATCH_MONITOR_PID_FILE="$RUNTIME_DIR/netwatch.monitor.pid"
 FAIL_COUNT_FILE="$RUNTIME_DIR/watchdog.failcount"
 SUPERVISOR_RESTART_FILE="$RUNTIME_DIR/supervisor.restart"
 SUPERVISOR_ROLLBACK_FILE="$RUNTIME_DIR/supervisor.rollback"
 INITD_SEEN_FILE="$RUNTIME_DIR/initd.seen"
 START_LOCK_DIR="$RUNTIME_DIR/start.lock"
 CONFIG_LOCK_DIR="$RUNTIME_DIR/config.lock"
+WATCHDOG_LOCK_DIR="$RUNTIME_DIR/watchdog.lock"
 RUN_LOG="$LOG_DIR/sing-box.log"
 CONTROL_LOG="$LOG_DIR/control.log"
 CORE_VERSION_FILE="$RUNTIME_DIR/core.version"
+PRECHECKED_CONFIG_FILE="$RUNTIME_DIR/config.prechecked"
 ANDROID_PACKAGES_XML="/data/system/packages.xml"
 
 # Consecutive watchdog-detected crashes within this many restart cycles
@@ -49,7 +57,7 @@ API_RETRIES=1
 WHITELIST_SENTINEL_UID=4294967294
 
 mkdirs() {
-  mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"
+  mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR" "$RULESET_DIR"
 }
 
 log() {
@@ -70,7 +78,7 @@ load_settings_values() {
   SBMAGIC_WATCHDOG=true
   SBMAGIC_WATCHDOG_INTERVAL=300
   SBMAGIC_NETWORK_WATCH=true
-  SBMAGIC_NETWORK_CHANGE_FLUSH=true
+  SBMAGIC_NETWORK_CHANGE_FLUSH=false
   SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30
   SBMAGIC_STACK=gvisor
   SBMAGIC_PROCESS_NAME=netd-helper
@@ -78,17 +86,23 @@ load_settings_values() {
   SBMAGIC_MTU=1400
   SBMAGIC_IPV6=false
   SBMAGIC_AUTO_ROUTE=true
+  SBMAGIC_AUTO_REDIRECT=true
   SBMAGIC_STRICT_ROUTE=true
+  SBMAGIC_ENDPOINT_INDEPENDENT_NAT=false
+  SBMAGIC_REJECT_QUIC=false
   SBMAGIC_PACKAGE_MODE=white
   SBMAGIC_PROXY_RULE_MODE=bypass-cn
   SBMAGIC_FREE_FLOW_RULE_MODE=off
   SBMAGIC_MIXED_RULE_PRIORITY=proxy
   SBMAGIC_DNS_MODE=real-ip
   SBMAGIC_DNS_STRATEGY=ipv4_only
+  SBMAGIC_DNS_REVERSE_MAPPING=true
   SBMAGIC_DNS_LOCAL_TYPE=udp
   SBMAGIC_DNS_LOCAL_SERVER=223.5.5.5
+  SBMAGIC_DNS_LOCAL_TLS_SERVER_NAME=
   SBMAGIC_DNS_REMOTE_TYPE=https
   SBMAGIC_DNS_REMOTE_SERVER=1.1.1.1
+  SBMAGIC_DNS_REMOTE_TLS_SERVER_NAME=cloudflare-dns.com
   SBMAGIC_DNS_FINAL=remote
   SBMAGIC_FAKEIP4=198.18.0.0/15
   SBMAGIC_FAKEIP6=fc00::/18
@@ -96,8 +110,9 @@ load_settings_values() {
   SBMAGIC_API_PORT=auto
   SBMAGIC_API_FIREWALL=true
   SBMAGIC_API_MODE=Rule
-  SBMAGIC_RULESET_DOWNLOAD_DETOUR=proxy
+  SBMAGIC_RULESET_DOWNLOAD_DETOUR=direct
   SBMAGIC_RULE_UPDATE_INTERVAL=168h
+  SBMAGIC_UDP_TIMEOUT=5m
   SBMAGIC_SNIFF=false
   SBMAGIC_SNIFF_TIMEOUT=100ms
   SBMAGIC_OOM_PROTECT=false
@@ -245,6 +260,44 @@ validate_ipv6_literal() {
   '
 }
 
+validate_ipv4_cidr_literal() {
+  cidr_value="$1"
+  cidr_name="$2"
+  case "$cidr_value" in
+    */*)
+      cidr_ip="${cidr_value%/*}"
+      cidr_prefix="${cidr_value#*/}"
+      ;;
+    *)
+      die "invalid $cidr_name '$cidr_value': use an IPv4 CIDR like 198.18.0.0/15"
+      ;;
+  esac
+  validate_ipv4_literal "$cidr_ip" || die "invalid $cidr_name '$cidr_value': use an IPv4 CIDR like 198.18.0.0/15"
+  case "$cidr_prefix" in
+    ''|*[!0-9]*) die "invalid $cidr_name '$cidr_value': CIDR prefix must be 0..32" ;;
+  esac
+  [ "$cidr_prefix" -le 32 ] || die "invalid $cidr_name '$cidr_value': CIDR prefix must be 0..32"
+}
+
+validate_ipv6_cidr_literal() {
+  cidr_value="$1"
+  cidr_name="$2"
+  case "$cidr_value" in
+    */*)
+      cidr_ip="${cidr_value%/*}"
+      cidr_prefix="${cidr_value#*/}"
+      ;;
+    *)
+      die "invalid $cidr_name '$cidr_value': use an IPv6 CIDR like fc00::/18"
+      ;;
+  esac
+  validate_ipv6_literal "$cidr_ip" || die "invalid $cidr_name '$cidr_value': use an IPv6 CIDR like fc00::/18"
+  case "$cidr_prefix" in
+    ''|*[!0-9]*) die "invalid $cidr_name '$cidr_value': CIDR prefix must be 0..128" ;;
+  esac
+  [ "$cidr_prefix" -le 128 ] || die "invalid $cidr_name '$cidr_value': CIDR prefix must be 0..128"
+}
+
 validate_dns_server_literal() {
   value="$1"
   name="$2"
@@ -259,6 +312,33 @@ validate_dns_server_literal() {
   die "invalid $name '$value': use an IP literal, not a hostname or URL"
 }
 
+validate_dns_tls_server_name() {
+  value="$1"
+  name="$2"
+  [ -z "$value" ] && return 0
+  case "$value" in
+    *://*|*/*|*\\*|*\"*|*\[*|*\]*|*%*|*,*|*" "*|*:*|.*|*.)
+      die "invalid $name '$value': use a DNS name like cloudflare-dns.com"
+      ;;
+  esac
+  printf '%s\n' "$value" | awk '
+    function fail() { exit 1 }
+    {
+      if (length($0) > 253) fail()
+      n = split($0, labels, ".")
+      if (n < 2) fail()
+      for (i = 1; i <= n; i++) {
+        label = labels[i]
+        if (length(label) < 1 || length(label) > 63) fail()
+        if (label !~ /^[A-Za-z0-9-]+$/) fail()
+        if (label ~ /^-/ || label ~ /-$/) fail()
+      }
+      ok = 1
+    }
+    END { exit ok ? 0 : 1 }
+  ' || die "invalid $name '$value': use a DNS name like cloudflare-dns.com"
+}
+
 validate_settings() {
   json_bool "$SBMAGIC_ENABLED" >/dev/null
   json_bool "$SBMAGIC_BOOT_START" >/dev/null
@@ -268,10 +348,14 @@ validate_settings() {
   json_bool "$SBMAGIC_NETWORK_CHANGE_FLUSH" >/dev/null
   json_bool "$SBMAGIC_IPV6" >/dev/null
   json_bool "$SBMAGIC_AUTO_ROUTE" >/dev/null
+  json_bool "$SBMAGIC_AUTO_REDIRECT" >/dev/null
+  json_bool "$SBMAGIC_ENDPOINT_INDEPENDENT_NAT" >/dev/null
+  json_bool "$SBMAGIC_REJECT_QUIC" >/dev/null
   json_bool "$SBMAGIC_STRICT_ROUTE" >/dev/null
   json_bool "$SBMAGIC_API_FIREWALL" >/dev/null
   json_bool "$SBMAGIC_SNIFF" >/dev/null
   json_bool "$SBMAGIC_OOM_PROTECT" >/dev/null
+  json_bool "$SBMAGIC_DNS_REVERSE_MAPPING" >/dev/null
 
   validate_uint_range "$SBMAGIC_WATCHDOG_INTERVAL" SBMAGIC_WATCHDOG_INTERVAL 60 86400
   validate_uint_range "$SBMAGIC_NETWORK_RECOVERY_COOLDOWN" SBMAGIC_NETWORK_RECOVERY_COOLDOWN 5 3600
@@ -291,8 +375,20 @@ validate_settings() {
   validate_one_of "$SBMAGIC_RULESET_DOWNLOAD_DETOUR" SBMAGIC_RULESET_DOWNLOAD_DETOUR proxy direct
   validate_dns_server_literal "$SBMAGIC_DNS_LOCAL_SERVER" SBMAGIC_DNS_LOCAL_SERVER
   validate_dns_server_literal "$SBMAGIC_DNS_REMOTE_SERVER" SBMAGIC_DNS_REMOTE_SERVER
+  validate_dns_tls_server_name "$SBMAGIC_DNS_LOCAL_TLS_SERVER_NAME" SBMAGIC_DNS_LOCAL_TLS_SERVER_NAME
+  validate_dns_tls_server_name "$SBMAGIC_DNS_REMOTE_TLS_SERVER_NAME" SBMAGIC_DNS_REMOTE_TLS_SERVER_NAME
+  if [ "$SBMAGIC_DNS_MODE" = "fake-ip" ]; then
+    validate_ipv4_cidr_literal "$SBMAGIC_FAKEIP4" SBMAGIC_FAKEIP4
+    if [ "$SBMAGIC_IPV6" = "true" ]; then
+      validate_ipv6_cidr_literal "$SBMAGIC_FAKEIP6" SBMAGIC_FAKEIP6
+    fi
+  fi
   validate_duration_literal "$SBMAGIC_SNIFF_TIMEOUT" SBMAGIC_SNIFF_TIMEOUT
   validate_duration_literal "$SBMAGIC_RULE_UPDATE_INTERVAL" SBMAGIC_RULE_UPDATE_INTERVAL
+  validate_duration_literal "$SBMAGIC_UDP_TIMEOUT" SBMAGIC_UDP_TIMEOUT
+  if [ "$SBMAGIC_AUTO_REDIRECT" = "true" ] && [ "$SBMAGIC_AUTO_ROUTE" != "true" ]; then
+    die "SBMAGIC_AUTO_REDIRECT=true requires SBMAGIC_AUTO_ROUTE=true"
+  fi
 }
 
 cleanup_stale_process_binaries() {
@@ -554,12 +650,14 @@ route_proxy_rules() {
   package_arr="$1"
   [ "$package_arr" = "[]" ] && return 0
   pkg_json="$(route_package_field "$package_arr")"
+  reject_quic_rule="$(route_quic_reject_rule "$package_arr")"
   case "$SBMAGIC_PROXY_RULE_MODE" in
     off)
       return 0
       ;;
     global)
       cat <<EOF
+${reject_quic_rule}
 ,
       {
         "outbound": "proxy"$pkg_json
@@ -581,7 +679,7 @@ EOF
           "geoip-cn"
         ],
         "outbound": "direct"$pkg_json
-      },
+      }${reject_quic_rule},
       {
         "outbound": "proxy"$pkg_json
       }
@@ -620,6 +718,116 @@ route_mixed_rules() {
       route_free_flow_rules ""
       ;;
   esac
+}
+
+route_quic_reject_rule() {
+  package_arr="$1"
+  [ "$SBMAGIC_REJECT_QUIC" = "true" ] || return 0
+  pkg_json="$(route_package_field "$package_arr")"
+  cat <<'EOF'
+,
+      {
+        "network": "udp",
+        "port": [
+          443
+        ],
+        "action": "reject"
+EOF
+  printf '%s\n' "$pkg_json"
+  cat <<'EOF'
+      }
+EOF
+}
+
+route_clash_global_quic_reject_rule() {
+  [ "$SBMAGIC_REJECT_QUIC" = "true" ] || return 0
+  cat <<'EOF'
+,
+      {
+        "clash_mode": "Global",
+        "network": "udp",
+        "port": [
+          443
+        ],
+        "action": "reject"
+      }
+EOF
+}
+
+rule_sets_used() {
+  [ "$SBMAGIC_PROXY_RULE_MODE" = "bypass-cn" ]
+}
+
+route_rule_set_block() {
+  rule_sets_used || return 0
+  if [ -s "$GEOSITE_CN_RULESET" ] && [ -s "$GEOIP_CN_RULESET" ]; then
+    cat <<EOF
+    "rule_set": [
+      {
+        "tag": "geosite-cn",
+        "type": "local",
+        "format": "binary",
+        "path": "$GEOSITE_CN_RULESET"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "local",
+        "format": "binary",
+        "path": "$GEOIP_CN_RULESET"
+      }
+    ],
+EOF
+    return 0
+  fi
+  cat <<EOF
+    "rule_set": [
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "$GEOSITE_CN_RULESET_URL",
+        "download_detour": "$SBMAGIC_RULESET_DOWNLOAD_DETOUR",
+        "update_interval": "$SBMAGIC_RULE_UPDATE_INTERVAL"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "$GEOIP_CN_RULESET_URL",
+        "download_detour": "$SBMAGIC_RULESET_DOWNLOAD_DETOUR",
+        "update_interval": "$SBMAGIC_RULE_UPDATE_INTERVAL"
+      }
+    ],
+EOF
+}
+
+dns_tls_block() {
+  dns_type="$1"
+  server_name="$2"
+  [ -n "$server_name" ] || return 0
+  case "$dns_type" in
+    https|tls|quic|h3)
+      cat <<EOF
+,
+        "tls": {
+          "server_name": "$server_name"
+        }
+EOF
+      ;;
+  esac
+}
+
+dns_geosite_cn_rule() {
+  rule_sets_used || return 0
+  cat <<'EOF'
+      {
+        "rule_set": [
+          "geosite-cn"
+        ],
+        "action": "route",
+        "server": "local"
+      },
+EOF
 }
 
 random_token() {
@@ -733,13 +941,22 @@ netwatch_alive() {
 
 wait_for_service_start() {
   i=0
-  while [ "$i" -lt 15 ]; do
-    pid_alive && return 0
-    watchdog_alive || return 1
+  saw_pid=false
+  while [ "$i" -lt 20 ]; do
+    if service_ready_after_start; then
+      return 0
+    fi
+    pid_alive && saw_pid=true
+    if ! watchdog_alive; then
+      [ "$saw_pid" = "true" ] && return 0
+      sleep 1
+      i=$((i + 1))
+      continue
+    fi
     sleep 1
     i=$((i + 1))
   done
-  pid_alive
+  service_ready_after_start || [ "$saw_pid" = "true" ]
 }
 
 watchdog_interval_seconds() {
@@ -783,12 +1000,14 @@ package_field() {
 }
 
 tun_stack_fields() {
-  # sing-box documents endpoint_independent_nat as gvisor-only; other stacks
-  # already use endpoint-independent NAT by default.
-  if [ "$SBMAGIC_STACK" = "gvisor" ]; then
+  # endpoint_independent_nat (Full Cone) helps P2P/voice/gaming NAT traversal,
+  # but sing-box documents it as a slight throughput cost and it is gvisor-only.
+  # Default OFF for the performance-first always-on profile; enable only when a
+  # user actually needs Full Cone. Other stacks are endpoint-independent anyway.
+  if [ "$SBMAGIC_STACK" = "gvisor" ] && [ "$SBMAGIC_ENDPOINT_INDEPENDENT_NAT" = "true" ]; then
     printf ',\n      "endpoint_independent_nat": true'
   fi
-  printf ',\n      "udp_timeout": "5m"'
+  printf ',\n      "udp_timeout": "%s"' "$SBMAGIC_UDP_TIMEOUT"
 }
 
 render_config() {
@@ -802,7 +1021,9 @@ render_config() {
   ensure_no_strategy_conflicts
 
   auto_route="$(json_bool "$SBMAGIC_AUTO_ROUTE")"
+  auto_redirect="$(json_bool "$SBMAGIC_AUTO_REDIRECT")"
   strict_route="$(json_bool "$SBMAGIC_STRICT_ROUTE")"
+  dns_reverse_mapping="$(json_bool "$SBMAGIC_DNS_REVERSE_MAPPING")"
   ipv6_enabled="$(json_bool "$SBMAGIC_IPV6")"
   package_json="$(package_field)"
   tun_stack_json="$(tun_stack_fields)"
@@ -812,6 +1033,11 @@ render_config() {
   forced_proxy_rules="$(route_proxy_rules "$proxy_packages")"
   forced_free_flow_rules="$(route_free_flow_rules "$free_flow_packages")"
   mixed_rules="$(route_mixed_rules)"
+  clash_global_quic_reject_rule="$(route_clash_global_quic_reject_rule)"
+  route_rule_sets="$(route_rule_set_block)"
+  dns_local_tls="$(dns_tls_block "$SBMAGIC_DNS_LOCAL_TYPE" "$SBMAGIC_DNS_LOCAL_TLS_SERVER_NAME")"
+  dns_remote_tls="$(dns_tls_block "$SBMAGIC_DNS_REMOTE_TYPE" "$SBMAGIC_DNS_REMOTE_TLS_SERVER_NAME")"
+  dns_geosite_cn_rule="$(dns_geosite_cn_rule)"
   sniff_rule=""
   if [ "$SBMAGIC_SNIFF" = "true" ]; then
     sniff_rule=$(cat <<EOF
@@ -924,21 +1150,23 @@ EOF
       {
         "type": "$SBMAGIC_DNS_LOCAL_TYPE",
         "tag": "local",
-        "server": "$SBMAGIC_DNS_LOCAL_SERVER"
+        "server": "$SBMAGIC_DNS_LOCAL_SERVER"$dns_local_tls
       },
       {
         "type": "$SBMAGIC_DNS_REMOTE_TYPE",
         "tag": "remote",
         "server": "$SBMAGIC_DNS_REMOTE_SERVER",
-        "detour": "proxy"
+        "detour": "proxy"$dns_remote_tls
       }$fakeip_server
     ],
+    "reverse_mapping": $dns_reverse_mapping,
     "rules": [
       $dns_reject_aaaa{
         "domain": $dns_direct_domains,
         "action": "route",
         "server": "local"
       },
+${dns_geosite_cn_rule}
       {
         "domain_suffix": [
           "cn"
@@ -958,30 +1186,14 @@ EOF
       "address": $tun_address,
       "mtu": $SBMAGIC_MTU,
       "auto_route": $auto_route,
+      "auto_redirect": $auto_redirect,
       "strict_route": $strict_route$tun_stack_json,
       "stack": "$SBMAGIC_STACK"$package_json
     }
   ],
   "outbounds": $outbounds_json,
   "route": {
-    "rule_set": [
-      {
-        "tag": "geosite-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
-        "download_detour": "$SBMAGIC_RULESET_DOWNLOAD_DETOUR",
-        "update_interval": "$SBMAGIC_RULE_UPDATE_INTERVAL"
-      },
-      {
-        "tag": "geoip-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
-        "download_detour": "$SBMAGIC_RULESET_DOWNLOAD_DETOUR",
-        "update_interval": "$SBMAGIC_RULE_UPDATE_INTERVAL"
-      }
-    ],
+${route_rule_sets}
     "rules": [
       {
         "protocol": "dns",
@@ -994,7 +1206,7 @@ EOF
       {
         "clash_mode": "Direct",
         "outbound": "direct"
-      },
+      }$clash_global_quic_reject_rule,
       {
         "clash_mode": "Global",
         "outbound": "proxy"
@@ -1029,6 +1241,34 @@ check_config() {
   render_config >/dev/null || return 1
   validate_runtime_ready || return 1
   "$SING_BOX" check -D "$DATA_DIR" -c "$CONFIG_FILE"
+}
+
+config_precheck_signature() {
+  config_fp="$(file_fingerprint "$CONFIG_FILE")"
+  core_fp="$(file_fingerprint "$CORE_BIN")"
+  [ -n "$config_fp" ] && [ -n "$core_fp" ] || return 1
+  {
+    echo "config=$config_fp"
+    echo "core=$core_fp"
+  }
+}
+
+mark_prechecked_config() {
+  tmp="$PRECHECKED_CONFIG_FILE.$$"
+  config_precheck_signature > "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv -f "$tmp" "$PRECHECKED_CONFIG_FILE"
+  chmod 600 "$PRECHECKED_CONFIG_FILE" 2>/dev/null
+}
+
+consume_prechecked_config() {
+  [ -f "$PRECHECKED_CONFIG_FILE" ] || return 1
+  expected="$(cat "$PRECHECKED_CONFIG_FILE" 2>/dev/null)"
+  rm -f "$PRECHECKED_CONFIG_FILE"
+  current="$(config_precheck_signature 2>/dev/null)" || return 1
+  [ "$expected" = "$current" ]
 }
 
 validate_runtime_ready() {
@@ -1120,6 +1360,13 @@ release_config_lock() {
   release_lock_dir "$CONFIG_LOCK_DIR"
 }
 
+acquire_watchdog_lock() {
+  acquire_lock_dir "$WATCHDOG_LOCK_DIR"
+}
+release_watchdog_lock() {
+  release_lock_dir "$WATCHDOG_LOCK_DIR"
+}
+
 start_service_locked() {
   mkdirs
   load_settings
@@ -1131,9 +1378,12 @@ start_service_locked() {
     echo "sing-box already running: $(cat "$PID_FILE")"
     return 0
   fi
-  if ! check_config; then
+  if consume_prechecked_config; then
+    log "using prechecked config; skipped duplicate start check"
+  elif ! check_config; then
     die "config check failed"
   fi
+  ensure_api_env
   apply_api_firewall
   mv -f "$RUN_LOG" "$RUN_LOG.old" 2>/dev/null
   "$SING_BOX" run -D "$DATA_DIR" -c "$CONFIG_FILE" >> "$RUN_LOG" 2>&1 &
@@ -1148,6 +1398,9 @@ start_service_locked() {
   child_pid="$(cat "$PID_FILE")"
   apply_oom_score_adj "$child_pid" "sing-box"
   log "started sing-box pid=$child_pid"
+  if ! wait_for_runtime_ready; then
+    log "sing-box pid=$child_pid started but API/TUN not ready yet"
+  fi
   [ "$SBMAGIC_MONITOR_CHILD" = "true" ] || ensure_watchdog
   sync_netwatch
   status
@@ -1312,6 +1565,7 @@ stop_netwatch() {
     fi
     rm -f "$NETWATCH_PID_FILE"
   fi
+  stop_netwatch_monitor
   if command -v pgrep >/dev/null 2>&1; then
     for npid in $(pgrep -f "$DATA_DIR/magicctl netwatch" 2>/dev/null); do
       [ "$npid" = "$$" ] && continue
@@ -1321,6 +1575,21 @@ stop_netwatch() {
       kill -0 "$npid" 2>/dev/null && kill -9 "$npid" 2>/dev/null
     done
   fi
+  stop_netwatch_monitor
+}
+
+stop_netwatch_monitor() {
+  [ -f "$NETWATCH_MONITOR_PID_FILE" ] || return 0
+  mpid="$(cat "$NETWATCH_MONITOR_PID_FILE" 2>/dev/null)"
+  rm -f "$NETWATCH_MONITOR_PID_FILE"
+  case "$mpid" in ''|*[!0-9]*|$$) return 0 ;; esac
+  kill "$mpid" 2>/dev/null || return 0
+  i=0
+  while kill -0 "$mpid" 2>/dev/null && [ "$i" -lt 3 ]; do
+    sleep 1
+    i=$((i + 1))
+  done
+  kill -0 "$mpid" 2>/dev/null && kill -9 "$mpid" 2>/dev/null
 }
 
 stop_init_service() {
@@ -1356,6 +1625,7 @@ reload_service() {
     return 0
   fi
   check_config || die "config check failed -- keeping current process running"
+  mark_prechecked_config || true
   restart_service
 }
 
@@ -1445,6 +1715,20 @@ file_mtime_text() {
 ruleset_cache_time() {
   newest_file=""
   newest_epoch=0
+  for candidate in "$GEOSITE_CN_RULESET" "$GEOIP_CN_RULESET"; do
+    [ -f "$candidate" ] || continue
+    epoch="$(file_mtime_epoch "$candidate")"
+    case "$epoch" in ''|*[!0-9]*) epoch=0 ;; esac
+    if [ "$epoch" -gt "$newest_epoch" ]; then
+      newest_epoch="$epoch"
+      newest_file="$candidate"
+    fi
+  done
+  if [ -n "$newest_file" ]; then
+    file_mtime_text "$newest_file"
+    return 0
+  fi
+
   for candidate in "$CACHE_DIR"/cache.db "$CACHE_DIR"/cache.db-* "$CACHE_DIR"/*.srs "$CACHE_DIR"/rule*; do
     [ -f "$candidate" ] || continue
     epoch="$(file_mtime_epoch "$candidate")"
@@ -1556,11 +1840,21 @@ status() {
   echo "strategy_package_count=$strategy_package_count"
   echo "strategy_process_lookup=$strategy_process_lookup"
   echo "ruleset_download_detour=$SBMAGIC_RULESET_DOWNLOAD_DETOUR"
+  if rule_sets_used; then
+    echo "ruleset_active=true"
+  else
+    echo "ruleset_active=false"
+  fi
   echo "ruleset_update_interval=$SBMAGIC_RULE_UPDATE_INTERVAL"
   echo "ruleset_cache_time=$(ruleset_cache_time)"
   echo "sniff=$SBMAGIC_SNIFF"
   echo "sniff_timeout=$SBMAGIC_SNIFF_TIMEOUT"
+  echo "auto_redirect=$SBMAGIC_AUTO_REDIRECT"
+  echo "endpoint_independent_nat=$SBMAGIC_ENDPOINT_INDEPENDENT_NAT"
+  echo "reject_quic=$SBMAGIC_REJECT_QUIC"
+  echo "udp_timeout=$SBMAGIC_UDP_TIMEOUT"
   echo "dns_mode=$SBMAGIC_DNS_MODE"
+  echo "dns_reverse_mapping=$SBMAGIC_DNS_REVERSE_MAPPING"
   echo "ipv6=$SBMAGIC_IPV6"
   if [ -f "$LAST_GOOD_FILE" ]; then
     echo "last_good=$(stat -c '%y' "$LAST_GOOD_FILE" 2>/dev/null | cut -d'.' -f1)"
@@ -1584,10 +1878,14 @@ logs() {
 }
 
 nc_with_timeout() {
+  # -w is nc's own connection/idle timeout, present on BSD/GNU/busybox/toybox
+  # nc alike -- kept even when the external `timeout` binary is available so a
+  # hung/half-open socket can't block this call forever on a device that lacks
+  # `timeout` (nc would otherwise wait indefinitely with no safety net).
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$API_MAX_TIME" nc "$@"
+    timeout "$API_MAX_TIME" nc -w "$API_MAX_TIME" "$@"
   else
-    nc "$@"
+    nc -w "$API_MAX_TIME" "$@"
   fi
 }
 
@@ -1680,12 +1978,26 @@ api_health_ok() {
   API_CONNECT_TIMEOUT=1
   API_MAX_TIME=1
   API_RETRIES=1
-  api_call_once GET /connections "" >/dev/null 2>&1
+  api_call_once GET /configs "" >/dev/null 2>&1
   rc=$?
   API_CONNECT_TIMEOUT="$old_connect_timeout"
   API_MAX_TIME="$old_max_time"
   API_RETRIES="$old_retries"
   return "$rc"
+}
+
+api_health_ok_after_retries() {
+  attempts="$1"
+  delay="$2"
+  case "$attempts" in ''|*[!0-9]*) attempts=2 ;; esac
+  case "$delay" in ''|*[!0-9]*) delay=1 ;; esac
+  i=0
+  while [ "$i" -lt "$attempts" ]; do
+    api_health_ok && return 0
+    i=$((i + 1))
+    [ "$i" -lt "$attempts" ] && sleep "$delay"
+  done
+  return 1
 }
 
 tun_health_text() {
@@ -1695,6 +2007,42 @@ tun_health_text() {
   else
     echo false
   fi
+}
+
+tun_health_ok_or_unknown() {
+  state="$(tun_health_text)"
+  [ "$state" != "false" ]
+}
+
+network_event_is_own_tun() {
+  event="$1"
+  [ -n "$SBMAGIC_INTERFACE" ] || return 1
+  case "$event" in
+    *"$SBMAGIC_INTERFACE"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+runtime_ready() {
+  pid_alive || return 1
+  api_health_ok || return 1
+  [ "$(tun_health_text)" = "true" ] || return 1
+}
+
+service_ready_after_start() {
+  runtime_ready || return 1
+  [ "$SBMAGIC_NETWORK_WATCH" != "true" ] || netwatch_alive
+}
+
+wait_for_runtime_ready() {
+  i=0
+  while [ "$i" -lt 15 ]; do
+    pid_alive || return 1
+    runtime_ready && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
 }
 
 flush_runtime_connections() {
@@ -1715,13 +2063,23 @@ recover_if_unhealthy() {
     start_service
     return $?
   fi
-  if api_health_ok; then
-    log "recover($reason): API healthy; closing stale runtime connections"
-    flush_runtime_connections
-    echo "recovered=flushed-connections"
+  if api_health_ok_after_retries 2 2; then
+    if ! tun_health_ok_or_unknown; then
+      log "recover($reason): API healthy but tun missing; restarting service"
+      restart_service
+      return $?
+    fi
+    if [ "$SBMAGIC_NETWORK_CHANGE_FLUSH" = "true" ]; then
+      log "recover($reason): API healthy; closing stale runtime connections"
+      flush_runtime_connections
+      echo "recovered=flushed-connections"
+    else
+      log "recover($reason): API healthy; no connection flush configured"
+      echo "recovered=api-healthy"
+    fi
     return 0
   fi
-  log "recover($reason): API unresponsive while pid is alive; restarting service"
+  log "recover($reason): API unresponsive after retries while pid is alive; restarting service"
   restart_service
 }
 
@@ -1745,11 +2103,36 @@ fetch_url() {
   "$FETCHER" "$url" "v2rayN/6.42" || die "fetch failed"
 }
 
+download_ruleset() {
+  url="$1"
+  dest="$2"
+  [ -x "$FETCHER" ] || die "magic-fetch missing: $FETCHER"
+  tmp="$dest.tmp.$$"
+  rm -f "$tmp"
+  if "$FETCHER" "$url" "singbox_tun_Magic/1.0" > "$tmp"; then
+    if [ -s "$tmp" ]; then
+      mv -f "$tmp" "$dest"
+      chmod 600 "$dest"
+      return 0
+    fi
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 ruleset_refresh() {
   mkdirs
+  load_settings
+  download_ruleset "$GEOSITE_CN_RULESET_URL" "$GEOSITE_CN_RULESET" || die "failed to download geosite-cn rule-set"
+  download_ruleset "$GEOIP_CN_RULESET_URL" "$GEOIP_CN_RULESET" || die "failed to download geoip-cn rule-set"
   rm -f "$CACHE_DIR/cache.db" "$CACHE_DIR/cache.db-"* 2>/dev/null
-  log "rule-set cache cleared; reloading service"
-  reload_service
+  log "rule-set files refreshed"
+  if rule_sets_used && pid_alive; then
+    log "rule-set active; reloading service"
+    reload_service
+  else
+    echo "ruleset_refreshed=true"
+  fi
 }
 
 config_file_for() {
@@ -1841,6 +2224,128 @@ config_set_strategy_packages() {
   mv -f "$tmp_free_flow" "$FREE_FLOW_PACKAGES_FILE"
   chmod 600 "$PROXY_PACKAGES_FILE" "$FREE_FLOW_PACKAGES_FILE"
   log "config set strategy packages"
+  trap - EXIT INT TERM HUP
+  release_config_lock
+  echo "ok"
+}
+
+settings_with_value() {
+  src="$1"
+  dest="$2"
+  key="$3"
+  value="$4"
+  if [ -f "$src" ]; then
+    awk -v key="$key" -v value="$value" '
+      BEGIN { seen = 0 }
+      $0 ~ "^" key "=" {
+        print key "=" value
+        seen = 1
+        next
+      }
+      { print }
+      END {
+        if (!seen) print key "=" value
+      }
+    ' "$src" > "$dest"
+  else
+    echo "$key=$value" > "$dest"
+  fi
+}
+
+config_set_per_app() {
+  marker_mode="__SBMAGIC_PACKAGE_MODE__"
+  marker_exclude="__SBMAGIC_EXCLUDE_PACKAGES__"
+  marker_include="__SBMAGIC_INCLUDE_PACKAGES__"
+  marker_proxy="__SBMAGIC_PROXY_PACKAGES__"
+  marker_free_flow="__SBMAGIC_FREE_FLOW_PACKAGES__"
+  acquire_config_lock || die "another config operation is already in progress"
+  tmp_mode=""
+  tmp_settings=""
+  tmp_exclude=""
+  tmp_include=""
+  tmp_proxy=""
+  tmp_free_flow=""
+  old_settings_file=""
+  old_exclude_file=""
+  old_include_file=""
+  old_proxy_packages_file=""
+  old_free_flow_packages_file=""
+  trap '[ -n "$tmp_mode" ] && rm -f "$tmp_mode"; [ -n "$tmp_settings" ] && rm -f "$tmp_settings"; [ -n "$tmp_exclude" ] && rm -f "$tmp_exclude"; [ -n "$tmp_include" ] && rm -f "$tmp_include"; [ -n "$tmp_proxy" ] && rm -f "$tmp_proxy"; [ -n "$tmp_free_flow" ] && rm -f "$tmp_free_flow"; release_config_lock' EXIT INT TERM HUP
+  mkdirs
+  tmp_mode="$RUNTIME_DIR/package-mode.$$"
+  tmp_settings="$SETTINGS_FILE.tmp.$$"
+  tmp_exclude="$EXCLUDE_FILE.tmp.$$"
+  tmp_include="$INCLUDE_FILE.tmp.$$"
+  tmp_proxy="$PROXY_PACKAGES_FILE.tmp.$$"
+  tmp_free_flow="$FREE_FLOW_PACKAGES_FILE.tmp.$$"
+  : > "$tmp_mode"
+  : > "$tmp_exclude"
+  : > "$tmp_include"
+  : > "$tmp_proxy"
+  : > "$tmp_free_flow"
+  awk \
+    -v marker_mode="$marker_mode" -v marker_exclude="$marker_exclude" \
+    -v marker_include="$marker_include" -v marker_proxy="$marker_proxy" \
+    -v marker_free_flow="$marker_free_flow" \
+    -v mode="$tmp_mode" -v exclude="$tmp_exclude" -v include="$tmp_include" \
+    -v proxy="$tmp_proxy" -v free_flow="$tmp_free_flow" '
+      $0 == marker_mode { out = mode; seen_mode = 1; next }
+      $0 == marker_exclude { out = exclude; seen_exclude = 1; next }
+      $0 == marker_include { out = include; seen_include = 1; next }
+      $0 == marker_proxy { out = proxy; seen_proxy = 1; next }
+      $0 == marker_free_flow { out = free_flow; seen_free_flow = 1; next }
+      out != "" { print > out }
+      END {
+        if (!seen_mode || !seen_exclude || !seen_include || !seen_proxy || !seen_free_flow) exit 2
+      }
+    ' || {
+      rm -f "$tmp_mode" "$tmp_settings" "$tmp_exclude" "$tmp_include" "$tmp_proxy" "$tmp_free_flow"
+      die "per-app payload missing marker"
+    }
+
+  package_mode="$(tr -d '[:space:]' < "$tmp_mode" 2>/dev/null)"
+  validate_one_of "$package_mode" SBMAGIC_PACKAGE_MODE black white
+  settings_with_value "$SETTINGS_FILE" "$tmp_settings" SBMAGIC_PACKAGE_MODE "$package_mode"
+  ensure_no_strategy_conflicts_files "$tmp_proxy" "$tmp_free_flow"
+
+  old_settings_file="$SETTINGS_FILE"
+  old_exclude_file="$EXCLUDE_FILE"
+  old_include_file="$INCLUDE_FILE"
+  old_proxy_packages_file="$PROXY_PACKAGES_FILE"
+  old_free_flow_packages_file="$FREE_FLOW_PACKAGES_FILE"
+  SETTINGS_FILE="$tmp_settings"
+  EXCLUDE_FILE="$tmp_exclude"
+  INCLUDE_FILE="$tmp_include"
+  PROXY_PACKAGES_FILE="$tmp_proxy"
+  FREE_FLOW_PACKAGES_FILE="$tmp_free_flow"
+  if ! ( check_config_scratch ) >/dev/null 2>&1; then
+    SETTINGS_FILE="$old_settings_file"
+    EXCLUDE_FILE="$old_exclude_file"
+    INCLUDE_FILE="$old_include_file"
+    PROXY_PACKAGES_FILE="$old_proxy_packages_file"
+    FREE_FLOW_PACKAGES_FILE="$old_free_flow_packages_file"
+    rm -f "$tmp_mode" "$tmp_settings" "$tmp_exclude" "$tmp_include" "$tmp_proxy" "$tmp_free_flow"
+    die "rendered config check failed for per-app settings; kept previous files"
+  fi
+  SETTINGS_FILE="$old_settings_file"
+  EXCLUDE_FILE="$old_exclude_file"
+  INCLUDE_FILE="$old_include_file"
+  PROXY_PACKAGES_FILE="$old_proxy_packages_file"
+  FREE_FLOW_PACKAGES_FILE="$old_free_flow_packages_file"
+
+  cp -f "$SETTINGS_FILE" "$SETTINGS_FILE.bak" 2>/dev/null
+  cp -f "$EXCLUDE_FILE" "$EXCLUDE_FILE.bak" 2>/dev/null
+  cp -f "$INCLUDE_FILE" "$INCLUDE_FILE.bak" 2>/dev/null
+  cp -f "$PROXY_PACKAGES_FILE" "$PROXY_PACKAGES_FILE.bak" 2>/dev/null
+  cp -f "$FREE_FLOW_PACKAGES_FILE" "$FREE_FLOW_PACKAGES_FILE.bak" 2>/dev/null
+  mv -f "$tmp_settings" "$SETTINGS_FILE"
+  mv -f "$tmp_exclude" "$EXCLUDE_FILE"
+  mv -f "$tmp_include" "$INCLUDE_FILE"
+  mv -f "$tmp_proxy" "$PROXY_PACKAGES_FILE"
+  mv -f "$tmp_free_flow" "$FREE_FLOW_PACKAGES_FILE"
+  chmod 600 "$SETTINGS_FILE" "$EXCLUDE_FILE" "$INCLUDE_FILE" "$PROXY_PACKAGES_FILE" "$FREE_FLOW_PACKAGES_FILE"
+  rm -f "$tmp_mode"
+  log "config set per-app"
   trap - EXIT INT TERM HUP
   release_config_lock
   echo "ok"
@@ -2044,16 +2549,29 @@ watchdog() {
 
 netwatch() {
   echo $$ > "$NETWATCH_PID_FILE"
+  NETWATCH_FIFO="$RUNTIME_DIR/netwatch.events.$$"
+  trap 'netwatch_cleanup' EXIT INT TERM HUP
   log "network watch started"
   if ! command -v ip >/dev/null 2>&1; then
     log "network watch exiting: ip command unavailable"
-    rm -f "$NETWATCH_PID_FILE"
+    exit 0
+  fi
+  if ! command -v mkfifo >/dev/null 2>&1; then
+    log "network watch exiting: mkfifo command unavailable"
     exit 0
   fi
 
   last_event=0
   while true; do
-    ip monitor route address link 2>>"$CONTROL_LOG" | while IFS= read -r event; do
+    rm -f "$NETWATCH_FIFO"
+    if ! mkfifo "$NETWATCH_FIFO"; then
+      log "network watch monitor fifo failed; retrying"
+      sleep 10
+      continue
+    fi
+    ip monitor route address link > "$NETWATCH_FIFO" 2>>"$CONTROL_LOG" &
+    echo $! > "$NETWATCH_MONITOR_PID_FILE"
+    while IFS= read -r event; do
       [ -n "$event" ] || continue
       if ! load_settings >/dev/null 2>>"$CONTROL_LOG"; then
         log "network watch ignored event because settings are invalid"
@@ -2064,18 +2582,28 @@ netwatch() {
         rm -f "$NETWATCH_PID_FILE"
         exit 0
       fi
+      own_tun_event=false
+      if network_event_is_own_tun "$event"; then
+        if tun_health_ok_or_unknown; then
+          continue
+        fi
+        own_tun_event=true
+        log "network watch tun missing after event: $event"
+      fi
       now="$(date +%s 2>/dev/null || echo 0)"
       case "$now" in ''|*[!0-9]*) now=0 ;; esac
       cooldown="$SBMAGIC_NETWORK_RECOVERY_COOLDOWN"
       case "$cooldown" in ''|*[!0-9]*) cooldown=30 ;; esac
-      if [ "$last_event" -ne 0 ] && [ $((now - last_event)) -lt "$cooldown" ]; then
+      if [ "$own_tun_event" != "true" ] && [ "$last_event" -ne 0 ] && [ $((now - last_event)) -lt "$cooldown" ]; then
         continue
       fi
       last_event="$now"
       log "network watch event: $event"
       sleep 2
       recover_if_unhealthy "network-change" >/dev/null 2>>"$CONTROL_LOG" || true
-    done
+    done < "$NETWATCH_FIFO"
+    stop_netwatch_monitor
+    rm -f "$NETWATCH_FIFO"
     if ! load_settings >/dev/null 2>>"$CONTROL_LOG"; then
       log "network watch paused: settings invalid"
     elif [ "$SBMAGIC_ENABLED" != "true" ] || [ "$SBMAGIC_NETWORK_WATCH" != "true" ]; then
@@ -2088,6 +2616,14 @@ netwatch() {
   done
 }
 
+netwatch_cleanup() {
+  stop_netwatch_monitor
+  rm -f "$NETWATCH_FIFO"
+  if [ "$(cat "$NETWATCH_PID_FILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$NETWATCH_PID_FILE"
+  fi
+}
+
 # Make sure exactly one watchdog loop is running when the service is
 # enabled. Called after every successful (re)start instead of only at
 # boot, so a watchdog that exited (disabled, or crash-loop shutdown)
@@ -2097,8 +2633,14 @@ ensure_watchdog() {
   if watchdog_alive; then
     return 0
   fi
+  acquire_watchdog_lock || return 1
+  if watchdog_alive; then
+    release_watchdog_lock
+    return 0
+  fi
   rm -f "$WATCHDOG_PID_FILE"
   "$0" watchdog >/dev/null 2>&1 &
+  release_watchdog_lock
 }
 
 start_init_service() {
@@ -2220,10 +2762,11 @@ Commands:
   recover              Check local health and recover stale runtime connections
   api METHOD PATH [JSON]
   fetch URL              Fetch a subscription URL and print the body
-  ruleset-refresh        Clear cached remote rule-sets and safe-reload
+  ruleset-refresh        Download local rule-sets and safe-reload when active
   config get KEY        Print a config file (settings|outbounds|exclude|include|proxy-packages|free-flow-packages|dns-direct)
   config set KEY        Overwrite a config file from stdin (keeps KEY.bak)
   config set-strategies Overwrite proxy/free-flow package strategy files atomically
+  config set-per-app    Overwrite per-app mode and package files atomically
   config rollback KEY    Swap a config file with its .bak (toggle)
   applist [user|system]  List installed apps as "package\tlabel\tuser|system"
   watchdog             Event-driven supervisor with crash-loop guard
@@ -2260,6 +2803,7 @@ case "$cmd" in
       get) config_get "$1" ;;
       set) config_set "$1" ;;
       set-strategies) config_set_strategy_packages ;;
+      set-per-app) config_set_per_app ;;
       rollback) config_rollback "$1" ;;
       *) usage; exit 1 ;;
     esac

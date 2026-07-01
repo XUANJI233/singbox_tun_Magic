@@ -11,6 +11,7 @@ DATA_DIR=/data/adb/singbox_tun_Magic
 PID_FILE="$DATA_DIR/runtime/sing-box.pid"
 WPID_FILE="$DATA_DIR/runtime/watchdog.pid"
 NPID_FILE="$DATA_DIR/runtime/netwatch.pid"
+NMPID_FILE="$DATA_DIR/runtime/netwatch.monitor.pid"
 PROCESS_FILE="$DATA_DIR/runtime/process.path"
 
 is_alive() { kill -0 "$1" 2>/dev/null; }
@@ -21,6 +22,9 @@ command -v setprop >/dev/null 2>&1 && setprop ctl.stop netd_helper 2>/dev/null
 
 npid="$(cat "$NPID_FILE" 2>/dev/null)"
 [ -n "$npid" ] && kill "$npid" 2>/dev/null
+
+nmpid="$(cat "$NMPID_FILE" 2>/dev/null)"
+[ -n "$nmpid" ] && kill "$nmpid" 2>/dev/null
 
 wpid="$(cat "$WPID_FILE" 2>/dev/null)"
 [ -n "$wpid" ] && kill "$wpid" 2>/dev/null

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import sys
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -22,6 +24,10 @@ EXECUTABLES = {
 }
 
 ABI_DIRS = {"arm64-v8a", "x86_64"}
+RULESETS = {
+    "geosite-cn.srs": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+    "geoip-cn.srs": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+}
 
 
 def read_module_prop() -> dict[str, str]:
@@ -64,6 +70,30 @@ def add_file(zf: zipfile.ZipFile, file_path: Path, rel: str) -> None:
     zf.writestr(info, file_path.read_bytes())
 
 
+def download_rulesets() -> None:
+    ruleset_dir = MODULE_DIR / "defaults" / "rulesets"
+    ruleset_dir.mkdir(parents=True, exist_ok=True)
+    for name, url in RULESETS.items():
+        target = ruleset_dir / name
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        req = urllib.request.Request(url, headers={"User-Agent": "singbox_tun_Magic/packager"})
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = resp.read()
+            if not data:
+                raise RuntimeError("empty response")
+            tmp.write_bytes(data)
+            tmp.replace(target)
+            print(f"ruleset {name}: downloaded {len(data)} bytes")
+        except Exception as exc:
+            if tmp.exists():
+                tmp.unlink()
+            if target.is_file() and target.stat().st_size > 0:
+                print(f"ruleset {name}: using existing bundled copy after download failed: {exc}", file=sys.stderr)
+                continue
+            raise SystemExit(f"failed to download rule-set {name}: {exc}") from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Package the Magisk/KernelSU module zip.")
     parser.add_argument("--abi", choices=["arm64-v8a", "x86_64"], default=None,
@@ -74,6 +104,7 @@ def main() -> None:
 
     props = read_module_prop()
     abi = args.abi
+    download_rulesets()
 
     if abi:
         required_bins = [f"bin/{abi}/sing-box", f"bin/{abi}/magic-fetch"]

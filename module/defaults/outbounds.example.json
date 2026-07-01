@@ -17,9 +17,9 @@
       "my-node"
     ],
     "url": "https://www.gstatic.com/generate_204",
-    "interval": "3m",
-    "idle_timeout": "30m",
-    "tolerance": 50
+    "interval": "10m",
+    "idle_timeout": "1h",
+    "tolerance": 100
   },
   {
     "type": "selector",
