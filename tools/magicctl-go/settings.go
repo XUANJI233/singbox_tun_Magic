@@ -14,6 +14,7 @@ type settings struct {
 	Interface              string
 	MTU                    int
 	IPv6                   bool
+	IPv6Mode               string
 	AutoRoute              bool
 	AutoRedirect           bool
 	StrictRoute            bool
@@ -53,7 +54,8 @@ func defaultSettings() map[string]string {
 		"SBMAGIC_PROCESS_NAME":               "netd-helper",
 		"SBMAGIC_INTERFACE":                  "utun0",
 		"SBMAGIC_MTU":                        "1400",
-		"SBMAGIC_IPV6":                       "false",
+		"SBMAGIC_IPV6":                       "true",
+		"SBMAGIC_IPV6_MODE":                  "auto",
 		"SBMAGIC_AUTO_ROUTE":                 "true",
 		"SBMAGIC_AUTO_REDIRECT":              "true",
 		"SBMAGIC_STRICT_ROUTE":               "true",
@@ -81,7 +83,7 @@ func defaultSettings() map[string]string {
 		"SBMAGIC_API_SECRET":                 "",
 		"SBMAGIC_RULESET_DOWNLOAD_DETOUR":    "direct",
 		"SBMAGIC_RULE_UPDATE_INTERVAL":       "168h",
-		"SBMAGIC_UDP_TIMEOUT":                "5m",
+		"SBMAGIC_UDP_TIMEOUT":                "auto",
 		"SBMAGIC_SNIFF":                      "false",
 		"SBMAGIC_SNIFF_TIMEOUT":              "100ms",
 	}
@@ -138,6 +140,15 @@ func parseSettings(v map[string]string) (settings, error) {
 	if err != nil {
 		return settings{}, err
 	}
+	ipv6Mode := v["SBMAGIC_IPV6_MODE"]
+	if ipv6Mode == "" {
+		if ipv6 {
+			ipv6Mode = "proxy"
+		} else {
+			ipv6Mode = "block"
+		}
+	}
+	ipv6 = ipv6Mode == "auto" || ipv6Mode == "proxy"
 	autoRoute, err := boolFor("SBMAGIC_AUTO_ROUTE")
 	if err != nil {
 		return settings{}, err
@@ -174,6 +185,7 @@ func parseSettings(v map[string]string) (settings, error) {
 		Interface:              v["SBMAGIC_INTERFACE"],
 		MTU:                    mtu,
 		IPv6:                   ipv6,
+		IPv6Mode:               ipv6Mode,
 		AutoRoute:              autoRoute,
 		AutoRedirect:           autoRedirect,
 		StrictRoute:            strictRoute,
@@ -201,7 +213,7 @@ func parseSettings(v map[string]string) (settings, error) {
 		APISecret:              v["SBMAGIC_API_SECRET"],
 		RulesetDownloadDetour:  v["SBMAGIC_RULESET_DOWNLOAD_DETOUR"],
 		RuleUpdateInterval:     v["SBMAGIC_RULE_UPDATE_INTERVAL"],
-		UDPTimeout:             v["SBMAGIC_UDP_TIMEOUT"],
+		UDPTimeout:             effectiveUDPTimeout(v["SBMAGIC_UDP_TIMEOUT"], endpointIndependentNAT, rejectQUIC),
 		Sniff:                  sniff,
 		SniffTimeout:           v["SBMAGIC_SNIFF_TIMEOUT"],
 	}
@@ -209,6 +221,21 @@ func parseSettings(v map[string]string) (settings, error) {
 		return settings{}, err
 	}
 	return s, nil
+}
+
+func effectiveUDPTimeout(value string, endpointIndependentNAT, rejectQUIC bool) string {
+	switch value {
+	case "", "auto":
+		if endpointIndependentNAT {
+			return "10m"
+		}
+		if rejectQUIC {
+			return "2m"
+		}
+		return "5m"
+	default:
+		return value
+	}
 }
 
 func boolSetting(value, name string) (bool, error) {
@@ -242,6 +269,9 @@ func validateRenderSettings(s settings) error {
 	if err := checkOne(s.Stack, "SBMAGIC_STACK", "gvisor", "system", "mixed"); err != nil {
 		return err
 	}
+	if err := checkOne(s.IPv6Mode, "SBMAGIC_IPV6_MODE", "auto", "proxy", "block", "off"); err != nil {
+		return err
+	}
 	if err := checkOne(s.PackageMode, "SBMAGIC_PACKAGE_MODE", "black", "white"); err != nil {
 		return err
 	}
@@ -259,6 +289,9 @@ func validateRenderSettings(s settings) error {
 	}
 	if err := checkOne(s.DNSFinal, "SBMAGIC_DNS_FINAL", "remote", "local"); err != nil {
 		return err
+	}
+	if s.IPv6Mode != "proxy" && s.DNSStrategy == "ipv6_only" {
+		return fmt.Errorf("SBMAGIC_DNS_STRATEGY=ipv6_only requires SBMAGIC_IPV6_MODE=proxy")
 	}
 	if s.APIPort == "" || s.APISecret == "" {
 		return fmt.Errorf("api.env is missing SBMAGIC_API_PORT or SBMAGIC_API_SECRET")

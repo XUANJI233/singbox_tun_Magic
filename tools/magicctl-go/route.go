@@ -7,7 +7,7 @@ func renderRoute(s settings, p paths, proxyPkgs, freeFlowPkgs []string, ruleSets
 	if s.Sniff {
 		rules = append(rules, map[string]any{"action": "sniff", "timeout": s.SniffTimeout})
 	}
-	if !s.IPv6 {
+	if s.IPv6Mode == "block" {
 		rules = append(rules, map[string]any{"ip_version": 6, "action": "reject"})
 	}
 	rules = append(rules,

@@ -3,11 +3,15 @@ package main
 const whitelistSentinelUID = 4294967294
 
 func renderTunInbound(s settings, includePkgs, excludePkgs []string) map[string]any {
+	addresses := []string{"172.19.0.1/30"}
+	if s.IPv6Mode != "off" {
+		addresses = append(addresses, "fdfe:dcba:9876::1/126")
+	}
 	tun := map[string]any{
 		"type":           "tun",
 		"tag":            "tun-in",
 		"interface_name": s.Interface,
-		"address":        []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
+		"address":        addresses,
 		"mtu":            s.MTU,
 		"auto_route":     s.AutoRoute,
 		"auto_redirect":  s.AutoRedirect,

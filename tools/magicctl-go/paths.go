@@ -23,6 +23,7 @@ type paths struct {
 	geositeCN        string
 	geoipCN          string
 	configFile       string
+	ipv6StateFile    string
 }
 
 func defaultDataDir() string {
@@ -55,5 +56,6 @@ func newPaths(dataDir string) paths {
 		geositeCN:        filepath.Join(rulesetDir, "geosite-cn.srs"),
 		geoipCN:          filepath.Join(rulesetDir, "geoip-cn.srs"),
 		configFile:       filepath.Join(runtimeDir, "config.json"),
+		ipv6StateFile:    filepath.Join(runtimeDir, "ipv6.state"),
 	}
 }

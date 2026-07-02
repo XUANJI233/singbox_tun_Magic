@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import re
 import sys
 import urllib.request
 import zipfile
@@ -30,6 +31,25 @@ RULESETS = {
     "geosite-cn.srs": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
     "geoip-cn.srs": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
 }
+
+
+def common_libs_from_magicctl() -> list[str]:
+    script = (MODULE_DIR / "common" / "magicctl").read_text(encoding="utf-8")
+    match = re.search(r"for lib in\s+(?P<body>.*?); do", script, re.S)
+    if not match:
+        raise SystemExit("failed to read common/lib load list from module/common/magicctl")
+    body = match.group("body").replace("\\", " ")
+    libs = body.split()
+    if not libs:
+        raise SystemExit("empty common/lib load list in module/common/magicctl")
+    duplicates = sorted({name for name in libs if libs.count(name) > 1})
+    if duplicates:
+        raise SystemExit(f"duplicate common/lib entries in module/common/magicctl: {', '.join(duplicates)}")
+    actual = sorted(path.stem for path in (MODULE_DIR / "common" / "lib").glob("*.sh"))
+    extra = sorted(set(actual) - set(libs))
+    if extra:
+        raise SystemExit(f"common/lib scripts not loaded by module/common/magicctl: {', '.join(extra)}")
+    return libs
 
 
 def read_module_prop() -> dict[str, str]:
@@ -119,7 +139,9 @@ def main() -> None:
         ]
         default_name = "星盘.zip"
 
-    missing = ["module.prop", "customize.sh", "common/magicctl", "bin/applist.dex"] + required_bins
+    missing = ["module.prop", "customize.sh", "common/magicctl", "bin/applist.dex"] + [
+        f"common/lib/{name}.sh" for name in common_libs_from_magicctl()
+    ] + required_bins
     for rel in missing:
         if not (MODULE_DIR / rel).is_file():
             raise SystemExit(f"missing module file: module/{rel}")

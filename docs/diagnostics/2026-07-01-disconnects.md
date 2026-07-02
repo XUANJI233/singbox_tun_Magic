@@ -447,7 +447,7 @@ promote-last-good delta_jiffies=0
 - **规则集默认本地预置**:打包时预取 geosite-cn / geoip-cn `.srs`,安装时复制到 `$CACHE_DIR/rulesets`,渲染时优先使用 `type: local`。`SBMAGIC_RULESET_DOWNLOAD_DETOUR=direct` 只用于本地文件缺失后的远程兜底,避免首次启动出现规则下载/代理就绪互相等待。规则文件时间已在状态页展示;直连无法更新时再切到 `proxy`。
 - **只有非默认策略侧需要包名识别**:`packages.proxy/free-flow` 是 route 层强制策略。渲染时会跳过与 `SBMAGIC_MIXED_RULE_PRIORITY` 相同的一侧,所以默认代理优先下,`packages.proxy` 不再生成 `package_name` 条件;只有少数强制走另一侧策略的应用才需要包名/进程识别。
 - **auto_redirect 不是 UDP/QUIC 加速器**:Android 上它主要优化 IPv4 TCP。应用侧 HTTP/3/QUIC 仍走 UDP/gVisor 路径;`SBMAGIC_REJECT_QUIC=false` 默认关闭,只有确认设备被 UDP/443 成本拖慢时才建议开启,让应用回退 TCP。Hysteria2/TUIC/QUIC 节点出站不受这个路由拒绝规则影响。
-- **`udp_timeout=5m` 是固定折中**:对多数场景省资源;HTTP/3、游戏、语音等 UDP 长空闲场景可能需要更长超时,但调长会增加 NAT 表占用。
+- **UDP 超时已改成自动默认**:`SBMAGIC_UDP_TIMEOUT=auto` 会在渲染时落成实际时长:普通配置 `5m`,Full Cone NAT 时 `10m`,拒绝 QUIC 时 `2m`;仍可手动填 `2m`/`5m`/`10m` 等 Go duration。
 - **手动 reload 会重启核心;ruleset-refresh 条件重启**:sing-box clash API 没有真实热重载配置接口,所以配置 reload 会重建 TUN 并打断已有连接。`ruleset-refresh` 只在 `bypass-cn` 规则集正在使用且核心运行时 reload;停机或未使用规则集时只更新本地 `.srs` 文件。这不是后台自发断流。
 - **手动切换 selector 会影响连接**:导入生成的 selector 仍保留 `interrupt_exist_connections=true`,用户主动切节点时旧连接会被切断,新连接立即走新节点;这属于显式操作。
 
@@ -462,6 +462,8 @@ promote-last-good delta_jiffies=0
 发现并处理:
 - RA/IPv6 地址 lifetime 刷新会每 8-15 分钟触发一次 `ip monitor` 地址事件,旧 netwatch 会做一次健康检查。已新增 IPv6 地址快照,对已知地址的 `inet6 ... valid_lft/preferred_lft` 刷新直接忽略;新地址、删除地址、link/route/default 变化仍会触发恢复检查。
 - 已新增 `cleanup_netwatch_fifos`,在 netwatch 启动和停止时清理 `runtime/netwatch.events.*` 孤儿 FIFO。SIGKILL 本身无法执行 trap,但下一次 stop/start 会清掉残留。
+- 已新增网络恢复细调项:`SBMAGIC_NETWORK_SETTLE_DELAY`、`SBMAGIC_NETWORK_HEALTH_RETRIES`、`SBMAGIC_NETWORK_HEALTH_RETRY_DELAY`、`SBMAGIC_NETWORK_OWN_TUN_GRACE`,避免把 ROM 刚切网/刚重建 TUN 的短暂状态当成需要重启。
+- IPv6 已从旧布尔改成 `SBMAGIC_IPV6_MODE=auto/proxy/block/off`:默认 `auto`,按内核当前 IPv6 路由结果自动选择运行时有效模式;无默认 IPv6 出口按 `off` 渲染,有 IPv6 但短探测不通按 `block` 渲染。手动 `proxy` 是强制开启,不会被自动回退覆盖。
 - 已修正 `settings.env` 的 auto_redirect 注释:Android 上是 iptables REDIRECT 快路径,不是 nftables 依赖。
 - 已优化策略渲染:与 `SBMAGIC_MIXED_RULE_PRIORITY` 相同的一侧不再生成 `package_name` 规则。当前常见的白名单 + 代理优先配置下,即使 UI 中 `packages.proxy` 与入口白名单相同,route 层也不会再触发每连接包名识别。
 - 已把配置渲染从 2800+ 行 shell 主控中拆出到 `tools/magicctl-go/`:shell `magicctl` 保留启动/停止/watchdog/netwatch 等 Android 生命周期编排,Go `magicctl-go render` 专管 DNS/TUN/route/fake-ip/ruleset JSON。渲染逻辑按文件拆分,并补了默认策略包名识别、QUIC 范围、fake-ip IPv6 的单元测试。
@@ -481,4 +483,4 @@ promote-last-good delta_jiffies=0
 
 ## 当前结论
 
-已修掉当前代码中能明确证明的模块自造断流/空转路径:切网默认 flush、重 `/connections` 健康检查、启动过早返回、watchdog 启动竞态、netwatch monitor 孤儿、自身 TUN 事件误触发、IPv6 RA 续租健康检查空转、规则集代理冷启动依赖、默认策略侧重复包名识别、过于积极的默认 urltest、real-ip 域名路由缺反向映射、非 `.cn` 中国站点 DNS 首次解析绕远程。若真机仍断流,下一步必须按日志时间点区分:核心是否重启、DNS 是否卡住、上游/CDN 是否断开、还是应用自身连接池重拨。
+已修掉当前代码中能明确证明的模块自造断流/空转路径:切网默认 flush、重 `/connections` 健康检查、启动过早返回、watchdog 启动竞态、netwatch monitor 孤儿、自身 TUN 事件误触发、IPv6 RA 续租健康检查空转、规则集代理冷启动依赖、默认策略侧重复包名识别、过于积极的默认 urltest、real-ip 域名路由缺反向映射、非 `.cn` 中国站点 DNS 首次解析绕远程、IPv6/DNS 错配、UDP 超时固定不可调。若真机仍断流,下一步必须按日志时间点区分:核心是否重启、DNS 是否卡住、上游/CDN 是否断开、还是应用自身连接池重连。

@@ -18,7 +18,7 @@ func renderDNS(s settings, _ paths, directDomains []string, ruleSetsUsed bool) m
 	}
 
 	rules := []any{}
-	if !s.IPv6 {
+	if s.IPv6Mode != "proxy" {
 		rules = append(rules, map[string]any{
 			"query_type": []string{"AAAA"},
 			"action":     "reject",

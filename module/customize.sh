@@ -22,13 +22,14 @@ unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >&2
 
 DATA_DIR="/data/adb/singbox_tun_Magic"
 BIN_DIR="$DATA_DIR/bin"
+LIB_DIR="$DATA_DIR/lib"
 CONFIG_DIR="$DATA_DIR/configs"
 RUNTIME_DIR="$DATA_DIR/runtime"
 LOG_DIR="$DATA_DIR/logs"
 CACHE_DIR="$DATA_DIR/cache"
 RULESET_DIR="$CACHE_DIR/rulesets"
 
-mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR" "$RULESET_DIR"
+mkdir -p "$BIN_DIR" "$LIB_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR" "$RULESET_DIR"
 
 cp -f "$MODPATH/bin/$SBMAGIC_ABI/sing-box" "$BIN_DIR/.core"
 [ -f "$MODPATH/bin/$SBMAGIC_ABI/magic-fetch" ] && cp -f "$MODPATH/bin/$SBMAGIC_ABI/magic-fetch" "$BIN_DIR/magic-fetch"
@@ -36,6 +37,9 @@ cp -f "$MODPATH/bin/$SBMAGIC_ABI/sing-box" "$BIN_DIR/.core"
 # applist.dex is ABI-independent dalvik bytecode (app-label dumper run via app_process)
 [ -f "$MODPATH/bin/applist.dex" ] && cp -f "$MODPATH/bin/applist.dex" "$BIN_DIR/applist.dex"
 cp -f "$MODPATH/common/magicctl" "$DATA_DIR/magicctl"
+rm -rf "$LIB_DIR"
+mkdir -p "$LIB_DIR"
+cp -f "$MODPATH/common/lib/"*.sh "$LIB_DIR/"
 chmod 755 "$BIN_DIR/.core" "$BIN_DIR/magic-fetch" "$BIN_DIR/magicctl-go" "$DATA_DIR/magicctl" 2>/dev/null
 
 core_fp="$(stat -c '%s:%Y' "$BIN_DIR/.core" 2>/dev/null)"
@@ -63,7 +67,8 @@ if [ -d "$MODPATH/defaults/rulesets" ]; then
 fi
 echo "$MODPATH" > "$RUNTIME_DIR/module.path"
 
-chmod 700 "$DATA_DIR" "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"
+chmod 700 "$DATA_DIR" "$BIN_DIR" "$LIB_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR"
+chmod 600 "$LIB_DIR"/*.sh 2>/dev/null
 chmod 600 "$CONFIG_DIR"/* 2>/dev/null
 chmod 644 "$CONFIG_DIR/outbounds.example.json" "$CONFIG_DIR"/*.default 2>/dev/null
 
@@ -77,6 +82,7 @@ set_perm_recursive "$DATA_DIR" 0 0 0700 0600
 set_perm "$BIN_DIR/.core" 0 0 0755
 [ -f "$BIN_DIR/magic-fetch" ] && set_perm "$BIN_DIR/magic-fetch" 0 0 0755
 [ -f "$BIN_DIR/magicctl-go" ] && set_perm "$BIN_DIR/magicctl-go" 0 0 0755
+set_perm_recursive "$LIB_DIR" 0 0 0700 0600
 set_perm "$DATA_DIR/magicctl" 0 0 0755
 
 ui_print "- ABI: $SBMAGIC_ABI"

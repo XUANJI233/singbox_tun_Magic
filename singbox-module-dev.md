@@ -141,18 +141,17 @@ APP 流量 + DNS 查询
 - `magicctl` 渲染时会加一个 `{"type":"fakeip","tag":"fakeip",...}` DNS server(1.12+ 新格式,不再用顶层 `dns.fakeip` 对象),并在直连/CN 规则之后追加 `query_type: A/AAAA -> server: fakeip` 的 DNS 规则。`dns.final` 仍保持 `remote`/`local`。**不能**把 `dns.final` 设成 `fakeip`;sing-box 1.13 会拒绝启动(`default server cannot be fakeip`)。`SBMAGIC_FAKEIP4` / `SBMAGIC_FAKEIP6` 在模块层先做 CIDR 校验,坏值不会等到核心启动时才暴露。
 - fake-ip 模式下渲染会显式写 `cache_file.store_fakeip: true`,把 fake-ip↔域名映射持久化到 `cache.db`,避免重启后旧映射失效导致正在用 fake-ip 的连接断开(该字段默认值在不同 sing-box 版本间不一致,所以显式写死)。
 - 因为所有流量都在 tun 内(没有"排除 APP 拿到假 IP 但流量不进 tun"的问题——排除的 APP 本来就不查这个 DNS),fake-ip 在当前架构下**不存在旧文档里 per-app 冲突的那套顾虑**,可以放心用来恢复域名级分流精度。
-- IPv6 关闭时(`SBMAGIC_IPV6=false`,默认),AAAA 已被 DNS 规则最前面的 `reject` 全局拦掉(见 §4.4),所以 fake-ip 自然只产出 v4,不会下发 fake v6 段。
+- IPv6 处于自动回退到 `block` 或手动 `block` 时,AAAA 已被 DNS 规则最前面的 `reject` 全局拦掉(见 §4.4),所以 fake-ip 自然只产出 v4,不会下发 fake v6 段。
 
-### 4.4 IPv6 防泄漏(`SBMAGIC_IPV6`)
+### 4.4 IPv6 防泄漏(`SBMAGIC_IPV6_MODE`)
 
-这是容易被忽略的一点:**`SBMAGIC_IPV6=false` 不等于"不管 IPv6"**,而是"接管 IPv6 但全部拦截",理由如下。
+IPv6 现在用四态配置收口:`auto`(默认)、`proxy`、`block`、`off`。`auto` 在启动、reload 和网络切换时用内核 `ip -6 route get` 结果判断 Android 当前出口,并只接受同一接口上的公网 IPv6 地址。默认网络没有 IPv6 默认路由/公网地址时,运行时按 `off` 渲染;有 IPv6 但短探测不通时,按 `block` 渲染;探测通过才按 `proxy` 渲染。旧的 `SBMAGIC_IPV6=true/false` 只作为兼容输入保留。
 
-- tun inbound 的 `address` 字段**始终**包含一个 ULA(`fdfe:dcba:9876::1/126`)地址,不管 `SBMAGIC_IPV6` 是否开启。这个地址本身不可全局路由,纯粹是为了让 `auto_route` 把系统的 IPv6 默认路由也劫持到 tun 接口上。
+- `auto`:默认值。按当前网络自动选择 `proxy`/`block`/`off`,避免无 IPv6 网络或坏 IPv6 链路导致卡顿。
+- `block`:tun inbound 带一个 ULA(`fdfe:dcba:9876::1/126`)地址,让 `auto_route` 把选中应用的 IPv6 默认路由也纳入 tun;随后 DNS 层拒绝 AAAA,route 层插入 `{"ip_version": 6, "action": "reject"}`。这是"看起来有 IPv6 但探测不通"时的自动回退目标。
+- `proxy`:强制允许 IPv6。tun inbound 带 ULA,不插入 AAAA/reject 防线,IPv6 数据可以正常走 fake-ip/真实解析 + 域名/规则集分流。默认 `SBMAGIC_DNS_STRATEGY=ipv4_only` 不会自动改变;要真正解析到 AAAA,需要把 DNS 策略换成 `prefer_ipv4`/`prefer_ipv6`/`ipv6_only`。`ipv6_only` 会被校验为必须搭配 `SBMAGIC_IPV6_MODE=proxy`。
+- `off`:不下发 tun IPv6 地址,只作为排查路由冲突的调试选项。它不提供 IPv6 防泄漏保证,硬编码 IPv6 目的地可能绕过模块。
 - 如果不这么做,在一台真有 IPv6 出口的设备上,被代理的 APP 的 IPv6 流量会**完全绕过 tun**,直接走运营商网络的 IPv6 通路出去——这是一个会直接暴露真实 IP 的"代理穿透"问题,比"没适配 IPv6"更糟。
-- `SBMAGIC_IPV6=false`(默认)时,渲染管线额外加两条防线:
-  1. **DNS 层**:在 DNS 规则最前面插入 `{"query_type": ["AAAA"], "action": "reject"}`,任何域名的 AAAA 查询直接被拒绝,不管 `SBMAGIC_DNS_STRATEGY` 设的是什么——这是兜底,不依赖用户没改错别的设置。
-  2. **路由层**:在 `ip_is_private` 规则之前插入 `{"ip_version": 6, "action": "reject"}`,即便某个 APP 拿到了硬编码的 IPv6 地址(没走 DNS),数据面也直接拒绝,不会泄漏、也不会误判成"直连"。(用 `action: reject` 而不是旧的 `outbound: block`——`block` 特殊出站在 sing-box 1.13 已移除。)
-- `SBMAGIC_IPV6=true` 时,上面两条防线不插入,IPv6 数据可以正常走 fake-ip/真实解析 + 域名/规则集分流,和 IPv4 走一样的 route 引擎逻辑。**但**默认的 `SBMAGIC_DNS_STRATEGY=ipv4_only` 不会因为这个开关自动改变——开 IPv6 只是"允许"接管,要真正解析到 AAAA,还需要把 DNS 策略换成 `prefer_ipv4`(双栈优先 v4)之类的值。WebUI 的设置表单在这两个字段之间加了提示文案,避免用户以为开了 IPv6 开关就立刻生效。
 
 ### 4.5 DNS 鸡生蛋
 
@@ -182,11 +181,11 @@ APP 流量 + DNS 查询
 
 - **不再有"是否配 tun"的争议**——当前架构下 tun 就是唯一入口,`module/common/magicctl` 的 `render_config` 直接生成 `inbounds: [{"type":"tun", ...}]`。
 - route 引擎用 1.13+ 的 action 式语法(`sniff`/`hijack-dns`/`reject`),避免已废弃字段。**特别注意**:`block` 和 `dns` 两种特殊出站在 sing-box **1.13 已移除**,所以默认 `outbounds.json` 里**不再有** `{"type":"block"}`/`{"type":"dns"}`,拦截一律用路由 `action: reject`、DNS 接管用 `action: hijack-dns`。装在 1.13 二进制上若带着这两个旧出站会直接 `check` 失败、服务起不来。
-- 路由顺序固定为:DNS 接管 → 可选 sniff → IPv6 禁用时 reject → 私网/LAN 恒直连 → clash Direct/Global → 强制代理应用规则 → 强制免流应用规则 → 自动/混合应用规则 → `final: direct`。`SBMAGIC_PROXY_RULE_MODE` 控制代理策略(`off/global/bypass-cn`),`SBMAGIC_FREE_FLOW_RULE_MODE` 控制免流策略(`off/global`),不要再用布尔式 `SBMAGIC_FREE_FLOW` 或把"国内直连"和"免流出口"混在一个开关里。私网恒直连是全局规则,不会被 `global` 代理或免流策略覆盖,避免路由器后台、局域网设备、强制门户被送进远端出口。`SBMAGIC_SNIFF=false` 是默认值,避免每个进 TUN 的首连都付 sniff 成本;只有遇到应用不走系统 DNS、域名分流缺失时再开启。
+- 路由顺序固定为:DNS 接管 → 可选 sniff → `SBMAGIC_IPV6_MODE=block` 时 reject IPv6 → 私网/LAN 恒直连 → clash Direct/Global → 强制代理应用规则 → 强制免流应用规则 → 自动/混合应用规则 → `final: direct`。`SBMAGIC_PROXY_RULE_MODE` 控制代理策略(`off/global/bypass-cn`),`SBMAGIC_FREE_FLOW_RULE_MODE` 控制免流策略(`off/global`),不要再用布尔式 `SBMAGIC_FREE_FLOW` 或把"国内直连"和"免流出口"混在一个开关里。私网恒直连是全局规则,不会被 `global` 代理或免流策略覆盖,避免路由器后台、局域网设备、强制门户被送进远端出口。`SBMAGIC_SNIFF=false` 是默认值,避免每个进 TUN 的首连都付 sniff 成本;只有遇到应用不走系统 DNS、域名分流缺失时再开启。
 - tun inbound 显式写了几个"显式优于隐式"的字段,不依赖版本默认值:
   - `auto_redirect: true` 默认开启,在 Android 上主要加速 IPv4 TCP:让符合条件的 TCP 转发走内核 fast path,减少 userspace/gVisor L3/L4 转换成本。UDP、IPv6 以及 sing-box 自己发起的 Hysteria2/TUIC/QUIC 出站 socket 不吃这条优化。
   - `endpoint_independent_nat: true` 只在 `SBMAGIC_STACK=gvisor` 且 `SBMAGIC_ENDPOINT_INDEPENDENT_NAT=true` 时写入;默认关闭,因为 Full Cone NAT 对 P2P/语音/游戏有帮助,但官方说明有轻微吞吐成本。
-  - `udp_timeout: "5m"`(UDP NAT 映射超时,避免大量短连接 UDP 把 NAT 表撑大,行为可预期)。
+  - `udp_timeout`:默认 `SBMAGIC_UDP_TIMEOUT=auto`,渲染时变成实际时长。普通配置为 `5m`,开 Full Cone NAT 时为 `10m`,开 `SBMAGIC_REJECT_QUIC=true` 时为 `2m`;也可以手动填 Go duration(如 `2m`/`5m`/`10m`)。
 - `SBMAGIC_REJECT_QUIC=false` 默认关闭。开启时会拒绝公共 UDP/443,迫使浏览器/多数应用从 HTTP/3/QUIC 回退到 TCP,从而让应用侧 Web 流量尽量吃到 `auto_redirect` 的 TCP 快路径。它是性能/省电取舍开关,不是无副作用优化:弱网下 QUIC 可能更稳,所以需要真机 A/B 后再长期启用。
 - `SBMAGIC_STACK` 默认 `gvisor`,不是 sing-box 官方在带 gVisor tag 时的默认 `mixed`。原因是 `bench/results/avd-stack-benchmark-2026-06-30.md` 在 `Pixel_9_API_36_1_root` AVD 上验证: `system`/`mixed` 能通过 `check` 并启动,但 TCP 流量没有进入 tun inbound;`mixed` 的 TCP 半边也是 `system`,所以同样不可用。`system` 理论上少一层虚拟栈,但当前模块不把"理论更快"置于"实测可用"之前。
 - `cache_file` 开启;fake-ip 模式额外写 `store_fakeip: true`(见 §4.3)。
@@ -228,7 +227,7 @@ APP 流量 + DNS 查询
 - `magicctl stop` 和 `disable` 会**连 supervisor 一起停**(`stop_watchdog`),然后停核心。内部的 restart/rollback/崩溃自愈路径不杀 supervisor,只让它重新启动子进程。
 - Android 正常没有 systemd/systemctl,模块不能依赖 `systemctl`。当前默认优先尝试 Android init `.rc`,但保留 late_start 直接启动兜底,因为 Magisk/KernelSU/APatch 的 systemless rc 注入在不同 ROM 上仍可能受 SELinux 域、capability 或导入时机影响。
 - framework 级 `ProcessRecord#setPersistent(true)` / `setMaxAdj(ProcessList.SYSTEM_ADJ)` 不是 root shell 能调用的公开能力,需要改 `system_server`、定制 ROM 或 Xposed/LSPosed hook。模块默认不做这种高侵入注入;rc 路径使用 init 原生 `oom_score_adjust -900`,direct/fallback 路径可选 `SBMAGIC_OOM_PROTECT` 写 `/proc/<pid>/oom_score_adj`,用于验证/缓解 LMKD 空闲回收。
-- `magicctl netwatch` 是**事件式网络恢复器**:阻塞在 `ip monitor route address link`,只在链路/地址/路由变化(例如休眠恢复、Wi-Fi/蜂窝切换)后检查本机 API 与 TUN 状态。健康检查用轻量 `/configs`,并在重启前做短重试;健康的自身 TUN 事件会被忽略,避免 auto_route/TUN 维护事件反过来触发恢复检查。API 健康但 TUN 接口明确不存在时也会 restart,覆盖"进程没死但代理路径坏"的半坏状态。默认不会在 API/TUN 健康时关闭长连接;`SBMAGIC_NETWORK_CHANGE_FLUSH=true` 时才会主动关闭旧连接让传输层重拨。它不做固定外网测速,避免网络本身断开时反复重启;默认 `SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30` 秒,防止 ROM 连续路由事件造成频繁断连。`ip monitor` 子进程会写入 `runtime/netwatch.monitor.pid`,stop/uninstall/trap 都会清理,避免管道子进程孤儿化。
+- `magicctl netwatch` 是**事件式网络恢复器**:阻塞在 `ip monitor route address link`,只在链路/地址/路由变化(例如休眠恢复、Wi-Fi/蜂窝切换)后检查本机 API 与 TUN 状态。健康检查用轻量 `/configs`,并在重启前做短重试;健康的自身 TUN 事件会被忽略,避免 auto_route/TUN 维护事件反过来触发恢复检查。API 健康但 TUN 接口明确不存在时也会 restart,覆盖"进程没死但代理路径坏"的半坏状态。默认不会在 API/TUN 健康时关闭长连接;`SBMAGIC_NETWORK_CHANGE_FLUSH=true` 时才会主动关闭旧连接。它不做固定外网测速,避免网络本身断开时反复重启。恢复行为可细调:`SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30`、`SBMAGIC_NETWORK_SETTLE_DELAY=2`、`SBMAGIC_NETWORK_HEALTH_RETRIES=2`、`SBMAGIC_NETWORK_HEALTH_RETRY_DELAY=2`、`SBMAGIC_NETWORK_OWN_TUN_GRACE=12`。`ip monitor` 子进程会写入 `runtime/netwatch.monitor.pid`,stop/uninstall/trap 都会清理,避免管道子进程孤儿化。
 
 ### 7.3 配置回退与崩溃自愈
 
@@ -358,7 +357,7 @@ APP 流量 + DNS 查询
 ### 9.5 网络 / tun
 - `SBMAGIC_PROCESS_NAME`(默认 `netd-helper`,运行时二进制文件名,改名后 `reload` 会先停旧进程再用新名启动)
 - `SBMAGIC_MTU`、`SBMAGIC_INTERFACE`(默认 `utun0`,避免和模块 id 同名暴露身份)
-- `SBMAGIC_IPV6`
+- `SBMAGIC_IPV6_MODE`(`auto`/`proxy`/`block`/`off`,默认 `auto`)
 - `SBMAGIC_STACK`(默认 `gvisor`;`system`/`mixed` 保留为实验选项,不作为默认)
 - `SBMAGIC_SNIFF`(默认 `false`;关闭时不写入 sniff action,降低所有进 TUN 应用的首连成本)
 - `SBMAGIC_SNIFF_TIMEOUT`(默认 `100ms`;仅 `SBMAGIC_SNIFF=true` 时生效,极慢首包场景可适当调大)
@@ -367,7 +366,7 @@ APP 流量 + DNS 查询
 - `SBMAGIC_INIT_SERVICE`:默认 `true`;开机时优先尝试 Android init service `netd_helper`,失败自动走 late_start 直接启动。
 - `SBMAGIC_WATCHDOG`:无轮询 supervisor 开关;开启时由父进程 `wait` 子进程退出,不是定时轮询。
 - `SBMAGIC_WATCHDOG_INTERVAL`:last-good 晋升延迟,默认 300s。
-- `SBMAGIC_NETWORK_WATCH` / `SBMAGIC_NETWORK_CHANGE_FLUSH` / `SBMAGIC_NETWORK_RECOVERY_COOLDOWN`:网络事件监听默认开启,冷却 30 秒;`SBMAGIC_NETWORK_CHANGE_FLUSH` 默认关闭,所以 API 健康时不会主动切断 xHTTP/gRPC/WS 长连接。只有设备切网后旧连接经常假活时才建议打开 flush。
+- `SBMAGIC_NETWORK_WATCH` / `SBMAGIC_NETWORK_CHANGE_FLUSH` / `SBMAGIC_NETWORK_RECOVERY_COOLDOWN` / `SBMAGIC_NETWORK_SETTLE_DELAY` / `SBMAGIC_NETWORK_HEALTH_RETRIES` / `SBMAGIC_NETWORK_HEALTH_RETRY_DELAY` / `SBMAGIC_NETWORK_OWN_TUN_GRACE`:网络事件监听默认开启,冷却 30 秒;`SBMAGIC_NETWORK_CHANGE_FLUSH` 默认关闭,所以 API 健康时不会主动切断 xHTTP/gRPC/WS 长连接。只有设备切网后旧连接经常假活时才建议打开 flush。
 - `SBMAGIC_OOM_PROTECT` / `SBMAGIC_OOM_SCORE_ADJ`:高级选项,默认关闭;用于 direct/fallback 路径尝试写 `/proc/<pid>/oom_score_adj` 降低 LMKD 回收概率。init rc 路径已经声明 `oom_score_adjust -900`。它不是 Android framework 的 `setPersistent(true)`,也不会把 native 进程注册成系统 persistent 进程。
 - 电池白名单开关(Doze 对抗,需要 WebUI 引导用户去系统设置加白名单,模块本身不能直接改)
 
@@ -429,9 +428,9 @@ APP 流量 + DNS 查询
 - clash API 只监听 `127.0.0.1` + 随机高端口,凭据 root-only,WebUI 通过 `magicctl api` 转发而不是页面直连。默认还有 OUTPUT owner 防火墙,普通 APP 不应能连到该端口拿 401 指纹;若目标 ROM 缺少 iptables/owner match,会自动降级为随机端口 + Bearer secret,见 §8.2。
 
 ### 14.3 IPv6
-- 链路 v6 不完整 → 走 v6 通不了 → 卡。`SBMAGIC_IPV6=false` 是默认,建议先用 v4 跑通再开。fake-ip 模式下 v6 关闭则不返回 fake v6(见 §4.3)。
-- `SBMAGIC_IPV6=false` 不是"放过 IPv6 不管",而是"接管 IPv6 路由后整体拦截",防止真有 v6 出口的设备绕过代理泄漏,见 §4.4。
-- 开 `SBMAGIC_IPV6=true` 后如果没把 `SBMAGIC_DNS_STRATEGY` 从默认 `ipv4_only` 改掉,实际效果是"看起来开了但没生效"(不会有任何变化),这是预期行为,不是 bug,见 §4.4。
+- 链路 v6 不完整 → 走 v6 通不了 → 卡。默认 `SBMAGIC_IPV6_MODE=auto`,会按当前 IPv6 路由自动选择有效模式。fake-ip 模式下非有效 `proxy` 则不返回 fake v6(见 §4.3)。
+- `SBMAGIC_IPV6_MODE=block` 不是"放过 IPv6 不管",而是"接管 IPv6 路由后整体拦截",防止真有 v6 出口的设备绕过代理泄漏,见 §4.4。
+- `SBMAGIC_IPV6_MODE=auto` 时,没有默认 IPv6 出口会按 `off` 渲染;有 IPv6 但短探测不通会按 `block` 渲染;两者都会把本次渲染的 DNS 策略压到 `ipv4_only`;切到可用 IPv6 网络后 netwatch 会重新渲染并恢复 `proxy`。
 
 ### 14.4 MTU/MSS
 - `SBMAGIC_MTU` 默认 1400,够保守;层层封装后仍黑洞需考虑 MSS clamping(sing-box tun 本身不直接提供,需出站层配合或调小 MTU)。
@@ -498,7 +497,7 @@ APP 流量 + DNS 查询
 - [ ] DNS 用 1.12+ 新 server 格式(type+server)、规则用 action 式;旧字段(`address` URL、顶层 `fakeip`)不下发,`reverse_mapping` 默认开启
 - [ ] `block`/`dns` 旧特殊出站已移除(1.13 删除),拦截用 `action: reject`、DNS 用 `hijack-dns`
 - [ ] `route.default_domain_resolver` 已设(多 DNS server 时解析节点域名必需,见 §4.6)
-- [ ] tun 默认 `auto_redirect=true` 加速 IPv4 TCP;`SBMAGIC_REJECT_QUIC=false` 仅作为可选 HTTP/3 回退开关;gvisor stack 下仅按需启用 `endpoint_independent_nat`,默认关闭以降低转发成本;所有 stack 显式 `udp_timeout: "5m"`;fake-ip 模式显式 `store_fakeip: true`
+- [ ] tun 默认 `auto_redirect=true` 加速 IPv4 TCP;`SBMAGIC_REJECT_QUIC=false` 仅作为可选 HTTP/3 回退开关;gvisor stack 下仅按需启用 `endpoint_independent_nat`,默认关闭以降低转发成本;`SBMAGIC_UDP_TIMEOUT=auto` 渲染为实际 duration;fake-ip 模式显式 `store_fakeip: true`
 
 **应用配置 / 并发(详见 §7.4)**
 - [ ] 配置改动走 `reload`(校验后重启),不依赖 clash API 热重载(那是空桩)
@@ -506,10 +505,11 @@ APP 流量 + DNS 查询
 - [ ] `stop`/`disable` 连看门狗一起停,不会被自动拉起
 
 **IPv6(详见 §4.4)**
-- [ ] tun 始终带 IPv6 地址,claim 默认 v6 路由(不管 `SBMAGIC_IPV6` 开关)
-- [ ] `SBMAGIC_IPV6=false` 时:DNS 层拒绝 AAAA + 路由层 `action: reject` 所有 v6 目的地,双重防线
-- [ ] `SBMAGIC_IPV6=true` 时额外提示用户调整 `SBMAGIC_DNS_STRATEGY`,否则"开了等于没开"
-- [ ] fake-ip 的 v6 段只在 `SBMAGIC_IPV6=true` 时下发
+- [ ] `SBMAGIC_IPV6_MODE=block` 时 tun 带 IPv6 地址并 claim 默认 v6 路由,DNS 层拒绝 AAAA + route 层 `action: reject` 所有 v6 目的地
+- [ ] `SBMAGIC_IPV6_MODE=auto` 时运行时有效模式随当前 IPv6 路由变成 `proxy`/`block`/`off`
+- [ ] `SBMAGIC_IPV6_MODE=proxy` 时强制允许 IPv6,不被自动回退覆盖
+- [ ] `SBMAGIC_IPV6_MODE=off` 时不下发 tun IPv6 地址,只作为排查路由冲突的调试项
+- [ ] fake-ip 的 v6 段只在 `SBMAGIC_IPV6_MODE=proxy` 时下发
 
 **回退与崩溃自愈(详见 §7.3)**
 - [ ] 每个配置源文件 `config set` 自动留 `.bak`,`config rollback <key>` 可逆切换

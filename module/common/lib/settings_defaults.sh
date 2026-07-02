@@ -1,0 +1,99 @@
+# shellcheck shell=sh
+# Loaded by magicctl. Do not execute directly.
+
+load_settings_values() {
+  SBMAGIC_ENABLED=true
+  SBMAGIC_BOOT_START=false
+  SBMAGIC_INIT_SERVICE=true
+  SBMAGIC_WATCHDOG=true
+  SBMAGIC_WATCHDOG_INTERVAL=300
+  SBMAGIC_NETWORK_WATCH=true
+  SBMAGIC_NETWORK_CHANGE_FLUSH=false
+  SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30
+  SBMAGIC_NETWORK_SETTLE_DELAY=2
+  SBMAGIC_NETWORK_HEALTH_RETRIES=2
+  SBMAGIC_NETWORK_HEALTH_RETRY_DELAY=2
+  SBMAGIC_NETWORK_OWN_TUN_GRACE=12
+  SBMAGIC_STACK=gvisor
+  SBMAGIC_PROCESS_NAME=netd-helper
+  SBMAGIC_INTERFACE=utun0
+  SBMAGIC_MTU=1400
+  SBMAGIC_IPV6=true
+  SBMAGIC_IPV6_MODE=auto
+  SBMAGIC_AUTO_ROUTE=true
+  SBMAGIC_AUTO_REDIRECT=true
+  SBMAGIC_STRICT_ROUTE=true
+  SBMAGIC_ENDPOINT_INDEPENDENT_NAT=false
+  SBMAGIC_REJECT_QUIC=false
+  SBMAGIC_PACKAGE_MODE=white
+  SBMAGIC_PROXY_RULE_MODE=bypass-cn
+  SBMAGIC_FREE_FLOW_RULE_MODE=off
+  SBMAGIC_MIXED_RULE_PRIORITY=proxy
+  SBMAGIC_DNS_MODE=real-ip
+  SBMAGIC_DNS_STRATEGY=ipv4_only
+  SBMAGIC_DNS_REVERSE_MAPPING=true
+  SBMAGIC_DNS_LOCAL_TYPE=udp
+  SBMAGIC_DNS_LOCAL_SERVER=223.5.5.5
+  SBMAGIC_DNS_LOCAL_TLS_SERVER_NAME=
+  SBMAGIC_DNS_REMOTE_TYPE=https
+  SBMAGIC_DNS_REMOTE_SERVER=1.1.1.1
+  SBMAGIC_DNS_REMOTE_TLS_SERVER_NAME=cloudflare-dns.com
+  SBMAGIC_DNS_FINAL=remote
+  SBMAGIC_FAKEIP4=198.18.0.0/15
+  SBMAGIC_FAKEIP6=fc00::/18
+  SBMAGIC_API_HOST=127.0.0.1
+  SBMAGIC_API_PORT=auto
+  SBMAGIC_API_FIREWALL=true
+  SBMAGIC_API_MODE=Rule
+  SBMAGIC_RULESET_DOWNLOAD_DETOUR=direct
+  SBMAGIC_RULE_UPDATE_INTERVAL=168h
+  SBMAGIC_UDP_TIMEOUT=auto
+  SBMAGIC_SNIFF=false
+  SBMAGIC_SNIFF_TIMEOUT=100ms
+  SBMAGIC_OOM_PROTECT=false
+  SBMAGIC_OOM_SCORE_ADJ=-900
+
+  if [ -f "$SETTINGS_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$SETTINGS_FILE"
+  fi
+
+  normalize_runtime_settings
+}
+
+normalize_runtime_settings() {
+  case "$SBMAGIC_IPV6_MODE" in
+    "")
+      if [ "$SBMAGIC_IPV6" = "true" ]; then
+        SBMAGIC_IPV6_MODE=proxy
+        SBMAGIC_IPV6=true
+      else
+        SBMAGIC_IPV6_MODE=block
+        SBMAGIC_IPV6=false
+      fi
+      ;;
+    auto|proxy)
+      SBMAGIC_IPV6=true
+      ;;
+    block|off)
+      SBMAGIC_IPV6=false
+      ;;
+  esac
+}
+
+effective_udp_timeout() {
+  case "$SBMAGIC_UDP_TIMEOUT" in
+    auto|"")
+      if [ "$SBMAGIC_ENDPOINT_INDEPENDENT_NAT" = "true" ]; then
+        echo 10m
+      elif [ "$SBMAGIC_REJECT_QUIC" = "true" ]; then
+        echo 2m
+      else
+        echo 5m
+      fi
+      ;;
+    *)
+      echo "$SBMAGIC_UDP_TIMEOUT"
+      ;;
+  esac
+}

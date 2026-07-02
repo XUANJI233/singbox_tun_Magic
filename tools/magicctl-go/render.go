@@ -21,6 +21,9 @@ func renderConfig(p paths) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := applyIPv6RuntimeState(&s, p.ipv6StateFile); err != nil {
+		return nil, err
+	}
 
 	outbounds, err := readJSONFile[[]any](p.outboundsFile)
 	if err != nil {

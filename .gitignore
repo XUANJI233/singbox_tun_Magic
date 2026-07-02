@@ -9,3 +9,6 @@
 /module/bin/applist.dex
 /module/defaults/rulesets/*.srs
 .claude/
+
+/tools/magicctl-go/magicctl-go.exe
+/tools/magic-fetch/magic-fetch.exe
