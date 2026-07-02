@@ -9,6 +9,7 @@ import (
 
 type settings struct {
 	Enabled                bool
+	SettingsVersion        string
 	Stack                  string
 	ProcessName            string
 	Interface              string
@@ -17,6 +18,9 @@ type settings struct {
 	IPv6Mode               string
 	AutoRoute              bool
 	AutoRedirect           bool
+	TCPCongestionControl   string
+	UDPNativeMode          string
+	UDPNativeOutbound      string
 	StrictRoute            bool
 	EndpointIndependentNAT bool
 	RejectQUIC             bool
@@ -50,14 +54,18 @@ type settings struct {
 func defaultSettings() map[string]string {
 	return map[string]string{
 		"SBMAGIC_ENABLED":                    "true",
+		"SBMAGIC_SETTINGS_VERSION":           "2",
 		"SBMAGIC_STACK":                      "gvisor",
 		"SBMAGIC_PROCESS_NAME":               "netd-helper",
 		"SBMAGIC_INTERFACE":                  "utun0",
-		"SBMAGIC_MTU":                        "1400",
+		"SBMAGIC_MTU":                        "9000",
 		"SBMAGIC_IPV6":                       "true",
 		"SBMAGIC_IPV6_MODE":                  "auto",
 		"SBMAGIC_AUTO_ROUTE":                 "true",
 		"SBMAGIC_AUTO_REDIRECT":              "true",
+		"SBMAGIC_TCP_CONGESTION_CONTROL":     "system",
+		"SBMAGIC_UDP_NATIVE_MODE":            "off",
+		"SBMAGIC_UDP_NATIVE_OUTBOUND":        "",
 		"SBMAGIC_STRICT_ROUTE":               "true",
 		"SBMAGIC_ENDPOINT_INDEPENDENT_NAT":   "false",
 		"SBMAGIC_REJECT_QUIC":                "false",
@@ -180,6 +188,7 @@ func parseSettings(v map[string]string) (settings, error) {
 
 	s := settings{
 		Enabled:                enabled,
+		SettingsVersion:        v["SBMAGIC_SETTINGS_VERSION"],
 		Stack:                  v["SBMAGIC_STACK"],
 		ProcessName:            v["SBMAGIC_PROCESS_NAME"],
 		Interface:              v["SBMAGIC_INTERFACE"],
@@ -188,6 +197,9 @@ func parseSettings(v map[string]string) (settings, error) {
 		IPv6Mode:               ipv6Mode,
 		AutoRoute:              autoRoute,
 		AutoRedirect:           autoRedirect,
+		TCPCongestionControl:   v["SBMAGIC_TCP_CONGESTION_CONTROL"],
+		UDPNativeMode:          v["SBMAGIC_UDP_NATIVE_MODE"],
+		UDPNativeOutbound:      v["SBMAGIC_UDP_NATIVE_OUTBOUND"],
 		StrictRoute:            strictRoute,
 		EndpointIndependentNAT: endpointIndependentNAT,
 		RejectQUIC:             rejectQUIC,
@@ -268,6 +280,15 @@ func validateRenderSettings(s settings) error {
 	}
 	if err := checkOne(s.Stack, "SBMAGIC_STACK", "gvisor", "system", "mixed"); err != nil {
 		return err
+	}
+	if err := checkOne(s.TCPCongestionControl, "SBMAGIC_TCP_CONGESTION_CONTROL", "system", "bbr", "cubic", "reno"); err != nil {
+		return err
+	}
+	if err := checkOne(s.UDPNativeMode, "SBMAGIC_UDP_NATIVE_MODE", "off", "quic"); err != nil {
+		return err
+	}
+	if s.UDPNativeMode != "off" && s.UDPNativeOutbound == "" {
+		return fmt.Errorf("SBMAGIC_UDP_NATIVE_OUTBOUND is required when SBMAGIC_UDP_NATIVE_MODE=%s", s.UDPNativeMode)
 	}
 	if err := checkOne(s.IPv6Mode, "SBMAGIC_IPV6_MODE", "auto", "proxy", "block", "off"); err != nil {
 		return err

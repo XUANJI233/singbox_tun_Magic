@@ -66,6 +66,7 @@ status() {
       ;;
   esac
   echo "enabled=$SBMAGIC_ENABLED"
+  echo "settings_version=$SBMAGIC_SETTINGS_VERSION"
   if [ -n "$status_config_error" ]; then
     echo "config_valid=false"
     echo "config_error=$status_config_error"
@@ -156,6 +157,12 @@ status() {
   echo "sniff=$SBMAGIC_SNIFF"
   echo "sniff_timeout=$SBMAGIC_SNIFF_TIMEOUT"
   echo "auto_redirect=$SBMAGIC_AUTO_REDIRECT"
+  echo "tcp_congestion_control=$SBMAGIC_TCP_CONGESTION_CONTROL"
+  if [ -r /proc/sys/net/ipv4/tcp_congestion_control ]; then
+    echo "tcp_congestion_control_current=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo unknown)"
+  fi
+  echo "udp_native_mode=$SBMAGIC_UDP_NATIVE_MODE"
+  echo "udp_native_outbound=$SBMAGIC_UDP_NATIVE_OUTBOUND"
   echo "endpoint_independent_nat=$SBMAGIC_ENDPOINT_INDEPENDENT_NAT"
   echo "reject_quic=$SBMAGIC_REJECT_QUIC"
   echo "udp_timeout=$SBMAGIC_UDP_TIMEOUT"

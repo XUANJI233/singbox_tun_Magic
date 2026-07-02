@@ -59,7 +59,12 @@
       "seq_key": "X-Request-Seq",
       "sc_max_each_post_bytes": "1000000",
       "sc_min_posts_interval_ms": "30",
-      "uplink_http_method": "POST"
+      "uplink_http_method": "POST",
+      "xmux": {
+        "max_concurrency": "4-8",
+        "h_max_request_times": "80-120",
+        "h_max_reusable_secs": "20-25"
+      }
     }
   },
   {

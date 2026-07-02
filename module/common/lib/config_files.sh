@@ -19,6 +19,12 @@ config_get() {
   cat "$file" 2>/dev/null
 }
 
+config_migration_notice() {
+  [ -f "$MIGRATION_NOTICE_FILE" ] || return 0
+  cat "$MIGRATION_NOTICE_FILE" 2>/dev/null || true
+  rm -f "$MIGRATION_NOTICE_FILE"
+}
+
 config_set() {
   key="$1"
   file="$(config_file_for "$key")" || die "unknown config key: $key"

@@ -14,7 +14,9 @@ func renderRoute(s settings, p paths, proxyPkgs, freeFlowPkgs []string, ruleSets
 		map[string]any{"ip_is_private": true, "outbound": "direct"},
 		map[string]any{"clash_mode": "Direct", "outbound": "direct"},
 	)
-	if s.RejectQUIC {
+	if s.UDPNativeMode == "quic" {
+		rules = append(rules, clashGlobalUDPNativeRule(s))
+	} else if s.RejectQUIC {
 		rules = append(rules, clashGlobalQUICRejectRule())
 	}
 	rules = append(rules, map[string]any{"clash_mode": "Global", "outbound": "proxy"})
@@ -61,7 +63,9 @@ func proxyRules(s settings, packages []string, scoped bool) []any {
 		return nil
 	case "global":
 		rules := []any{}
-		if s.RejectQUIC {
+		if s.UDPNativeMode == "quic" {
+			rules = append(rules, udpNativeQUICRule(s, pkg))
+		} else if s.RejectQUIC {
 			rules = append(rules, quicRejectRule(pkg))
 		}
 		rules = append(rules, mergeRule(map[string]any{"outbound": "proxy"}, pkg))
@@ -77,7 +81,9 @@ func proxyRules(s settings, packages []string, scoped bool) []any {
 				"outbound": "direct",
 			}, pkg),
 		}
-		if s.RejectQUIC {
+		if s.UDPNativeMode == "quic" {
+			rules = append(rules, udpNativeQUICRule(s, pkg))
+		} else if s.RejectQUIC {
 			rules = append(rules, quicRejectRule(pkg))
 		}
 		rules = append(rules, mergeRule(map[string]any{"outbound": "proxy"}, pkg))
@@ -123,8 +129,20 @@ func quicRejectRule(extra map[string]any) map[string]any {
 	}, extra)
 }
 
+func udpNativeQUICRule(s settings, extra map[string]any) map[string]any {
+	return mergeRule(map[string]any{
+		"network":  "udp",
+		"port":     []int{443},
+		"outbound": s.UDPNativeOutbound,
+	}, extra)
+}
+
 func clashGlobalQUICRejectRule() map[string]any {
 	return mergeRule(quicRejectRule(nil), map[string]any{"clash_mode": "Global"})
+}
+
+func clashGlobalUDPNativeRule(s settings) map[string]any {
+	return mergeRule(udpNativeQUICRule(s, nil), map[string]any{"clash_mode": "Global"})
 }
 
 func routeRuleSets(s settings, p paths) []any {

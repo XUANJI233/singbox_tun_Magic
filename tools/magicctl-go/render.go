@@ -29,6 +29,10 @@ func renderConfig(p paths) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("outbounds: %w", err)
 	}
+	outbounds, err = prepareOutbounds(&s, outbounds)
+	if err != nil {
+		return nil, err
+	}
 
 	dnsDirect, err := readListFile(p.dnsDirectFile)
 	if err != nil {

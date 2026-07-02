@@ -63,6 +63,226 @@ func TestRejectQUICStaysOnProxyPaths(t *testing.T) {
 	}
 }
 
+func TestRejectQUICDefaultOff(t *testing.T) {
+	dir := testDataDir(t, map[string]string{})
+
+	cfg, err := renderConfig(newPaths(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := cfg["route"].(map[string]any)
+	rules := route["rules"].([]any)
+
+	for _, raw := range rules {
+		rule := raw.(map[string]any)
+		if rule["action"] == "reject" && rule["network"] == "udp" {
+			t.Fatalf("default profile should not reject UDP/443: %#v", rules)
+		}
+	}
+}
+
+func TestUDPNativeQUICRoutePrecedesReject(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": strings.Join([]string{
+			"SBMAGIC_UDP_NATIVE_MODE=quic",
+			"SBMAGIC_UDP_NATIVE_OUTBOUND=udp-node",
+			"SBMAGIC_REJECT_QUIC=true",
+			"",
+		}, "\n"),
+		"outbounds.json": `[{"type":"selector","tag":"proxy","outbounds":["node","direct"]},{"type":"vless","tag":"node","server":"example.com","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000"},{"type":"hysteria2","tag":"udp-node","server":"example.com","server_port":443,"password":"secret"},{"type":"direct","tag":"direct"},{"type":"direct","tag":"free-flow"}]`,
+	})
+
+	cfg, err := renderConfig(newPaths(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := cfg["route"].(map[string]any)
+	rules := route["rules"].([]any)
+
+	hasUDPNative := false
+	for _, raw := range rules {
+		rule := raw.(map[string]any)
+		if rule["network"] == "udp" && rule["outbound"] == "udp-node" {
+			hasUDPNative = true
+		}
+		if rule["network"] == "udp" && rule["action"] == "reject" {
+			t.Fatalf("UDP-native mode should route QUIC instead of rejecting it: %#v", rules)
+		}
+	}
+	if !hasUDPNative {
+		t.Fatalf("missing UDP-native QUIC rule: %#v", rules)
+	}
+}
+
+func TestUDPNativeDefaultDoesNotNeedPackageLookup(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": strings.Join([]string{
+			"SBMAGIC_UDP_NATIVE_MODE=quic",
+			"SBMAGIC_UDP_NATIVE_OUTBOUND=udp-node",
+			"",
+		}, "\n"),
+		"outbounds.json":     `[{"type":"selector","tag":"proxy","outbounds":["node","udp-node","direct"]},{"type":"vless","tag":"node","server":"example.com","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000"},{"type":"tuic","tag":"udp-node","server":"example.com","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000","password":"secret"},{"type":"direct","tag":"direct"},{"type":"direct","tag":"free-flow"}]`,
+		"packages.include":   "org.example.browser\n",
+		"packages.proxy":     "org.example.browser\n",
+		"packages.free-flow": "",
+	})
+
+	cfg, err := renderConfig(newPaths(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := mustJSON(t, cfg)
+	if strings.Contains(string(data), `"package_name"`) {
+		t.Fatalf("default UDP-native route should not need package lookup:\n%s", data)
+	}
+	if !strings.Contains(string(data), `"outbound":"udp-node"`) {
+		t.Fatalf("missing UDP-native outbound rule:\n%s", data)
+	}
+}
+
+func TestUDPNativeBypassCNKeepsDirectBeforeUDP(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": strings.Join([]string{
+			"SBMAGIC_UDP_NATIVE_MODE=quic",
+			"SBMAGIC_UDP_NATIVE_OUTBOUND=udp-node",
+			"",
+		}, "\n"),
+		"outbounds.json": `[{"type":"selector","tag":"proxy","outbounds":["node","udp-node","direct"]},{"type":"vless","tag":"node","server":"example.com","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000"},{"type":"hysteria2","tag":"udp-node","server":"example.com","server_port":443,"password":"secret"},{"type":"direct","tag":"direct"},{"type":"direct","tag":"free-flow"}]`,
+	})
+
+	cfg, err := renderConfig(newPaths(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := cfg["route"].(map[string]any)["rules"].([]any)
+	directIndex := -1
+	udpIndex := -1
+	for i, raw := range rules {
+		rule := raw.(map[string]any)
+		if rule["outbound"] == "direct" {
+			if _, hasRuleSet := rule["rule_set"]; hasRuleSet {
+				directIndex = i
+			}
+		}
+		if rule["outbound"] == "udp-node" {
+			udpIndex = i
+		}
+	}
+	if directIndex < 0 || udpIndex < 0 || directIndex > udpIndex {
+		t.Fatalf("bypass-cn direct rules should stay before UDP-native fallback: %#v", rules)
+	}
+}
+
+func TestUDPNativeRouteRequiresExistingOutbound(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": strings.Join([]string{
+			"SBMAGIC_UDP_NATIVE_MODE=quic",
+			"SBMAGIC_UDP_NATIVE_OUTBOUND=missing",
+			"",
+		}, "\n"),
+	})
+
+	_, err := renderConfig(newPaths(dir))
+	if err == nil || !strings.Contains(err.Error(), "SBMAGIC_UDP_NATIVE_OUTBOUND") {
+		t.Fatalf("expected missing UDP-native outbound to fail, got %v", err)
+	}
+}
+
+func TestUDPNativeXHTTPWithMixedALPNCreatesH3Clone(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": strings.Join([]string{
+			"SBMAGIC_UDP_NATIVE_MODE=quic",
+			"SBMAGIC_UDP_NATIVE_OUTBOUND=xhttp-h2",
+			"",
+		}, "\n"),
+		"outbounds.json": `[{"type":"selector","tag":"proxy","outbounds":["xhttp-h2","direct"]},{"type":"vless","tag":"xhttp-h2","server":"example.com","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000","tls":{"enabled":true,"alpn":["h2","h3"]},"transport":{"type":"xhttp","path":"/","x_padding_bytes":"100-1000"}},{"type":"direct","tag":"direct"},{"type":"direct","tag":"free-flow"}]`,
+	})
+
+	cfg, err := renderConfig(newPaths(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbounds := cfg["outbounds"].([]any)
+	clone := findOutboundByTag(outbounds, "__sbmagic_udp_h3_xhttp-h2")
+	if clone == nil {
+		t.Fatalf("missing internal XHTTP H3 clone: %#v", outbounds)
+	}
+	alpn := clone["tls"].(map[string]any)["alpn"].([]any)
+	if len(alpn) != 1 || alpn[0] != "h3" {
+		t.Fatalf("internal XHTTP clone must force h3 only: %#v", clone)
+	}
+	rules := cfg["route"].(map[string]any)["rules"].([]any)
+	hasCloneRoute := false
+	for _, raw := range rules {
+		rule := raw.(map[string]any)
+		if rule["network"] == "udp" && rule["outbound"] == "__sbmagic_udp_h3_xhttp-h2" {
+			hasCloneRoute = true
+		}
+	}
+	if !hasCloneRoute {
+		t.Fatalf("missing UDP-native route to internal XHTTP H3 clone: %#v", rules)
+	}
+}
+
+func TestUDPNativeXHTTPAllowsH3FirstWithH2Fallback(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": strings.Join([]string{
+			"SBMAGIC_UDP_NATIVE_MODE=quic",
+			"SBMAGIC_UDP_NATIVE_OUTBOUND=xhttp-h3",
+			"",
+		}, "\n"),
+		"outbounds.json": `[{"type":"selector","tag":"proxy","outbounds":["xhttp-h3","direct"]},{"type":"vless","tag":"xhttp-h3","server":"example.com","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000","tls":{"enabled":true,"alpn":["h3","h2"]},"transport":{"type":"xhttp","path":"/","x_padding_bytes":"100-1000"}},{"type":"direct","tag":"direct"},{"type":"direct","tag":"free-flow"}]`,
+	})
+
+	cfg, err := renderConfig(newPaths(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := mustJSON(t, cfg)
+	if !strings.Contains(string(data), `"outbound":"xhttp-h3"`) {
+		t.Fatalf("missing XHTTP H3 UDP-native route:\n%s", data)
+	}
+	if findOutboundByTag(cfg["outbounds"].([]any), "__sbmagic_udp_h3_xhttp-h3") != nil {
+		t.Fatalf("h3-first XHTTP outbound should not need an internal clone:\n%s", data)
+	}
+}
+
+func TestUDPNativeXHTTPWithoutH3Rejected(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": strings.Join([]string{
+			"SBMAGIC_UDP_NATIVE_MODE=quic",
+			"SBMAGIC_UDP_NATIVE_OUTBOUND=xhttp-h2",
+			"",
+		}, "\n"),
+		"outbounds.json": `[{"type":"selector","tag":"proxy","outbounds":["xhttp-h2","direct"]},{"type":"vless","tag":"xhttp-h2","server":"example.com","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000","tls":{"enabled":true,"alpn":["h2"]},"transport":{"type":"xhttp","path":"/","x_padding_bytes":"100-1000"}},{"type":"direct","tag":"direct"},{"type":"direct","tag":"free-flow"}]`,
+	})
+
+	_, err := renderConfig(newPaths(dir))
+	if err == nil || !strings.Contains(err.Error(), "is not a UDP-native outbound") {
+		t.Fatalf("expected xhttp without h3 to fail, got %v", err)
+	}
+}
+
+func TestUDPNativeAllowsKCPTransport(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": strings.Join([]string{
+			"SBMAGIC_UDP_NATIVE_MODE=quic",
+			"SBMAGIC_UDP_NATIVE_OUTBOUND=kcp-node",
+			"",
+		}, "\n"),
+		"outbounds.json": `[{"type":"selector","tag":"proxy","outbounds":["kcp-node","direct"]},{"type":"vless","tag":"kcp-node","server":"example.com","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000","transport":{"type":"kcp"}},{"type":"direct","tag":"direct"},{"type":"direct","tag":"free-flow"}]`,
+	})
+
+	cfg, err := renderConfig(newPaths(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := mustJSON(t, cfg)
+	if !strings.Contains(string(data), `"outbound":"kcp-node"`) {
+		t.Fatalf("missing KCP UDP-native route:\n%s", data)
+	}
+}
+
 func TestFakeIPIPv6Render(t *testing.T) {
 	dir := testDataDir(t, map[string]string{
 		"settings.env": strings.Join([]string{
@@ -240,6 +460,17 @@ func TestIPv6OnlyDNSRequiresProxyIPv6Mode(t *testing.T) {
 	_, err := renderConfig(newPaths(dir))
 	if err == nil || !strings.Contains(err.Error(), "SBMAGIC_IPV6_MODE=proxy") {
 		t.Fatalf("expected ipv6_only strategy to require proxy IPv6 mode, got %v", err)
+	}
+}
+
+func TestTCPCongestionControlValidation(t *testing.T) {
+	dir := testDataDir(t, map[string]string{
+		"settings.env": "SBMAGIC_TCP_CONGESTION_CONTROL=fast\n",
+	})
+
+	_, err := renderConfig(newPaths(dir))
+	if err == nil || !strings.Contains(err.Error(), "SBMAGIC_TCP_CONGESTION_CONTROL") {
+		t.Fatalf("expected invalid TCP congestion control to fail, got %v", err)
 	}
 }
 

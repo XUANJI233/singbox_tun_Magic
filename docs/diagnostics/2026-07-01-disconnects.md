@@ -442,11 +442,13 @@ promote-last-good delta_jiffies=0
 ### 仍需注意的性能/稳定性取舍
 
 - **gvisor 栈仍是主要转发开销**:AVD 中 system/mixed 不是可靠路径,所以默认保留 gvisor。真实机若 system 栈可用,仍可单独对比,但不能作为默认。
-- **远程 DNS 经 proxy**:`dns.final=remote` + remote DNS `detour=proxy` 能防 DNS 泄漏,但代理链路抖动时新域名解析会慢;这会表现为"新连接打不开",不一定是长连接真的断。CN/直连域名现在会优先用本地 DNS,减少这种冷启动绕路。
+- **远程 DNS 经 proxy**:`dns.final=remote` + remote DNS `detour=proxy` 能防 DNS 泄漏,但代理链路抖动时新域名解析会慢;这会表现为"新连接打不开",不一定是长连接真的断。实测海外新域名约 0.4-0.9s,缓存命中约 16-41ms。CN/直连域名优先用本地 DNS,减少这种冷启动绕路。
 - **DNS 独立失败预算暂不硬塞配置字段**:sing-box 官方 `dns.timeout` / DNS rule action `timeout` 是 1.14 系列字段,当前模块核心是 1.13.14-extended。为了避免升级前被 `sing-box check` 拒绝,本轮不渲染这些字段;后续升级核心后再把 `SBMAGIC_DNS_TIMEOUT` 做成受版本保护的配置项。
 - **规则集默认本地预置**:打包时预取 geosite-cn / geoip-cn `.srs`,安装时复制到 `$CACHE_DIR/rulesets`,渲染时优先使用 `type: local`。`SBMAGIC_RULESET_DOWNLOAD_DETOUR=direct` 只用于本地文件缺失后的远程兜底,避免首次启动出现规则下载/代理就绪互相等待。规则文件时间已在状态页展示;直连无法更新时再切到 `proxy`。
 - **只有非默认策略侧需要包名识别**:`packages.proxy/free-flow` 是 route 层强制策略。渲染时会跳过与 `SBMAGIC_MIXED_RULE_PRIORITY` 相同的一侧,所以默认代理优先下,`packages.proxy` 不再生成 `package_name` 条件;只有少数强制走另一侧策略的应用才需要包名/进程识别。
-- **auto_redirect 不是 UDP/QUIC 加速器**:Android 上它主要优化 IPv4 TCP。应用侧 HTTP/3/QUIC 仍走 UDP/gVisor 路径;`SBMAGIC_REJECT_QUIC=false` 默认关闭,只有确认设备被 UDP/443 成本拖慢时才建议开启,让应用回退 TCP。Hysteria2/TUIC/QUIC 节点出站不受这个路由拒绝规则影响。
+- **auto_redirect 不是 UDP/QUIC 加速器**:Android 上它主要优化 IPv4 TCP。应用侧 HTTP/3/QUIC 仍走 UDP/gVisor 路径;`SBMAGIC_REJECT_QUIC=false` 默认关闭。TCP 节点下确认 UDP/443 卡顿时再开启,让多数应用回退 TCP。Hysteria2/TUIC/QUIC 这类 UDP-native 节点保持关闭。
+- **BBR 只作为可试开关**:真机 A/B 中,`bbr` 对新连接延迟没有明确改善,但 5MB 下载样本比 `cubic` 少了严重停滞。它适合继续实测弱网吞吐稳定性,不修复上游 30s HTTP/2 重置。
+- **UDP-native 出口是结构解法**:`reject_quic=true` 适合只有单 TCP/CDN 节点时让应用回退 TCP。若另有 Hysteria2/TUIC 等 UDP-native 出口,`SBMAGIC_UDP_NATIVE_MODE=quic` 可把代理路径的 UDP/443 分过去,避免 QUIC-over-TCP。入口应用分流仍在 TUN 前完成;UDP-native 是进 TUN 后的 route 分流,默认代理优先下不引入包名识别。UI 只显示明显支持 UDP 的节点。XHTTP 节点只要 ALPN 含 `h3` 就可选;若同时含 H2/H3,渲染器会自动加一个隐藏 H3-only 出站给 UDP/443 使用,不修改原 TCP/H2 出站。Shadowsocks 带 SIP003 插件时不列入 UDP 出口。
 - **UDP 超时已改成自动默认**:`SBMAGIC_UDP_TIMEOUT=auto` 会在渲染时落成实际时长:普通配置 `5m`,Full Cone NAT 时 `10m`,拒绝 QUIC 时 `2m`;仍可手动填 `2m`/`5m`/`10m` 等 Go duration。
 - **手动 reload 会重启核心;ruleset-refresh 条件重启**:sing-box clash API 没有真实热重载配置接口,所以配置 reload 会重建 TUN 并打断已有连接。`ruleset-refresh` 只在 `bypass-cn` 规则集正在使用且核心运行时 reload;停机或未使用规则集时只更新本地 `.srs` 文件。这不是后台自发断流。
 - **手动切换 selector 会影响连接**:导入生成的 selector 仍保留 `interrupt_exist_connections=true`,用户主动切节点时旧连接会被切断,新连接立即走新节点;这属于显式操作。
@@ -467,6 +469,9 @@ promote-last-good delta_jiffies=0
 - 已修正 `settings.env` 的 auto_redirect 注释:Android 上是 iptables REDIRECT 快路径,不是 nftables 依赖。
 - 已优化策略渲染:与 `SBMAGIC_MIXED_RULE_PRIORITY` 相同的一侧不再生成 `package_name` 规则。当前常见的白名单 + 代理优先配置下,即使 UI 中 `packages.proxy` 与入口白名单相同,route 层也不会再触发每连接包名识别。
 - 已把配置渲染从 2800+ 行 shell 主控中拆出到 `tools/magicctl-go/`:shell `magicctl` 保留启动/停止/watchdog/netwatch 等 Android 生命周期编排,Go `magicctl-go render` 专管 DNS/TUN/route/fake-ip/ruleset JSON。渲染逻辑按文件拆分,并补了默认策略包名识别、QUIC 范围、fake-ip IPv6 的单元测试。
+
+迁移:
+- 已加入 `SBMAGIC_SETTINGS_VERSION=2`。升级时若旧配置没有版本且仍是 `SBMAGIC_NETWORK_CHANGE_FLUSH=true`,安装脚本会迁移为 `false`,写入 `logs/install-migration.log`,并让 WebUI 弹一次提示。
 
 真机应用:
 - 已把新版 `magicctl` 同步到 `/data/adb/singbox_tun_Magic/magicctl` 和模块目录。

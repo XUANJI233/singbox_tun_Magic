@@ -20,6 +20,7 @@ validate_settings() {
   json_bool "$SBMAGIC_DNS_REVERSE_MAPPING" >/dev/null
 
   validate_uint_range "$SBMAGIC_WATCHDOG_INTERVAL" SBMAGIC_WATCHDOG_INTERVAL 60 86400
+  validate_uint_range "$SBMAGIC_SETTINGS_VERSION" SBMAGIC_SETTINGS_VERSION 1 999
   validate_uint_range "$SBMAGIC_NETWORK_RECOVERY_COOLDOWN" SBMAGIC_NETWORK_RECOVERY_COOLDOWN 5 3600
   validate_uint_range "$SBMAGIC_NETWORK_SETTLE_DELAY" SBMAGIC_NETWORK_SETTLE_DELAY 0 30
   validate_uint_range "$SBMAGIC_NETWORK_HEALTH_RETRIES" SBMAGIC_NETWORK_HEALTH_RETRIES 1 10
@@ -28,6 +29,8 @@ validate_settings() {
   validate_uint_range "$SBMAGIC_MTU" SBMAGIC_MTU 1200 9000
   validate_int_range "$SBMAGIC_OOM_SCORE_ADJ" SBMAGIC_OOM_SCORE_ADJ -1000 1000
   validate_one_of "$SBMAGIC_STACK" SBMAGIC_STACK gvisor system mixed
+  validate_one_of "$SBMAGIC_TCP_CONGESTION_CONTROL" SBMAGIC_TCP_CONGESTION_CONTROL system bbr cubic reno
+  validate_one_of "$SBMAGIC_UDP_NATIVE_MODE" SBMAGIC_UDP_NATIVE_MODE off quic
   validate_one_of "$SBMAGIC_IPV6_MODE" SBMAGIC_IPV6_MODE auto proxy block off
   validate_one_of "$SBMAGIC_PACKAGE_MODE" SBMAGIC_PACKAGE_MODE black white
   validate_one_of "$SBMAGIC_PROXY_RULE_MODE" SBMAGIC_PROXY_RULE_MODE off global bypass-cn
@@ -60,5 +63,8 @@ validate_settings() {
   fi
   if [ "$SBMAGIC_AUTO_REDIRECT" = "true" ] && [ "$SBMAGIC_AUTO_ROUTE" != "true" ]; then
     die "SBMAGIC_AUTO_REDIRECT=true requires SBMAGIC_AUTO_ROUTE=true"
+  fi
+  if [ "$SBMAGIC_UDP_NATIVE_MODE" != "off" ] && [ -z "$SBMAGIC_UDP_NATIVE_OUTBOUND" ]; then
+    die "SBMAGIC_UDP_NATIVE_OUTBOUND is required when SBMAGIC_UDP_NATIVE_MODE=$SBMAGIC_UDP_NATIVE_MODE"
   fi
 }

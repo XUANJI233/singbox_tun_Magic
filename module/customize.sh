@@ -28,8 +28,55 @@ RUNTIME_DIR="$DATA_DIR/runtime"
 LOG_DIR="$DATA_DIR/logs"
 CACHE_DIR="$DATA_DIR/cache"
 RULESET_DIR="$CACHE_DIR/rulesets"
+SETTINGS_VERSION=2
+MIGRATION_LOG="$LOG_DIR/install-migration.log"
+MIGRATION_NOTICE_FILE="$RUNTIME_DIR/settings.migration.notice"
 
 mkdir -p "$BIN_DIR" "$LIB_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR" "$RULESET_DIR"
+
+settings_get() {
+  key="$1"
+  [ -f "$CONFIG_DIR/settings.env" ] || return 0
+  grep -m 1 "^$key=" "$CONFIG_DIR/settings.env" 2>/dev/null | cut -d= -f2-
+}
+
+settings_set() {
+  key="$1"
+  value="$2"
+  file="$CONFIG_DIR/settings.env"
+  if grep -q "^$key=" "$file" 2>/dev/null; then
+    sed -i "s|^$key=.*|$key=$value|" "$file"
+  else
+    printf '\n%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+settings_version_value() {
+  version="$(settings_get SBMAGIC_SETTINGS_VERSION)"
+  case "$version" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo "$version" ;;
+  esac
+}
+
+migrate_settings() {
+  [ -f "$CONFIG_DIR/settings.env" ] || return 0
+
+  old_version="$(settings_version_value)"
+  notices=""
+  if [ "$old_version" -lt 2 ] && [ "$(settings_get SBMAGIC_NETWORK_CHANGE_FLUSH)" = "true" ]; then
+    settings_set SBMAGIC_NETWORK_CHANGE_FLUSH false
+    notices="${notices}切换网络断开旧连接已关闭"
+  fi
+  settings_set SBMAGIC_SETTINGS_VERSION "$SETTINGS_VERSION"
+
+  [ -n "$notices" ] || return 0
+  {
+    date '+%Y-%m-%d %H:%M:%S'
+    echo "settings migration: $old_version -> $SETTINGS_VERSION; $notices"
+  } >> "$MIGRATION_LOG"
+  echo "已迁移旧设置:$notices" > "$MIGRATION_NOTICE_FILE"
+}
 
 cp -f "$MODPATH/bin/$SBMAGIC_ABI/sing-box" "$BIN_DIR/.core"
 [ -f "$MODPATH/bin/$SBMAGIC_ABI/magic-fetch" ] && cp -f "$MODPATH/bin/$SBMAGIC_ABI/magic-fetch" "$BIN_DIR/magic-fetch"
@@ -59,6 +106,8 @@ for name in settings.env outbounds.json packages.exclude packages.include packag
     cp -f "$MODPATH/defaults/$name" "$CONFIG_DIR/$name.default"
   fi
 done
+
+migrate_settings
 
 cp -f "$MODPATH/defaults/outbounds.example.json" "$CONFIG_DIR/outbounds.example.json"
 if [ -d "$MODPATH/defaults/rulesets" ]; then

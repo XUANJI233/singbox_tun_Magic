@@ -10,6 +10,53 @@ network_event_is_own_tun() {
   esac
 }
 
+netwatch_event_iface() {
+  event="$1"
+  set -- $event
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      [0-9]*:)
+        [ "$#" -gt 1 ] || return 1
+        iface="${2%%@*}"
+        iface="${iface%:}"
+        [ -n "$iface" ] && echo "$iface"
+        return 0
+        ;;
+      dev)
+        [ "$#" -gt 1 ] || return 1
+        iface="${2%%@*}"
+        iface="${iface%:}"
+        [ -n "$iface" ] && echo "$iface"
+        return 0
+        ;;
+    esac
+    shift
+  done
+  return 1
+}
+
+netwatch_event_is_default_route() {
+  case "$1" in
+    default*|Deleted\ default*|*" default "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+netwatch_iface_is_noise() {
+  case "$1" in
+    p2p*|dummy*|ifb*|lo|sit*|ip6tnl*|rmnet_ipa*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+netwatch_event_is_noise_iface() {
+  event="$1"
+  netwatch_event_is_default_route "$event" && return 1
+  iface="$(netwatch_event_iface "$event")" || return 1
+  [ "$iface" = "$SBMAGIC_INTERFACE" ] && return 1
+  netwatch_iface_is_noise "$iface"
+}
+
 network_own_tun_grace_seconds() {
   value="${SBMAGIC_NETWORK_OWN_TUN_GRACE:-$NETWATCH_OWN_TUN_GRACE_SECONDS}"
   case "$value" in ''|*[!0-9]*) value="$NETWATCH_OWN_TUN_GRACE_SECONDS" ;; esac
@@ -138,6 +185,9 @@ netwatch() {
         continue
       fi
       if netwatch_event_is_known_ipv6_addr_refresh "$event"; then
+        continue
+      fi
+      if netwatch_event_is_noise_iface "$event"; then
         continue
       fi
       own_tun_event=false

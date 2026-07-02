@@ -184,9 +184,12 @@ IPv6 现在用四态配置收口:`auto`(默认)、`proxy`、`block`、`off`。`a
 - 路由顺序固定为:DNS 接管 → 可选 sniff → `SBMAGIC_IPV6_MODE=block` 时 reject IPv6 → 私网/LAN 恒直连 → clash Direct/Global → 强制代理应用规则 → 强制免流应用规则 → 自动/混合应用规则 → `final: direct`。`SBMAGIC_PROXY_RULE_MODE` 控制代理策略(`off/global/bypass-cn`),`SBMAGIC_FREE_FLOW_RULE_MODE` 控制免流策略(`off/global`),不要再用布尔式 `SBMAGIC_FREE_FLOW` 或把"国内直连"和"免流出口"混在一个开关里。私网恒直连是全局规则,不会被 `global` 代理或免流策略覆盖,避免路由器后台、局域网设备、强制门户被送进远端出口。`SBMAGIC_SNIFF=false` 是默认值,避免每个进 TUN 的首连都付 sniff 成本;只有遇到应用不走系统 DNS、域名分流缺失时再开启。
 - tun inbound 显式写了几个"显式优于隐式"的字段,不依赖版本默认值:
   - `auto_redirect: true` 默认开启,在 Android 上主要加速 IPv4 TCP:让符合条件的 TCP 转发走内核 fast path,减少 userspace/gVisor L3/L4 转换成本。UDP、IPv6 以及 sing-box 自己发起的 Hysteria2/TUIC/QUIC 出站 socket 不吃这条优化。
+  - `SBMAGIC_TCP_CONGESTION_CONTROL=system` 默认不改 ROM 全局 TCP 算法。设备内核提供 `bbr` 时可手动试用,它影响外层 TCP socket 的恢复/吞吐稳定性,不解决上游 HTTP/2 长流被对端重置。
   - `endpoint_independent_nat: true` 只在 `SBMAGIC_STACK=gvisor` 且 `SBMAGIC_ENDPOINT_INDEPENDENT_NAT=true` 时写入;默认关闭,因为 Full Cone NAT 对 P2P/语音/游戏有帮助,但官方说明有轻微吞吐成本。
   - `udp_timeout`:默认 `SBMAGIC_UDP_TIMEOUT=auto`,渲染时变成实际时长。普通配置为 `5m`,开 Full Cone NAT 时为 `10m`,开 `SBMAGIC_REJECT_QUIC=true` 时为 `2m`;也可以手动填 Go duration(如 `2m`/`5m`/`10m`)。
-- `SBMAGIC_REJECT_QUIC=false` 默认关闭。开启时会拒绝公共 UDP/443,迫使浏览器/多数应用从 HTTP/3/QUIC 回退到 TCP,从而让应用侧 Web 流量尽量吃到 `auto_redirect` 的 TCP 快路径。它是性能/省电取舍开关,不是无副作用优化:弱网下 QUIC 可能更稳,所以需要真机 A/B 后再长期启用。
+- `SBMAGIC_REJECT_QUIC=false` 默认关闭。开启后只拒绝本来要走代理的公共 UDP/443。TCP/CDN 节点(XHTTP/gRPC/WS)里,应用侧 HTTP/3 会变成 UDP-over-TCP,在蜂窝抖动下可能放大延迟;确认 UDP/443 是问题后再打开。使用 Hysteria2/TUIC 这类 UDP-native 节点时保持关闭。
+- `SBMAGIC_UDP_NATIVE_MODE=off` 默认关闭。若同时有 Hysteria2/TUIC 等 UDP-native 节点,可设 `SBMAGIC_UDP_NATIVE_MODE=quic` 与 `SBMAGIC_UDP_NATIVE_OUTBOUND=<tag>`,把本来要走代理的公共 UDP/443 分到该出口;它比 `reject_quic=true` 更完整,但要求上游真实支持 UDP,且 tag 必须存在于 `outbounds.json`。UI 只列出明显支持 UDP 的出站:Hysteria/Hysteria2/TUIC/WireGuard/Tailscale/无插件 Shadowsocks、V2Ray QUIC/KCP transport、Naive/TrustTunnel QUIC、MASQUE(H3),以及 ALPN 含 `h3` 的 XHTTP。若 XHTTP 同时支持 H2/H3 且 H3 不是首项,渲染器会自动生成一个隐藏的 H3-only 出站供 UDP/443 使用;原 TCP/H2 出站不改,也不暴露到 `outbounds.json`。
+- 分流层级:应用是否进 TUN 仍在入口层用 `include_package`/`exclude_package` 提前完成,非代理应用不进入 sing-box。UDP-native 只能在已进入 TUN 后由 sing-box route 分流,因为它要使用 sing-box 出站节点封装;默认代理优先配置下不需要 `package_name` 规则。`bypass-cn` 会先保留 CN/私网直连,再把剩余 UDP/443 送到 UDP-native 出口。
 - `SBMAGIC_STACK` 默认 `gvisor`,不是 sing-box 官方在带 gVisor tag 时的默认 `mixed`。原因是 `bench/results/avd-stack-benchmark-2026-06-30.md` 在 `Pixel_9_API_36_1_root` AVD 上验证: `system`/`mixed` 能通过 `check` 并启动,但 TCP 流量没有进入 tun inbound;`mixed` 的 TCP 半边也是 `system`,所以同样不可用。`system` 理论上少一层虚拟栈,但当前模块不把"理论更快"置于"实测可用"之前。
 - `cache_file` 开启;fake-ip 模式额外写 `store_fakeip: true`(见 §4.3)。
 - 规则集(geosite-cn / geoip-cn,`.srs` 格式)按"本地预置优先,远程兜底"处理:`scripts/package-module.py` 打包前下载规则集到 `module/defaults/rulesets`,安装时 `customize.sh` 复制到 `$CACHE_DIR/rulesets`,渲染配置时优先生成 `type: "local"` 的 `rule_set`。这样全新安装第一次启动不需要现场下载 geofile,也不会把 CN 分流冷启动绑到代理出口。只有本地规则文件缺失时才回退到 `type: "remote"`;远程兜底默认 `download_detour: direct`(`SBMAGIC_RULESET_DOWNLOAD_DETOUR=direct`),直连无法访问规则源时可切到 `proxy`。
@@ -227,7 +230,8 @@ IPv6 现在用四态配置收口:`auto`(默认)、`proxy`、`block`、`off`。`a
 - `magicctl stop` 和 `disable` 会**连 supervisor 一起停**(`stop_watchdog`),然后停核心。内部的 restart/rollback/崩溃自愈路径不杀 supervisor,只让它重新启动子进程。
 - Android 正常没有 systemd/systemctl,模块不能依赖 `systemctl`。当前默认优先尝试 Android init `.rc`,但保留 late_start 直接启动兜底,因为 Magisk/KernelSU/APatch 的 systemless rc 注入在不同 ROM 上仍可能受 SELinux 域、capability 或导入时机影响。
 - framework 级 `ProcessRecord#setPersistent(true)` / `setMaxAdj(ProcessList.SYSTEM_ADJ)` 不是 root shell 能调用的公开能力,需要改 `system_server`、定制 ROM 或 Xposed/LSPosed hook。模块默认不做这种高侵入注入;rc 路径使用 init 原生 `oom_score_adjust -900`,direct/fallback 路径可选 `SBMAGIC_OOM_PROTECT` 写 `/proc/<pid>/oom_score_adj`,用于验证/缓解 LMKD 空闲回收。
-- `magicctl netwatch` 是**事件式网络恢复器**:阻塞在 `ip monitor route address link`,只在链路/地址/路由变化(例如休眠恢复、Wi-Fi/蜂窝切换)后检查本机 API 与 TUN 状态。健康检查用轻量 `/configs`,并在重启前做短重试;健康的自身 TUN 事件会被忽略,避免 auto_route/TUN 维护事件反过来触发恢复检查。API 健康但 TUN 接口明确不存在时也会 restart,覆盖"进程没死但代理路径坏"的半坏状态。默认不会在 API/TUN 健康时关闭长连接;`SBMAGIC_NETWORK_CHANGE_FLUSH=true` 时才会主动关闭旧连接。它不做固定外网测速,避免网络本身断开时反复重启。恢复行为可细调:`SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30`、`SBMAGIC_NETWORK_SETTLE_DELAY=2`、`SBMAGIC_NETWORK_HEALTH_RETRIES=2`、`SBMAGIC_NETWORK_HEALTH_RETRY_DELAY=2`、`SBMAGIC_NETWORK_OWN_TUN_GRACE=12`。`ip monitor` 子进程会写入 `runtime/netwatch.monitor.pid`,stop/uninstall/trap 都会清理,避免管道子进程孤儿化。
+- `magicctl netwatch` 是**事件式网络恢复器**:阻塞在 `ip monitor route address link`,只在链路/地址/路由变化(例如休眠恢复、Wi-Fi/蜂窝切换)后检查本机 API 与 TUN 状态。健康检查用轻量 `/configs`,并在重启前做短重试;健康的自身 TUN 事件会被忽略,避免 auto_route/TUN 维护事件反过来触发恢复检查。p2p/dummy/ifb/lo 等非默认网络噪声接口也会被忽略,避免 Wi-Fi Direct 之类的无关 link 变化唤醒健康检查。API 健康但 TUN 接口明确不存在时也会 restart,覆盖"进程没死但代理路径坏"的半坏状态。默认不会在 API/TUN 健康时关闭长连接;`SBMAGIC_NETWORK_CHANGE_FLUSH=true` 时才会主动关闭旧连接。它不做固定外网测速,避免网络本身断开时反复重启。恢复行为可细调:`SBMAGIC_NETWORK_RECOVERY_COOLDOWN=30`、`SBMAGIC_NETWORK_SETTLE_DELAY=2`、`SBMAGIC_NETWORK_HEALTH_RETRIES=2`、`SBMAGIC_NETWORK_HEALTH_RETRY_DELAY=2`、`SBMAGIC_NETWORK_OWN_TUN_GRACE=12`。`ip monitor` 子进程会写入 `runtime/netwatch.monitor.pid`,stop/uninstall/trap 都会清理,避免管道子进程孤儿化。
+- `settings.env` 带 `SBMAGIC_SETTINGS_VERSION`。`customize.sh` 升级时执行迁移表:当前版本 `<2` 且旧值仍为 `SBMAGIC_NETWORK_CHANGE_FLUSH=true` 时会改成 `false`,写入 `logs/install-migration.log`,并在 WebUI 弹一次提示。以后修正默认值必须追加迁移,不能只改 defaults。
 
 ### 7.3 配置回退与崩溃自愈
 
@@ -258,6 +262,7 @@ IPv6 现在用四态配置收口:`auto`(默认)、`proxy`、`block`、`off`。`a
 
 **已知限制(诚实写在这里,不要假装解决了)**:
 - 自动恢复只检查本机健康(PID / Clash API / TUN)和网络事件,没有做真正的外网连通性自检(比如"代理是否真的能访问目标网站")。节点凭据错误、服务器侧封禁、CDN 回源异常时,sing-box 进程和本机 API 都可能正常,这类问题仍需要用户看连接面板/日志或手动切节点。
+- sing-box/sing-tun 自带的 `/data/system/packages.xml` watcher 在部分 ROM 上会因系统原子重写文件而报 `watcher removed`。模块不因此自动重启核心,避免安装/更新应用时打断连接;新装应用进入名单后,保存名单并 `reload` 会重新解析 UID。
 - last-good 快照依赖看门狗持续运行;如果 `SBMAGIC_WATCHDOG=false`,快照不会更新,回退能力随之失效——这是默认开看门狗的另一个理由。
 - 全新安装后,如果用户第一次配置就写错了且在 15 分钟内反复崩,此时还没有任何 last-good 快照,自愈会直接走到"关闭模块"这一步,而不是回退到某个旧配置(因为没有旧配置可回退)。这是预期内的安全失败模式,不是 bug。
 
@@ -305,7 +310,7 @@ IPv6 现在用四态配置收口:`auto`(默认)、`proxy`、`block`、`off`。`a
 - 解析在**页面 JS** 里完成(JS 自带 base64/URL/JSON 能力,比 sh 干净可靠),把分享链接转成 sing-box 原生 outbound,再 `config set outbounds` 写入。
 - 支持协议:`vmess` / `vless`(含 reality、flow、`encryption`、ws/grpc/http/xhttp 传输、uTLS 指纹)/ `trojan` / `ss`(SIP002 与旧版全 base64 两种写法,含 plugin)/ `hysteria2`(含 salamander obfs)/ `tuic` / `anytls`。
 - VLESS `encryption` 在导入阶段按当前 sing-box-extended 的 `mlkem768x25519plus.<native|xorpub|random>.<0rtt|1rtt>.<key...>` 规则做本地预校验,key 必须是 base64url 解码后 32 或 1184 字节;不符合时拒绝该节点并在 UI 显示具体原因,避免写出 `sing-box check` 必炸的配置。
-- VLESS XHTTP 导入按 sing-box-extended 的字段落盘:`type=xhttp` 会生成 `transport.type: "xhttp"`;`extra` 内仅导入客户端安全字段,例如 `xPadding*`、`noGRPCHeader`、`scMaxEachPostBytes`、`scMinPostsIntervalMs`、`session*`、`seq*`、`uplink*` 与 `xmux`。`noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs`、`serverMaxHeaderBytes` 等服务端专用字段会在分享链接导入时丢弃,避免把服务端流控/缓冲策略误写进客户端 outbound。未提供 `xPaddingBytes` 时默认写 `"100-1000"`,避免 extended 核心校验拒绝空 padding。
+- VLESS XHTTP 导入按 sing-box-extended 的字段落盘:`type=xhttp` 会生成 `transport.type: "xhttp"`;`extra` 内仅导入客户端安全字段,例如 `xPadding*`、`noGRPCHeader`、`scMaxEachPostBytes`、`scMinPostsIntervalMs`、`session*`、`seq*`、`uplink*` 与 `xmux`。`noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs`、`serverMaxHeaderBytes` 等服务端专用字段会在分享链接导入时丢弃,避免把服务端流控/缓冲策略误写进客户端 outbound。未提供 `xPaddingBytes` 时默认写 `"100-1000"`,避免 extended 核心校验拒绝空 padding。XHTTP 不叠加 sing-box 通用 `multiplex`;需要并发复用时使用 XHTTP 自己的 `xmux`。导入器支持 `extra.xmux` 嵌套字段,也支持 `extra.enableXmux=true` 时写入保守默认:`max_concurrency: "4-8"`、`h_max_request_times: "80-120"`、`h_max_reusable_secs: "20-25"`。这个默认只减少并发短连接重复握手,不会掩盖上游 HTTP/2 长流被重置的问题。
 - 支持**订阅链接/导出配置**:WebUI 调模块自带 `magic-fetch` 拉取 URL(UA 用 `v2rayN/...` 以拿到通用的 base64 分享链接列表),再按行解析。缺少 `magic-fetch` 视为安装不完整,不再退回 curl/wget/nc 这类设备环境不稳定的后端。订阅正文是单段 base64 时自动解码;也可直接粘贴 sing-box JSON/outbounds 导出。
 - 不支持 Clash YAML 订阅(需 YAML 解析器,暂不引入);这类订阅请先转换成分享链接列表或 sing-box outbounds JSON。
 - 写入方式两种:**替换**(整体替换节点)/ **追加**(保留已有节点再并入,同名自动改名 `-2`/`-3`…)。组装结果 = `selector(proxy)` + `urltest(auto)` + 各节点 + `direct`,但 `proxy.default` 指向第一个真实节点,`auto` 只作为可手动选择的自动测速出口,避免空测速历史或坏首节点把新连接拖进长 TCP 超时。自动测速默认 `interval=10m`、`tolerance=100`,偏向移动端省电和减少节点抖动。导入后会立刻做 `outbounds` 语义校验(`proxy/direct` 必需、tag 不重复、selector/urltest 引用必须存在)和整配置 `check`,通过后仍需点"应用并重启"。
@@ -433,7 +438,7 @@ IPv6 现在用四态配置收口:`auto`(默认)、`proxy`、`block`、`off`。`a
 - `SBMAGIC_IPV6_MODE=auto` 时,没有默认 IPv6 出口会按 `off` 渲染;有 IPv6 但短探测不通会按 `block` 渲染;两者都会把本次渲染的 DNS 策略压到 `ipv4_only`;切到可用 IPv6 网络后 netwatch 会重新渲染并恢复 `proxy`。
 
 ### 14.4 MTU/MSS
-- `SBMAGIC_MTU` 默认 1400,够保守;层层封装后仍黑洞需考虑 MSS clamping(sing-box tun 本身不直接提供,需出站层配合或调小 MTU)。
+- `SBMAGIC_MTU` 默认 9000,与 sing-box Android TUN 默认一致。它只提高应用到本地 TUN 这段的包大小上限,不代表蜂窝/Wi-Fi 外层链路使用 jumbo frame;实际外连仍由系统 TCP/QUIC 路径 MTU 处理。比 9000 更大在 Android 上不建议:sing-box 源码也避免 Android 默认 65535,因为部分设备会报 ENOBUFS。若遇到个别 ROM/TUN 栈异常,再手动降到 1500/1400。
 
 ### 14.5 时间同步
 - 时间不准 → TLS 校验失败 → 代理全挂且报错难懂。
@@ -457,8 +462,8 @@ IPv6 现在用四态配置收口:`auto`(默认)、`proxy`、`block`、`off`。`a
 - 当前 DNS 已用 1.12+ 新 server 格式(§4.1),但 `route` 里若残留任何 1.14 才移除的旧字段需提前迁移;升级二进制后务必先 `magicctl check` 再 `reload`。`block`/`dns` 旧出站已在 1.13 清除(§5.1),不要在 `outbounds.json` 里加回来。
 
 ### 14.11 `system` / `mixed` TUN stack
-- sing-box 官方定义里,`system` 使用系统网络栈做 L3→L4 转换,`gvisor` 使用 gVisor 虚拟网络栈,`mixed` 是 system TCP + gVisor UDP。理论上 `system` 可能更省 CPU/内存,但当前 AVD root shell 测试显示它没有接管 TCP 连接,表现为客户端 `dial tcp ... i/o timeout`,日志里没有 inbound connection。
-- 因为 `mixed` 的 TCP 半边也是 `system`,它在同一测试里也失败。当前默认固定为 `gvisor`;除非在目标真机上完成 `magicctl check`、实际连通性和吞吐测试,否则不要为了理论性能切到 `system`/`mixed`。
+- sing-box 官方定义里,`system` 使用系统网络栈做 L3→L4 转换,`gvisor` 使用 gVisor 虚拟网络栈,`mixed` 是 system TCP + gVisor UDP。取向上 `gvisor` 理论兼容性更好,`system` 理论性能更好,`mixed` 均衡。
+- 真机测试里 `gvisor`、`system`、`mixed` 都能启动并通过连通性检查。默认仍保留 `gvisor`;改默认前按目标设备实测吞吐、耗电和断流。
 
 ---
 
@@ -497,7 +502,7 @@ IPv6 现在用四态配置收口:`auto`(默认)、`proxy`、`block`、`off`。`a
 - [ ] DNS 用 1.12+ 新 server 格式(type+server)、规则用 action 式;旧字段(`address` URL、顶层 `fakeip`)不下发,`reverse_mapping` 默认开启
 - [ ] `block`/`dns` 旧特殊出站已移除(1.13 删除),拦截用 `action: reject`、DNS 用 `hijack-dns`
 - [ ] `route.default_domain_resolver` 已设(多 DNS server 时解析节点域名必需,见 §4.6)
-- [ ] tun 默认 `auto_redirect=true` 加速 IPv4 TCP;`SBMAGIC_REJECT_QUIC=false` 仅作为可选 HTTP/3 回退开关;gvisor stack 下仅按需启用 `endpoint_independent_nat`,默认关闭以降低转发成本;`SBMAGIC_UDP_TIMEOUT=auto` 渲染为实际 duration;fake-ip 模式显式 `store_fakeip: true`
+- [ ] tun 默认 `auto_redirect=true` 加速 IPv4 TCP;`SBMAGIC_MTU=9000` 对齐 sing-box Android 默认;`SBMAGIC_REJECT_QUIC=false` 仅作为 TCP 节点下的 HTTP/3 回退开关;gvisor stack 下仅按需启用 `endpoint_independent_nat`,默认关闭以降低转发成本;`SBMAGIC_UDP_TIMEOUT=auto` 渲染为实际 duration;fake-ip 模式显式 `store_fakeip: true`
 
 **应用配置 / 并发(详见 §7.4)**
 - [ ] 配置改动走 `reload`(校验后重启),不依赖 clash API 热重载(那是空桩)

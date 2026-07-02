@@ -775,7 +775,7 @@ function fmtBytes(n) {
 }
 
 const KV_LABELS = {
-  enabled: "启用", config_valid: "配置有效", config_error: "配置错误",
+  enabled: "启用", settings_version: "设置版本", config_valid: "配置有效", config_error: "配置错误",
   running: "运行中", pid: "进程 PID", api_alive: "控制 API", tun_alive: "TUN 存在", data_dir: "数据目录",
   config: "运行配置", process_name: "进程名", tun_interface: "TUN 接口名", api: "控制面地址",
   mode: "Clash 模式", boot_start: "开机自启", init_service: "init 后备", init_service_seen: "init 入口时间", package_mode: "TUN 名单模式",
@@ -785,7 +785,7 @@ const KV_LABELS = {
   network_settle_delay: "变化后等待", network_health_retries: "检查次数", network_health_retry_delay: "检查间隔", network_own_tun_grace: "TUN 重建忽略",
   oom_protect: "低内存保护", oom_score_adj: "保留分值", current_oom_score_adj: "当前保留分值",
   proxy_rule_mode: "代理规则", free_flow_rule_mode: "免流规则",
-  mixed_rule_priority: "混合优先级", auto_redirect: "TCP 快路径", endpoint_independent_nat: "Full Cone NAT", reject_quic: "拒绝 QUIC", udp_timeout: "UDP 超时", ruleset_active: "规则集启用",
+  mixed_rule_priority: "混合优先级", auto_redirect: "TCP 快路径", tcp_congestion_control: "TCP 拥塞控制", tcp_congestion_control_current: "TCP 当前算法", udp_native_mode: "UDP 原生出口", udp_native_outbound: "UDP 出口节点", endpoint_independent_nat: "Full Cone NAT", reject_quic: "拒绝 QUIC", udp_timeout: "UDP 超时", ruleset_active: "规则集启用",
   ruleset_download_detour: "规则下载出口",
   ruleset_update_interval: "规则更新间隔", ruleset_cache_time: "规则文件时间",
   strategy_package_count: "强制策略应用数", strategy_process_lookup: "包名识别",
@@ -828,7 +828,7 @@ async function refreshStatusInner() {
 
     const wrap = document.getElementById("status-kv");
     wrap.innerHTML = "";
-    ["enabled", "config_valid", "config_error", "running", "pid", "api_alive", "tun_alive", "watchdog", "watchdog_running", "network_watch", "network_watch_running", "network_change_flush", "current_oom_score_adj", "oom_protect", "oom_score_adj", "process_name", "tun_interface", "boot_start", "init_service", "init_service_seen", "network_recovery_cooldown", "network_settle_delay", "network_health_retries", "network_health_retry_delay", "network_own_tun_grace", "package_mode", "tun_stack", "package_database_readable", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "strategy_package_count", "strategy_process_lookup", "auto_redirect", "endpoint_independent_nat", "reject_quic", "udp_timeout", "udp_timeout_effective", "ruleset_active", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "sniff", "sniff_timeout", "dns_mode", "dns_reverse_mapping", "ipv6_mode", "ipv6_available", "ipv6_effective_mode", "ipv6", "mode", "api", "data_dir", "config"].forEach(k => {
+    ["enabled", "settings_version", "config_valid", "config_error", "running", "pid", "api_alive", "tun_alive", "watchdog", "watchdog_running", "network_watch", "network_watch_running", "network_change_flush", "current_oom_score_adj", "oom_protect", "oom_score_adj", "process_name", "tun_interface", "boot_start", "init_service", "init_service_seen", "network_recovery_cooldown", "network_settle_delay", "network_health_retries", "network_health_retry_delay", "network_own_tun_grace", "package_mode", "tun_stack", "package_database_readable", "proxy_rule_mode", "free_flow_rule_mode", "mixed_rule_priority", "strategy_package_count", "strategy_process_lookup", "auto_redirect", "tcp_congestion_control", "tcp_congestion_control_current", "udp_native_mode", "udp_native_outbound", "endpoint_independent_nat", "reject_quic", "udp_timeout", "udp_timeout_effective", "ruleset_active", "ruleset_download_detour", "ruleset_update_interval", "ruleset_cache_time", "sniff", "sniff_timeout", "dns_mode", "dns_reverse_mapping", "ipv6_mode", "ipv6_available", "ipv6_effective_mode", "ipv6", "mode", "api", "data_dir", "config"].forEach(k => {
       if (!(k in kv)) return;
       const row = document.createElement("div");
       row.className = "kv";
@@ -1184,6 +1184,58 @@ function setSelectorDefault(outbounds, selector, target) {
   return true;
 }
 
+function outboundTLSHasH3(outbound) {
+  const alpn = outboundAlpnValues(outbound);
+  return alpn.length > 0 && alpn[0] === "h3";
+}
+
+function outboundTLSContainsH3(outbound) {
+  return outboundAlpnValues(outbound).includes("h3");
+}
+
+function outboundAlpnValues(outbound) {
+  const alpn = outbound?.tls?.alpn;
+  if (Array.isArray(alpn)) return alpn.map(v => String(v || "").trim().toLowerCase()).filter(Boolean);
+  if (typeof alpn === "string") return alpn.split(",").map(v => v.trim().toLowerCase()).filter(Boolean);
+  return [];
+}
+
+function configTruthy(value) {
+  if (value === true || value === 1) return true;
+  if (typeof value !== "string") return false;
+  const s = value.trim().toLowerCase();
+  return s === "true" || s === "1";
+}
+
+function outboundUdpNativeLabel(outbound) {
+  const type = String(outbound?.type || "").toLowerCase();
+  const transport = String(outbound?.transport?.type || "").toLowerCase();
+  if (["hysteria", "hysteria2", "tuic", "wireguard", "tailscale"].includes(type)) return type;
+  if (type === "shadowsocks" && !outbound.plugin) return "shadowsocks UDP";
+  if (transport === "quic") return `${type || "node"} / QUIC`;
+  if (transport === "kcp") return `${type || "node"} / KCP`;
+  if (transport === "xhttp" && outboundTLSHasH3(outbound)) return `${type || "node"} / XHTTP H3`;
+  if (transport === "xhttp" && outboundTLSContainsH3(outbound)) return `${type || "node"} / XHTTP H3 自动`;
+  if (type === "naive" && configTruthy(outbound.quic)) return "naive QUIC";
+  if (type === "masque" && !configTruthy(outbound.use_http2)) return "MASQUE H3";
+  if (type === "trusttunnel" && configTruthy(outbound.quic)) return "trusttunnel QUIC";
+  return "";
+}
+
+function udpNativeOutboundOptions(outbounds) {
+  const labels = {};
+  const values = [];
+  outbounds.forEach(o => {
+    if (!o || typeof o !== "object" || Array.isArray(o) || !o.tag) return;
+    const label = outboundUdpNativeLabel(o);
+    if (!label) return;
+    const tag = String(o.tag);
+    values.push(tag);
+    labels[tag] = `${tag} (${label})`;
+  });
+  return { values, labels };
+}
+
 async function persistSelectorDefault(selector, target) {
   const raw = await ctl("config", "get", "outbounds");
   const outbounds = parseOutboundsArray(raw);
@@ -1303,6 +1355,7 @@ async function loadOutbounds() {
   try {
     document.getElementById("outbounds-text").value = await ctl("config", "get", "outbounds");
     outboundsLoaded = true;
+    if (settingsLoaded) loadSettings();
   } catch (e) { toast(e.message); }
 }
 
@@ -1321,6 +1374,8 @@ async function saveOutbounds(check) {
     toast(check ? "正在保存并校验节点…" : "正在保存节点…");
     try {
       await ctlWithStdin(text, "config", "set", "outbounds");
+      outboundsLoaded = true;
+      if (settingsLoaded) loadSettings();
       if (check) {
         await ctl("check");
         toast("节点已保存并通过校验 ✓");
@@ -1387,7 +1442,12 @@ function splitHostPort(hp) {
   return i < 0 ? [hp, ""] : [hp.slice(0, i), hp.slice(i + 1)];
 }
 function splitAlpn(v) { return dec(v).split(",").map(s => s.trim()).filter(Boolean); }
-function truthy(v) { return v === "1" || v === "true"; }
+function truthy(v) {
+  if (v === true || v === 1) return true;
+  if (typeof v !== "string") return false;
+  const s = v.trim().toLowerCase();
+  return s === "1" || s === "true";
+}
 function rawUrlBase64ByteLength(segment) {
   if (!/^[A-Za-z0-9_-]+$/.test(segment) || segment.length % 4 === 1) return -1;
   let value = segment.replace(/-/g, "+").replace(/_/g, "/");
@@ -1471,6 +1531,25 @@ const XHTTP_XMUX_FIELD_MAP = [
   ["hMaxReusableSecs", "h_max_reusable_secs"],
   ["hKeepAlivePeriod", "h_keep_alive_period"],
 ];
+const XHTTP_DEFAULT_XMUX = {
+  max_concurrency: "4-8",
+  h_max_request_times: "80-120",
+  h_max_reusable_secs: "20-25",
+};
+
+function defaultXhttpXmux() {
+  return { ...XHTTP_DEFAULT_XMUX };
+}
+
+function xhttpXmuxFromExtra(extra) {
+  const xmux = {};
+  if (extra.xmux && typeof extra.xmux === "object" && !Array.isArray(extra.xmux)) {
+    copyMappedFields(extra.xmux, xmux, XHTTP_XMUX_FIELD_MAP);
+  }
+  copyMappedFields(extra, xmux, XHTTP_XMUX_FIELD_MAP);
+  if (Object.keys(xmux).length) return xmux;
+  return truthy(extra.enableXmux) ? defaultXhttpXmux() : null;
+}
 
 function vmessTransport(net, host, path) {
   net = (net || "tcp").toLowerCase();
@@ -1496,11 +1575,8 @@ function xhttpTransport(params, host) {
     });
     if (Object.keys(headers).length) transport.headers = headers;
   }
-  if (extra.xmux && typeof extra.xmux === "object" && !Array.isArray(extra.xmux)) {
-    const xmux = {};
-    copyMappedFields(extra.xmux, xmux, XHTTP_XMUX_FIELD_MAP);
-    if (Object.keys(xmux).length) transport.xmux = xmux;
-  }
+  const xmux = xhttpXmuxFromExtra(extra);
+  if (xmux) transport.xmux = xmux;
   return transport;
 }
 function parseVmess(line) {
@@ -2114,14 +2190,17 @@ const SETTINGS_GROUPS = [
     id: "group-network",
     fields: [
       { key: "SBMAGIC_PROCESS_NAME", label: "进程名", type: "text", hint: "下次启动生效。" },
-      { key: "SBMAGIC_STACK", label: "TUN 栈", type: "select", options: ["gvisor", "system", "mixed"], hint: "默认 gvisor;system/mixed 需真机验证。" },
+      { key: "SBMAGIC_STACK", label: "TUN 栈", type: "select", options: ["gvisor", "system", "mixed"], badge: "Beta", hint: "gvisor 理论兼容性更好;system 理论性能更好;mixed 均衡。" },
       { key: "SBMAGIC_INTERFACE", label: "TUN 接口名", type: "text", hint: "创建 TUN 时使用;最多 15 字节。" },
-      { key: "SBMAGIC_MTU", label: "MTU", type: "number", hint: "TUN 包大小上限;默认 1400。" },
+      { key: "SBMAGIC_MTU", label: "MTU", type: "number", hint: "TUN 包大小上限;默认 9000。" },
       { key: "SBMAGIC_AUTO_ROUTE", label: "自动路由", type: "bool", hint: "自动写入 TUN 路由。" },
       { key: "SBMAGIC_AUTO_REDIRECT", label: "TCP 快路径", type: "bool", hint: "用内核转发 IPv4 TCP;UDP/IPv6 不走这条快路径。" },
+      { key: "SBMAGIC_TCP_CONGESTION_CONTROL", label: "TCP 拥塞控制", type: "select", options: ["system", "bbr", "cubic", "reno"], defaultValue: "system", badge: "Beta", hint: "system 不修改;BBR 偏吞吐稳定。" },
+      { key: "SBMAGIC_UDP_NATIVE_MODE", label: "UDP 原生出口", type: "select", options: ["off", "quic"], defaultValue: "off", badge: "Beta", hint: "给 UDP/443 指定 UDP 节点;留空不启用。" },
+      { key: "SBMAGIC_UDP_NATIVE_OUTBOUND", label: "UDP 出口节点", type: "udp-outbound-select", badge: "Beta", hint: "只显示支持 UDP 传输的节点;XHTTP 含 h3 时自动处理。" },
       { key: "SBMAGIC_STRICT_ROUTE", label: "严格路由", type: "bool", hint: "收紧系统路由,减少流量绕过 TUN。" },
       { key: "SBMAGIC_ENDPOINT_INDEPENDENT_NAT", label: "Full Cone NAT", type: "bool", badge: "Beta", hint: "利于游戏/语音穿透;可能略降速度。" },
-      { key: "SBMAGIC_REJECT_QUIC", label: "拒绝 QUIC", type: "bool", defaultValue: "false", badge: "Beta", hint: "拒绝代理路径 UDP/443,让多数应用回退 TCP。" },
+      { key: "SBMAGIC_REJECT_QUIC", label: "拒绝 QUIC", type: "bool", defaultValue: "false", badge: "Beta", hint: "TCP 节点下可减少 HTTP/3 卡顿。" },
       {
         key: "SBMAGIC_IPV6_MODE", label: "IPv6 处理", type: "select",
         options: ["auto", "proxy", "block", "off"],
@@ -2185,11 +2264,15 @@ const SETTINGS_DEFAULTS = {
   SBMAGIC_NETWORK_HEALTH_RETRIES: "2",
   SBMAGIC_NETWORK_HEALTH_RETRY_DELAY: "2",
   SBMAGIC_NETWORK_OWN_TUN_GRACE: "12",
+  SBMAGIC_TCP_CONGESTION_CONTROL: "system",
+  SBMAGIC_UDP_NATIVE_MODE: "off",
+  SBMAGIC_UDP_NATIVE_OUTBOUND: "",
   SBMAGIC_UDP_TIMEOUT: "auto",
 };
 
 let settingsRawText = "";
 let settingsLoaded = false;
+let settingsUdpNativeOptions = { values: [], labels: {} };
 
 function normalizeSettingsForForm(values) {
   const normalized = { ...values };
@@ -2241,11 +2324,14 @@ function buildFieldRow(f, current) {
       if (value === v) o.selected = true;
       input.appendChild(o);
     });
-  } else if (f.type === "select") {
+  } else if (f.type === "select" || f.type === "udp-outbound-select") {
     input = document.createElement("select");
-    f.options.forEach(v => {
+    const dynamicOptions = f.type === "udp-outbound-select" ? settingsUdpNativeOptions : null;
+    const options = f.type === "udp-outbound-select" ? ["", ...dynamicOptions.values] : f.options;
+    const optionLabels = f.type === "udp-outbound-select" ? { "": "不使用", ...dynamicOptions.labels } : f.optionLabels;
+    options.forEach(v => {
       const o = document.createElement("option");
-      o.value = v; o.textContent = f.optionLabels?.[v] || v;
+      o.value = v; o.textContent = optionLabels?.[v] || v;
       if (value === v) o.selected = true;
       input.appendChild(o);
     });
@@ -2287,7 +2373,17 @@ function applySettingsEdits(rawText, values) {
 
 async function loadSettings() {
   try {
-    settingsRawText = await ctl("config", "get", "settings");
+    const [settingsText, outboundsText] = await Promise.all([
+      ctl("config", "get", "settings"),
+      ctl("config", "get", "outbounds"),
+    ]);
+    settingsRawText = settingsText;
+    try {
+      settingsUdpNativeOptions = udpNativeOutboundOptions(parseOutboundsArray(outboundsText));
+    } catch (e) {
+      settingsUdpNativeOptions = { values: [], labels: {} };
+      toast("UDP 节点列表读取失败:" + e.message);
+    }
     renderSettingsForm(normalizeSettingsForForm(parseKv(settingsRawText)));
     settingsLoaded = true;
   } catch (e) { toast(e.message); }
@@ -2303,6 +2399,10 @@ async function saveSettings() {
     document.querySelectorAll("#tab-settings [data-key]").forEach(el => {
       values[el.dataset.key] = el.value;
     });
+    if (values.SBMAGIC_UDP_NATIVE_MODE !== "off" && !values.SBMAGIC_UDP_NATIVE_OUTBOUND) {
+      toast("请选择 UDP 出口节点");
+      return;
+    }
     toast("正在保存设置…");
     try {
       const latestRawText = await ctl("config", "get", "settings");
@@ -2320,6 +2420,13 @@ document.getElementById("btn-settings-undo").addEventListener("click", () => wit
   try { await ctl("config", "rollback", "settings"); toast("已撤销"); loadSettings(); } catch (e) { toast(e.message); }
 }));
 
+async function showMigrationNotice() {
+  try {
+    const message = (await ctl("config", "migration-notice")).trim();
+    if (message) toast(message);
+  } catch (e) {}
+}
+
 // ---------- 日志 ----------
 async function loadLogs() {
   const src = document.getElementById("log-source").value;
@@ -2331,6 +2438,7 @@ document.getElementById("btn-logs-load").addEventListener("click", loadLogs);
 
 // ---------- init ----------
 refreshStatus();
+showMigrationNotice();
 </script>
 </body>
 </html>

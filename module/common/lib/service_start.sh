@@ -18,6 +18,7 @@ start_service_locked() {
     die "config check failed"
   fi
   ensure_api_env
+  apply_tcp_congestion_control
   apply_api_firewall
   mv -f "$RUN_LOG" "$RUN_LOG.old" 2>/dev/null
   "$SING_BOX" run -D "$DATA_DIR" -c "$CONFIG_FILE" >> "$RUN_LOG" 2>&1 &

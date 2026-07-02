@@ -64,6 +64,7 @@ stop_all_service() {
   stop_watchdog
   stop_service_locked
   rc=$?
+  restore_tcp_congestion_control
   trap - EXIT INT TERM HUP
   release_start_lock
   return "$rc"

@@ -41,6 +41,7 @@ FAIL_COUNT_FILE="$RUNTIME_DIR/watchdog.failcount"
 SUPERVISOR_RESTART_FILE="$RUNTIME_DIR/supervisor.restart"
 SUPERVISOR_ROLLBACK_FILE="$RUNTIME_DIR/supervisor.rollback"
 INITD_SEEN_FILE="$RUNTIME_DIR/initd.seen"
+MIGRATION_NOTICE_FILE="$RUNTIME_DIR/settings.migration.notice"
 START_LOCK_DIR="$RUNTIME_DIR/start.lock"
 CONFIG_LOCK_DIR="$RUNTIME_DIR/config.lock"
 WATCHDOG_LOCK_DIR="$RUNTIME_DIR/watchdog.lock"
@@ -67,7 +68,7 @@ LIB_DIR="${SBMAGIC_LIB_DIR:-$SBMAGIC_SELF_DIR/lib}"
 for lib in \
   base settings_defaults settings_runtime validators settings_validate process \
   firewall packages rulesets ipv6 api_env render locks service_start service_stop \
-  service_reload status api health netwatch supervisor config_files \
+  service_reload status api health netwatch supervisor tcp_tuning config_files \
   config_per_app init; do
   lib_file="$LIB_DIR/$lib.sh"
   if [ ! -f "$lib_file" ]; then
@@ -100,6 +101,7 @@ Commands:
   fetch URL              Fetch a subscription URL and print the body
   ruleset-refresh        Download local rule-sets and safe-reload when active
   config get KEY        Print a config file (settings|outbounds|exclude|include|proxy-packages|free-flow-packages|dns-direct)
+  config migration-notice Print and clear one upgrade notice
   config set KEY        Overwrite a config file from stdin (keeps KEY.bak)
   config set-strategies Overwrite proxy/free-flow package strategy files atomically
   config set-per-app    Overwrite per-app mode and package files atomically
@@ -138,6 +140,7 @@ case "$cmd" in
     case "$sub" in
       get) config_get "$1" ;;
       set) config_set "$1" ;;
+      migration-notice) config_migration_notice ;;
       set-strategies) config_set_strategy_packages ;;
       set-per-app) config_set_per_app ;;
       rollback) config_rollback "$1" ;;

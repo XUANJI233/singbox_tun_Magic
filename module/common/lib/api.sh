@@ -46,10 +46,33 @@ api_call_nc() {
   esac
 }
 
+api_max_time_for_path() {
+  api_path="$1"
+  case "$api_path" in
+    *"/delay?timeout="*)
+      api_delay_ms="${api_path#*timeout=}"
+      api_delay_ms="${api_delay_ms%%[!0-9]*}"
+      case "$api_delay_ms" in
+        ''|*[!0-9]*) echo "$API_MAX_TIME"; return 0 ;;
+      esac
+      api_delay_secs=$(( (api_delay_ms + 999) / 1000 + 2 ))
+      [ "$api_delay_secs" -gt 30 ] && api_delay_secs=30
+      [ "$api_delay_secs" -lt "$API_MAX_TIME" ] && api_delay_secs="$API_MAX_TIME"
+      echo "$api_delay_secs"
+      ;;
+    /dns/query*)
+      [ "$API_MAX_TIME" -lt 8 ] && echo 8 || echo "$API_MAX_TIME"
+      ;;
+    *) echo "$API_MAX_TIME" ;;
+  esac
+}
+
 api_call_once() {
   method="$1"
   path="$2"
   body="$3"
+  old_api_max_time="$API_MAX_TIME"
+  API_MAX_TIME="$(api_max_time_for_path "$path")"
   if [ -n "$body" ]; then
     if command -v curl >/dev/null 2>&1; then
       curl -fsS --connect-timeout "$API_CONNECT_TIMEOUT" --max-time "$API_MAX_TIME" -X "$method" -H "Authorization: Bearer $SBMAGIC_API_SECRET" -H "Content-Type: application/json" -d "$body" "http://$SBMAGIC_API_HOST:$SBMAGIC_API_PORT$path"
@@ -63,6 +86,9 @@ api_call_once() {
       api_call_nc "$method" "$path" ""
     fi
   fi
+  api_call_rc=$?
+  API_MAX_TIME="$old_api_max_time"
+  return "$api_call_rc"
 }
 
 api_call() {
