@@ -31,6 +31,10 @@ PROCESS_FILE="$RUNTIME_DIR/process.path"
 WATCHDOG_PID_FILE="$RUNTIME_DIR/watchdog.pid"
 NETWATCH_PID_FILE="$RUNTIME_DIR/netwatch.pid"
 NETWATCH_MONITOR_PID_FILE="$RUNTIME_DIR/netwatch.monitor.pid"
+NETWATCH_IGNORE_UNTIL_FILE="$RUNTIME_DIR/netwatch.ignore-until"
+NETWATCH_IGNORE_LOGGED_FILE="$RUNTIME_DIR/netwatch.ignore-logged"
+NETWATCH_IPV6_ADDR_STATE_FILE="$RUNTIME_DIR/netwatch.ipv6-addrs"
+LAST_GOOD_PROMOTE_PID_FILE="$RUNTIME_DIR/last-good-promote.pid"
 FAIL_COUNT_FILE="$RUNTIME_DIR/watchdog.failcount"
 SUPERVISOR_RESTART_FILE="$RUNTIME_DIR/supervisor.restart"
 SUPERVISOR_ROLLBACK_FILE="$RUNTIME_DIR/supervisor.rollback"
@@ -55,6 +59,7 @@ API_RETRIES=1
 # which would let every app enter TUN. Keep whitelist mode closed by adding a
 # sentinel UID that should never belong to a real Android app.
 WHITELIST_SENTINEL_UID=4294967294
+NETWATCH_OWN_TUN_GRACE_SECONDS=12
 
 mkdirs() {
   mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR" "$RULESET_DIR"
@@ -720,6 +725,23 @@ route_mixed_rules() {
   esac
 }
 
+route_effective_proxy_packages() {
+  package_arr="$1"
+  # If "auto" apps already use proxy, explicit proxy package rules do not
+  # change routing. Skipping them avoids sing-box package/process lookup on
+  # every proxied connection.
+  [ "$SBMAGIC_MIXED_RULE_PRIORITY" = "proxy" ] && { echo "[]"; return; }
+  echo "$package_arr"
+}
+
+route_effective_free_flow_packages() {
+  package_arr="$1"
+  # Same idea as proxy above: only emit package rules for the non-default
+  # strategy side.
+  [ "$SBMAGIC_MIXED_RULE_PRIORITY" = "free-flow" ] && { echo "[]"; return; }
+  echo "$package_arr"
+}
+
 route_quic_reject_rule() {
   package_arr="$1"
   [ "$SBMAGIC_REJECT_QUIC" = "true" ] || return 0
@@ -1030,8 +1052,10 @@ render_config() {
   dns_direct_domains="$(json_array_from_file "$DNS_DIRECT_FILE")"
   proxy_packages="$(json_array_from_file "$PROXY_PACKAGES_FILE")"
   free_flow_packages="$(json_array_from_file "$FREE_FLOW_PACKAGES_FILE")"
-  forced_proxy_rules="$(route_proxy_rules "$proxy_packages")"
-  forced_free_flow_rules="$(route_free_flow_rules "$free_flow_packages")"
+  effective_proxy_packages="$(route_effective_proxy_packages "$proxy_packages")"
+  effective_free_flow_packages="$(route_effective_free_flow_packages "$free_flow_packages")"
+  forced_proxy_rules="$(route_proxy_rules "$effective_proxy_packages")"
+  forced_free_flow_rules="$(route_free_flow_rules "$effective_free_flow_packages")"
   mixed_rules="$(route_mixed_rules)"
   clash_global_quic_reject_rule="$(route_clash_global_quic_reject_rule)"
   route_rule_sets="$(route_rule_set_block)"
@@ -1459,6 +1483,8 @@ stop_pid_file() {
 }
 
 stop_service_locked() {
+  mark_netwatch_own_tun_grace
+  stop_last_good_promote_timer
   if ! stop_pid_file && pid_alive; then
     pid="$(cat "$PID_FILE")"
     kill "$pid" 2>/dev/null
@@ -1485,6 +1511,7 @@ stop_service() {
 stop_all_service() {
   acquire_start_lock || { echo "another service operation is already in progress"; return 1; }
   trap 'release_start_lock' EXIT INT TERM HUP
+  stop_last_good_promote_timer
   stop_init_service
   stop_netwatch
   stop_watchdog
@@ -1566,6 +1593,7 @@ stop_netwatch() {
     rm -f "$NETWATCH_PID_FILE"
   fi
   stop_netwatch_monitor
+  cleanup_netwatch_fifos
   if command -v pgrep >/dev/null 2>&1; then
     for npid in $(pgrep -f "$DATA_DIR/magicctl netwatch" 2>/dev/null); do
       [ "$npid" = "$$" ] && continue
@@ -1576,6 +1604,7 @@ stop_netwatch() {
     done
   fi
   stop_netwatch_monitor
+  cleanup_netwatch_fifos
 }
 
 stop_netwatch_monitor() {
@@ -1590,6 +1619,13 @@ stop_netwatch_monitor() {
     i=$((i + 1))
   done
   kill -0 "$mpid" 2>/dev/null && kill -9 "$mpid" 2>/dev/null
+}
+
+cleanup_netwatch_fifos() {
+  for fifo in "$RUNTIME_DIR"/netwatch.events.*; do
+    [ "$fifo" = "$RUNTIME_DIR/netwatch.events.*" ] && continue
+    [ -p "$fifo" ] && rm -f "$fifo"
+  done
 }
 
 stop_init_service() {
@@ -1830,11 +1866,15 @@ status() {
   proxy_strategy_count="$(package_file_entry_count "$PROXY_PACKAGES_FILE")"
   free_flow_strategy_count="$(package_file_entry_count "$FREE_FLOW_PACKAGES_FILE")"
   strategy_package_count=$((proxy_strategy_count + free_flow_strategy_count))
+  proxy_lookup_count="$proxy_strategy_count"
+  free_flow_lookup_count="$free_flow_strategy_count"
+  [ "$SBMAGIC_MIXED_RULE_PRIORITY" = "proxy" ] && proxy_lookup_count=0
+  [ "$SBMAGIC_MIXED_RULE_PRIORITY" = "free-flow" ] && free_flow_lookup_count=0
   strategy_process_lookup=false
-  if [ "$proxy_strategy_count" -gt 0 ] && [ "$SBMAGIC_PROXY_RULE_MODE" != "off" ]; then
+  if [ "$proxy_lookup_count" -gt 0 ] && [ "$SBMAGIC_PROXY_RULE_MODE" != "off" ]; then
     strategy_process_lookup=true
   fi
-  if [ "$free_flow_strategy_count" -gt 0 ] && [ "$SBMAGIC_FREE_FLOW_RULE_MODE" != "off" ]; then
+  if [ "$free_flow_lookup_count" -gt 0 ] && [ "$SBMAGIC_FREE_FLOW_RULE_MODE" != "off" ]; then
     strategy_process_lookup=true
   fi
   echo "strategy_package_count=$strategy_package_count"
@@ -2020,6 +2060,89 @@ network_event_is_own_tun() {
   case "$event" in
     *"$SBMAGIC_INTERFACE"*) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+current_epoch() {
+  now="$(date +%s 2>/dev/null || echo 0)"
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  echo "$now"
+}
+
+mark_netwatch_own_tun_grace() {
+  mkdir -p "$RUNTIME_DIR" 2>/dev/null || true
+  now="$(current_epoch)"
+  [ "$now" -gt 0 ] || return 0
+  echo $((now + NETWATCH_OWN_TUN_GRACE_SECONDS)) > "$NETWATCH_IGNORE_UNTIL_FILE"
+  rm -f "$NETWATCH_IGNORE_LOGGED_FILE"
+  chmod 600 "$NETWATCH_IGNORE_UNTIL_FILE" 2>/dev/null || true
+}
+
+netwatch_own_tun_grace_active() {
+  [ -f "$NETWATCH_IGNORE_UNTIL_FILE" ] || return 1
+  until_epoch="$(cat "$NETWATCH_IGNORE_UNTIL_FILE" 2>/dev/null)"
+  case "$until_epoch" in
+    ''|*[!0-9]*)
+      rm -f "$NETWATCH_IGNORE_UNTIL_FILE" "$NETWATCH_IGNORE_LOGGED_FILE"
+      return 1
+      ;;
+  esac
+  now="$(current_epoch)"
+  if [ "$now" -gt 0 ] && [ "$now" -le "$until_epoch" ]; then
+    return 0
+  fi
+  rm -f "$NETWATCH_IGNORE_UNTIL_FILE" "$NETWATCH_IGNORE_LOGGED_FILE"
+  return 1
+}
+
+log_netwatch_own_tun_grace_once() {
+  [ -f "$NETWATCH_IGNORE_LOGGED_FILE" ] && return 0
+  log "network watch ignored own tun events during core restart"
+  : > "$NETWATCH_IGNORE_LOGGED_FILE"
+  chmod 600 "$NETWATCH_IGNORE_LOGGED_FILE" 2>/dev/null || true
+}
+
+snapshot_netwatch_ipv6_addrs() {
+  tmp="$NETWATCH_IPV6_ADDR_STATE_FILE.tmp.$$"
+  ip -6 -o addr show scope global 2>/dev/null | while IFS= read -r line; do
+    set -- $line
+    [ "$3" = "inet6" ] || continue
+    iface="${2%%@*}"
+    printf '%s %s\n' "$iface" "$4"
+  done | sort > "$tmp" 2>/dev/null || {
+    rm -f "$tmp"
+    return 1
+  }
+  mv "$tmp" "$NETWATCH_IPV6_ADDR_STATE_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+netwatch_event_is_known_ipv6_addr_refresh() {
+  event="$1"
+  case "$event" in
+    *" inet6 "*) ;;
+    *) return 1 ;;
+  esac
+  set -- $event
+  [ "$1" = "Deleted" ] && return 1
+  iface="${2%%@*}"
+  family="$3"
+  address="$4"
+  [ "$family" = "inet6" ] || return 1
+  [ -n "$iface" ] && [ -n "$address" ] || return 1
+  [ -f "$NETWATCH_IPV6_ADDR_STATE_FILE" ] || return 1
+  grep -Fqx "$iface $address" "$NETWATCH_IPV6_ADDR_STATE_FILE" 2>/dev/null
+}
+
+netwatch_event_is_ipv6_lifetime_line() {
+  case "$1" in
+    *"valid_lft "*"preferred_lft"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+netwatch_event_updates_ipv6_addr_state() {
+  case "$1" in
+    *" inet6 "*) snapshot_netwatch_ipv6_addrs >/dev/null 2>&1 || true ;;
   esac
 }
 
@@ -2405,14 +2528,67 @@ applist() {
 promote_last_good_later() {
   pid="$1"
   interval="$(watchdog_interval_seconds)"
-  (
-    sleep "$interval"
-    if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      cp -f "$CONFIG_FILE" "$LAST_GOOD_FILE" 2>/dev/null
-      echo 0 > "$FAIL_COUNT_FILE" 2>/dev/null
-      log "promoted current config to last-good after ${interval}s"
-    fi
-  ) >/dev/null 2>&1 &
+  stop_last_good_promote_timer
+  token="$(random_token)"
+  "$0" promote-last-good "$pid" "$token" "$interval" >/dev/null 2>&1 &
+  echo "$! $token" > "$LAST_GOOD_PROMOTE_PID_FILE"
+  chmod 600 "$LAST_GOOD_PROMOTE_PID_FILE" 2>/dev/null || true
+}
+
+promote_last_good_after() {
+  pid="$1"
+  token="$2"
+  interval="$3"
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  [ -n "$token" ] || return 0
+  case "$interval" in ''|*[!0-9]*) interval=300 ;; esac
+  sleep "$interval"
+  timer_entry="$(cat "$LAST_GOOD_PROMOTE_PID_FILE" 2>/dev/null)"
+  case "$timer_entry" in *" $token") ;; *) return 0 ;; esac
+  if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    cp -f "$CONFIG_FILE" "$LAST_GOOD_FILE" 2>/dev/null
+    echo 0 > "$FAIL_COUNT_FILE" 2>/dev/null
+    log "promoted current config to last-good after ${interval}s"
+  fi
+  timer_entry="$(cat "$LAST_GOOD_PROMOTE_PID_FILE" 2>/dev/null)"
+  case "$timer_entry" in *" $token") rm -f "$LAST_GOOD_PROMOTE_PID_FILE" ;; esac
+}
+
+stop_last_good_promote_timer() {
+  if [ ! -f "$LAST_GOOD_PROMOTE_PID_FILE" ]; then
+    stop_stray_last_good_promote_timers
+    return 0
+  fi
+  timer_entry="$(cat "$LAST_GOOD_PROMOTE_PID_FILE" 2>/dev/null)"
+  rm -f "$LAST_GOOD_PROMOTE_PID_FILE"
+  timer_pid="${timer_entry%% *}"
+  case "$timer_pid" in
+    ''|*[!0-9]*) ;;
+    *)
+      [ "$timer_pid" = "$$" ] && timer_pid=""
+      [ "$timer_pid" = "$(cat "$WATCHDOG_PID_FILE" 2>/dev/null)" ] && timer_pid=""
+      [ "$timer_pid" = "$(cat "$NETWATCH_PID_FILE" 2>/dev/null)" ] && timer_pid=""
+      [ "$timer_pid" = "$(cat "$PID_FILE" 2>/dev/null)" ] && timer_pid=""
+      if [ -n "$timer_pid" ] && [ -r "/proc/$timer_pid/cmdline" ]; then
+        cmdline="$(tr '\000' ' ' < "/proc/$timer_pid/cmdline" 2>/dev/null || true)"
+        case "$cmdline" in
+          *"$DATA_DIR/magicctl"*"promote-last-good"*|*"magicctl promote-last-good"*) kill -9 "$timer_pid" 2>/dev/null || true ;;
+        esac
+      fi
+      ;;
+  esac
+  stop_stray_last_good_promote_timers
+}
+
+stop_stray_last_good_promote_timers() {
+  for stale_pid in $(pgrep -f "magicctl promote-last-good" 2>/dev/null); do
+    [ "$stale_pid" = "$$" ] && continue
+    [ -r "/proc/$stale_pid/cmdline" ] || continue
+    stale_cmdline="$(tr '\000' ' ' < "/proc/$stale_pid/cmdline" 2>/dev/null || true)"
+    case "$stale_cmdline" in
+      *"$DATA_DIR/magicctl"*"promote-last-good"*) kill -9 "$stale_pid" 2>/dev/null || true ;;
+    esac
+  done
 }
 
 watchdog_failure_count() {
@@ -2561,6 +2737,8 @@ netwatch() {
     exit 0
   fi
 
+  cleanup_netwatch_fifos
+  snapshot_netwatch_ipv6_addrs >/dev/null 2>&1 || true
   last_event=0
   while true; do
     rm -f "$NETWATCH_FIFO"
@@ -2582,6 +2760,16 @@ netwatch() {
         rm -f "$NETWATCH_PID_FILE"
         exit 0
       fi
+      if netwatch_own_tun_grace_active; then
+        log_netwatch_own_tun_grace_once
+        continue
+      fi
+      if netwatch_event_is_ipv6_lifetime_line "$event"; then
+        continue
+      fi
+      if netwatch_event_is_known_ipv6_addr_refresh "$event"; then
+        continue
+      fi
       own_tun_event=false
       if network_event_is_own_tun "$event"; then
         if tun_health_ok_or_unknown; then
@@ -2590,6 +2778,7 @@ netwatch() {
         own_tun_event=true
         log "network watch tun missing after event: $event"
       fi
+      netwatch_event_updates_ipv6_addr_state "$event"
       now="$(date +%s 2>/dev/null || echo 0)"
       case "$now" in ''|*[!0-9]*) now=0 ;; esac
       cooldown="$SBMAGIC_NETWORK_RECOVERY_COOLDOWN"
@@ -2809,6 +2998,7 @@ case "$cmd" in
     esac
     ;;
   applist) applist "$1" ;;
+  promote-last-good) promote_last_good_after "$1" "$2" "$3" ;;
   watchdog) watchdog ;;
   netwatch) netwatch ;;
   initd) initd ;;

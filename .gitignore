@@ -3,6 +3,7 @@
 /build/
 /legacy/
 /bench/bin/
+/bench/artifacts/
 /module/bin/*/magic-fetch
 /module/bin/applist.dex
 /module/defaults/rulesets/*.srs
