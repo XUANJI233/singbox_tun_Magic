@@ -1,7 +1,7 @@
 id=singbox_tun_Magic
 name=星盘
-version=2026.07.02.1
-versionCode=13
+version=2026.07.02.2
+versionCode=14
 author=XUANJI233
 description=sing-box-extended 原生 TUN 常驻模块,支持可配置进程名/TUN 名、WebUI 与安全本机控制面
 updateJson=https://github.com/XUANJI233/singbox_tun_Magic/releases/latest/download/update.json

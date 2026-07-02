@@ -32,10 +32,11 @@ mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$RUNTIME_DIR" "$LOG_DIR" "$CACHE_DIR" "$RULES
 
 cp -f "$MODPATH/bin/$SBMAGIC_ABI/sing-box" "$BIN_DIR/.core"
 [ -f "$MODPATH/bin/$SBMAGIC_ABI/magic-fetch" ] && cp -f "$MODPATH/bin/$SBMAGIC_ABI/magic-fetch" "$BIN_DIR/magic-fetch"
+[ -f "$MODPATH/bin/$SBMAGIC_ABI/magicctl-go" ] && cp -f "$MODPATH/bin/$SBMAGIC_ABI/magicctl-go" "$BIN_DIR/magicctl-go"
 # applist.dex is ABI-independent dalvik bytecode (app-label dumper run via app_process)
 [ -f "$MODPATH/bin/applist.dex" ] && cp -f "$MODPATH/bin/applist.dex" "$BIN_DIR/applist.dex"
 cp -f "$MODPATH/common/magicctl" "$DATA_DIR/magicctl"
-chmod 755 "$BIN_DIR/.core" "$BIN_DIR/magic-fetch" "$DATA_DIR/magicctl" 2>/dev/null
+chmod 755 "$BIN_DIR/.core" "$BIN_DIR/magic-fetch" "$BIN_DIR/magicctl-go" "$DATA_DIR/magicctl" 2>/dev/null
 
 core_fp="$(stat -c '%s:%Y' "$BIN_DIR/.core" 2>/dev/null)"
 core_version="$("$BIN_DIR/.core" version 2>/dev/null | head -1)"
@@ -75,6 +76,7 @@ set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm_recursive "$DATA_DIR" 0 0 0700 0600
 set_perm "$BIN_DIR/.core" 0 0 0755
 [ -f "$BIN_DIR/magic-fetch" ] && set_perm "$BIN_DIR/magic-fetch" 0 0 0755
+[ -f "$BIN_DIR/magicctl-go" ] && set_perm "$BIN_DIR/magicctl-go" 0 0 0755
 set_perm "$DATA_DIR/magicctl" 0 0 0755
 
 ui_print "- ABI: $SBMAGIC_ABI"

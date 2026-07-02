@@ -19,8 +19,10 @@ EXECUTABLES = {
     "META-INF/com/google/android/update-binary",
     "bin/arm64-v8a/sing-box",
     "bin/arm64-v8a/magic-fetch",
+    "bin/arm64-v8a/magicctl-go",
     "bin/x86_64/sing-box",
     "bin/x86_64/magic-fetch",
+    "bin/x86_64/magicctl-go",
 }
 
 ABI_DIRS = {"arm64-v8a", "x86_64"}
@@ -107,12 +109,13 @@ def main() -> None:
     download_rulesets()
 
     if abi:
-        required_bins = [f"bin/{abi}/sing-box", f"bin/{abi}/magic-fetch"]
+        required_bins = [f"bin/{abi}/sing-box", f"bin/{abi}/magic-fetch", f"bin/{abi}/magicctl-go"]
         default_name = f"星盘_{abi}.zip"
     else:
         required_bins = [
             "bin/arm64-v8a/sing-box", "bin/x86_64/sing-box",
             "bin/arm64-v8a/magic-fetch", "bin/x86_64/magic-fetch",
+            "bin/arm64-v8a/magicctl-go", "bin/x86_64/magicctl-go",
         ]
         default_name = "星盘.zip"
 

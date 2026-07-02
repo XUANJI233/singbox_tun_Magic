@@ -84,10 +84,12 @@ try {
   $env:GOARCH = "arm64"
   $env:CC = $Arm64Cc
   Invoke-Native $Go @("build", "-trimpath", "-tags", "netgo,osusergo", "-ldflags", "-s -w", "-o", "module/bin/arm64-v8a/magic-fetch", "./tools/magic-fetch")
+  Invoke-Native $Go @("build", "-trimpath", "-tags", "netgo,osusergo", "-ldflags", "-s -w", "-o", "module/bin/arm64-v8a/magicctl-go", "./tools/magicctl-go")
 
   $env:GOARCH = "amd64"
   $env:CC = $X64Cc
   Invoke-Native $Go @("build", "-trimpath", "-tags", "netgo,osusergo", "-ldflags", "-s -w", "-o", "module/bin/x86_64/magic-fetch", "./tools/magic-fetch")
+  Invoke-Native $Go @("build", "-trimpath", "-tags", "netgo,osusergo", "-ldflags", "-s -w", "-o", "module/bin/x86_64/magicctl-go", "./tools/magicctl-go")
 } finally {
   $env:GOOS = $oldGoos
   $env:GOARCH = $oldGoarch
@@ -106,5 +108,7 @@ Invoke-Native $D8 @("--min-api", "33", "--output", $DexDir, (Join-Path $ClassesD
 Copy-Item -LiteralPath (Join-Path $DexDir "classes.dex") -Destination module/bin/applist.dex -Force
 
 Write-Host "built module/bin/arm64-v8a/magic-fetch"
+Write-Host "built module/bin/arm64-v8a/magicctl-go"
 Write-Host "built module/bin/x86_64/magic-fetch"
+Write-Host "built module/bin/x86_64/magicctl-go"
 Write-Host "built module/bin/applist.dex"

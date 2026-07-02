@@ -443,6 +443,7 @@ promote-last-good delta_jiffies=0
 
 - **gvisor 栈仍是主要转发开销**:AVD 中 system/mixed 不是可靠路径,所以默认保留 gvisor。真实机若 system 栈可用,仍可单独对比,但不能作为默认。
 - **远程 DNS 经 proxy**:`dns.final=remote` + remote DNS `detour=proxy` 能防 DNS 泄漏,但代理链路抖动时新域名解析会慢;这会表现为"新连接打不开",不一定是长连接真的断。CN/直连域名现在会优先用本地 DNS,减少这种冷启动绕路。
+- **DNS 独立失败预算暂不硬塞配置字段**:sing-box 官方 `dns.timeout` / DNS rule action `timeout` 是 1.14 系列字段,当前模块核心是 1.13.14-extended。为了避免升级前被 `sing-box check` 拒绝,本轮不渲染这些字段;后续升级核心后再把 `SBMAGIC_DNS_TIMEOUT` 做成受版本保护的配置项。
 - **规则集默认本地预置**:打包时预取 geosite-cn / geoip-cn `.srs`,安装时复制到 `$CACHE_DIR/rulesets`,渲染时优先使用 `type: local`。`SBMAGIC_RULESET_DOWNLOAD_DETOUR=direct` 只用于本地文件缺失后的远程兜底,避免首次启动出现规则下载/代理就绪互相等待。规则文件时间已在状态页展示;直连无法更新时再切到 `proxy`。
 - **只有非默认策略侧需要包名识别**:`packages.proxy/free-flow` 是 route 层强制策略。渲染时会跳过与 `SBMAGIC_MIXED_RULE_PRIORITY` 相同的一侧,所以默认代理优先下,`packages.proxy` 不再生成 `package_name` 条件;只有少数强制走另一侧策略的应用才需要包名/进程识别。
 - **auto_redirect 不是 UDP/QUIC 加速器**:Android 上它主要优化 IPv4 TCP。应用侧 HTTP/3/QUIC 仍走 UDP/gVisor 路径;`SBMAGIC_REJECT_QUIC=false` 默认关闭,只有确认设备被 UDP/443 成本拖慢时才建议开启,让应用回退 TCP。Hysteria2/TUIC/QUIC 节点出站不受这个路由拒绝规则影响。
@@ -463,6 +464,7 @@ promote-last-good delta_jiffies=0
 - 已新增 `cleanup_netwatch_fifos`,在 netwatch 启动和停止时清理 `runtime/netwatch.events.*` 孤儿 FIFO。SIGKILL 本身无法执行 trap,但下一次 stop/start 会清掉残留。
 - 已修正 `settings.env` 的 auto_redirect 注释:Android 上是 iptables REDIRECT 快路径,不是 nftables 依赖。
 - 已优化策略渲染:与 `SBMAGIC_MIXED_RULE_PRIORITY` 相同的一侧不再生成 `package_name` 规则。当前常见的白名单 + 代理优先配置下,即使 UI 中 `packages.proxy` 与入口白名单相同,route 层也不会再触发每连接包名识别。
+- 已把配置渲染从 2800+ 行 shell 主控中拆出到 `tools/magicctl-go/`:shell `magicctl` 保留启动/停止/watchdog/netwatch 等 Android 生命周期编排,Go `magicctl-go render` 专管 DNS/TUN/route/fake-ip/ruleset JSON。渲染逻辑按文件拆分,并补了默认策略包名识别、QUIC 范围、fake-ip IPv6 的单元测试。
 
 真机应用:
 - 已把新版 `magicctl` 同步到 `/data/adb/singbox_tun_Magic/magicctl` 和模块目录。

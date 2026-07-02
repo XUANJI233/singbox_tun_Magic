@@ -69,7 +69,7 @@ APP 流量 + DNS 查询
 
 - 用 sing-box tun inbound 的 `include_package`(白名单)或 `exclude_package`(黑名单)字段,对应模块的 `packages.include` / `packages.exclude` 文件,见 `module/defaults/`。
 - 在本模块这种 root CLI 形态下,这是 sing-tun 的 Android package 规则能力:包名解析为 UID 范围后由 `auto_route` 生成路由规则。**被排除 UID 的数据和常规 DNS 都不会进入本模块 tun 接口**,不存在旧文档里"DNS 全局接管、排除 APP 的 DNS 仍被拦截"的问题。
-- 进入 TUN 之后的"自动/代理/免流"不是入口控制,而是 sing-box route 层的出站策略。`packages.proxy` / `packages.free-flow` 会生成 `package_name` 路由条件,启用每连接包名/进程识别;大量短连接场景有额外性能成本,所以只建议给确实需要强制策略的少量应用使用。
+- 进入 TUN 之后的"自动/代理/免流"不是入口控制,而是 sing-box route 层的出站策略。`packages.proxy` / `packages.free-flow` 只在"非默认策略侧"生成 `package_name` 路由条件;默认代理优先时,`packages.proxy` 不会触发每连接包名/进程识别。
 - 黑/白名单两种模式见 §3。
 
 ### 1.3 各组件职责
@@ -77,7 +77,8 @@ APP 流量 + DNS 查询
 | 组件 | 形态 | 职责 | 待机能耗 |
 |------|------|------|----------|
 | sing-box | Go 二进制 | tun 创建/per-app/DNS(real-ip/fake-ip)/目的地分流/协议出站,单进程全包 | 中(Go 运行时 + gvisor 默认栈) |
-| magicctl | shell | 渲染配置、启停/`reload`/`rollback`、带启动互斥锁、watchdog 崩溃自愈、`fetch` 订阅、clash API 代理调用 | 取决于守护方式 |
+| magicctl | shell | 启停/`reload`/`rollback`、启动互斥锁、watchdog 崩溃自愈、`fetch` 订阅、clash API 代理调用 | 取决于守护方式 |
+| magicctl-go | Go 二进制 | 渲染 sing-box 运行配置:DNS/TUN/route/fake-ip/规则集/策略名单 | 零(只在 render/check/reload 时运行) |
 | service.sh / post-fs-data.sh | shell | 启动编排 | 零(仅启动时跑一次) |
 | WebUI(已落地) | HTML/JS | 配置入口 + 节点导入 + 状态/流量可视化 + 故障恢复 | 零(不常驻,见 §8) |
 
@@ -465,7 +466,7 @@ APP 流量 + DNS 查询
 ## 15. 构建与发布
 
 - 模块 ID 固定为 `singbox_tun_Magic`,展示名为 `星盘`,运行目录为 `/data/adb/singbox_tun_Magic`。
-- 本地打包产物名固定为 `星盘.zip`:先运行 `scripts/build-helpers.ps1` 重建 `magic-fetch`(arm64-v8a/x86_64)和 `applist.dex`,再运行 `python scripts/package-module.py --output dist/星盘.zip`。打包脚本会自动拉取 geosite-cn / geoip-cn `.srs` 并放入 zip 的 `defaults/rulesets`,使全新安装首次启动直接使用本地规则集。x86_64 Go/Android helper 需要 Android NDK clang wrapper,脚本会从 `ANDROID_HOME`/`ANDROID_SDK_ROOT` 下自动查找。
+- 本地打包产物名固定为 `星盘.zip`:先运行 `scripts/build-helpers.ps1` 重建 `magic-fetch`、`magicctl-go`(arm64-v8a/x86_64)和 `applist.dex`,再运行 `python scripts/package-module.py --output dist/星盘.zip`。打包脚本会自动拉取 geosite-cn / geoip-cn `.srs` 并放入 zip 的 `defaults/rulesets`,使全新安装首次启动直接使用本地规则集。x86_64 Go/Android helper 需要 Android NDK clang wrapper,脚本会从 `ANDROID_HOME`/`ANDROID_SDK_ROOT` 下自动查找。
 - `scripts/write-update-json.py` 生成 Magisk update metadata,`module.prop` 的 `updateJson` 指向 GitHub latest release 的 `update.json`;该 JSON 的 `zipUrl` 指向同一 release 下的 `星盘.zip`。
 - GitHub Actions `.github/workflows/release.yml` 在 tag `v*` 推送时自动构建、打包、生成 `update.json`,并把 `星盘.zip` 与 `update.json` 发布为 release 资产。workflow_dispatch 也可手动构建 artifacts。
 

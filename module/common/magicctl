@@ -11,6 +11,7 @@ RULESET_DIR="$CACHE_DIR/rulesets"
 CORE_BIN="$BIN_DIR/.core"
 SING_BOX="$BIN_DIR/netd-helper"
 FETCHER="$BIN_DIR/magic-fetch"
+RENDERER="$BIN_DIR/magicctl-go"
 APPLIST_DEX="$BIN_DIR/applist.dex"
 SETTINGS_FILE="$CONFIG_DIR/settings.env"
 OUTBOUNDS_FILE="$CONFIG_DIR/outbounds.json"
@@ -55,10 +56,6 @@ FAIL_THRESHOLD=3
 API_CONNECT_TIMEOUT=1
 API_MAX_TIME=2
 API_RETRIES=1
-# sing-tun treats an empty include_package list as "no UID include filter",
-# which would let every app enter TUN. Keep whitelist mode closed by adding a
-# sentinel UID that should never belong to a real Android app.
-WHITELIST_SENTINEL_UID=4294967294
 NETWATCH_OWN_TUN_GRACE_SECONDS=12
 
 mkdirs() {
@@ -401,7 +398,7 @@ cleanup_stale_process_binaries() {
   for candidate in "$BIN_DIR"/* "$BIN_DIR"/.[!.]* "$BIN_DIR"/..?*; do
     [ -e "$candidate" ] || continue
     case "$candidate" in
-      "$CORE_BIN"|"$SING_BOX"|"$FETCHER"|"$APPLIST_DEX")
+      "$CORE_BIN"|"$SING_BOX"|"$FETCHER"|"$RENDERER"|"$APPLIST_DEX")
         continue
       ;;
     esac
@@ -537,26 +534,6 @@ json_bool() {
   esac
 }
 
-json_array_from_file() {
-  file="$1"
-  awk '
-    BEGIN { first = 1; printf "[" }
-    {
-      line = $0
-      sub(/\r$/, "", line)
-      sub(/^[ \t]+/, "", line)
-      sub(/[ \t]+$/, "", line)
-      if (line == "" || line ~ /^#/) next
-      gsub(/\\/, "\\\\", line)
-      gsub(/"/, "\\\"", line)
-      if (!first) printf ","
-      printf "\"%s\"", line
-      first = 0
-    }
-    END { printf "]" }
-  ' "$file"
-}
-
 package_file_has_entries() {
   file="$1"
   awk '
@@ -645,211 +622,8 @@ ensure_no_strategy_conflicts_files() {
   [ -z "$conflict" ] || die "package exists in both packages.proxy and packages.free-flow: $conflict"
 }
 
-route_package_field() {
-  package_arr="$1"
-  [ -n "$package_arr" ] || return 0
-  printf ',\n        "package_name": %s' "$package_arr"
-}
-
-route_proxy_rules() {
-  package_arr="$1"
-  [ "$package_arr" = "[]" ] && return 0
-  pkg_json="$(route_package_field "$package_arr")"
-  reject_quic_rule="$(route_quic_reject_rule "$package_arr")"
-  case "$SBMAGIC_PROXY_RULE_MODE" in
-    off)
-      return 0
-      ;;
-    global)
-      cat <<EOF
-${reject_quic_rule}
-,
-      {
-        "outbound": "proxy"$pkg_json
-      }
-EOF
-      ;;
-    bypass-cn)
-      cat <<EOF
-,
-      {
-        "domain_suffix": [
-          "cn"
-        ],
-        "outbound": "direct"$pkg_json
-      },
-      {
-        "rule_set": [
-          "geosite-cn",
-          "geoip-cn"
-        ],
-        "outbound": "direct"$pkg_json
-      }${reject_quic_rule},
-      {
-        "outbound": "proxy"$pkg_json
-      }
-EOF
-      ;;
-  esac
-}
-
-route_free_flow_rules() {
-  package_arr="$1"
-  [ "$package_arr" = "[]" ] && return 0
-  pkg_json="$(route_package_field "$package_arr")"
-  case "$SBMAGIC_FREE_FLOW_RULE_MODE" in
-    off)
-      return 0
-      ;;
-    global)
-      cat <<EOF
-,
-      {
-        "outbound": "free-flow"$pkg_json
-      }
-EOF
-      ;;
-  esac
-}
-
-route_mixed_rules() {
-  case "$SBMAGIC_MIXED_RULE_PRIORITY" in
-    free-flow)
-      route_free_flow_rules ""
-      route_proxy_rules ""
-      ;;
-    *)
-      route_proxy_rules ""
-      route_free_flow_rules ""
-      ;;
-  esac
-}
-
-route_effective_proxy_packages() {
-  package_arr="$1"
-  # If "auto" apps already use proxy, explicit proxy package rules do not
-  # change routing. Skipping them avoids sing-box package/process lookup on
-  # every proxied connection.
-  [ "$SBMAGIC_MIXED_RULE_PRIORITY" = "proxy" ] && { echo "[]"; return; }
-  echo "$package_arr"
-}
-
-route_effective_free_flow_packages() {
-  package_arr="$1"
-  # Same idea as proxy above: only emit package rules for the non-default
-  # strategy side.
-  [ "$SBMAGIC_MIXED_RULE_PRIORITY" = "free-flow" ] && { echo "[]"; return; }
-  echo "$package_arr"
-}
-
-route_quic_reject_rule() {
-  package_arr="$1"
-  [ "$SBMAGIC_REJECT_QUIC" = "true" ] || return 0
-  pkg_json="$(route_package_field "$package_arr")"
-  cat <<'EOF'
-,
-      {
-        "network": "udp",
-        "port": [
-          443
-        ],
-        "action": "reject"
-EOF
-  printf '%s\n' "$pkg_json"
-  cat <<'EOF'
-      }
-EOF
-}
-
-route_clash_global_quic_reject_rule() {
-  [ "$SBMAGIC_REJECT_QUIC" = "true" ] || return 0
-  cat <<'EOF'
-,
-      {
-        "clash_mode": "Global",
-        "network": "udp",
-        "port": [
-          443
-        ],
-        "action": "reject"
-      }
-EOF
-}
-
 rule_sets_used() {
   [ "$SBMAGIC_PROXY_RULE_MODE" = "bypass-cn" ]
-}
-
-route_rule_set_block() {
-  rule_sets_used || return 0
-  if [ -s "$GEOSITE_CN_RULESET" ] && [ -s "$GEOIP_CN_RULESET" ]; then
-    cat <<EOF
-    "rule_set": [
-      {
-        "tag": "geosite-cn",
-        "type": "local",
-        "format": "binary",
-        "path": "$GEOSITE_CN_RULESET"
-      },
-      {
-        "tag": "geoip-cn",
-        "type": "local",
-        "format": "binary",
-        "path": "$GEOIP_CN_RULESET"
-      }
-    ],
-EOF
-    return 0
-  fi
-  cat <<EOF
-    "rule_set": [
-      {
-        "tag": "geosite-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "$GEOSITE_CN_RULESET_URL",
-        "download_detour": "$SBMAGIC_RULESET_DOWNLOAD_DETOUR",
-        "update_interval": "$SBMAGIC_RULE_UPDATE_INTERVAL"
-      },
-      {
-        "tag": "geoip-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "$GEOIP_CN_RULESET_URL",
-        "download_detour": "$SBMAGIC_RULESET_DOWNLOAD_DETOUR",
-        "update_interval": "$SBMAGIC_RULE_UPDATE_INTERVAL"
-      }
-    ],
-EOF
-}
-
-dns_tls_block() {
-  dns_type="$1"
-  server_name="$2"
-  [ -n "$server_name" ] || return 0
-  case "$dns_type" in
-    https|tls|quic|h3)
-      cat <<EOF
-,
-        "tls": {
-          "server_name": "$server_name"
-        }
-EOF
-      ;;
-  esac
-}
-
-dns_geosite_cn_rule() {
-  rule_sets_used || return 0
-  cat <<'EOF'
-      {
-        "rule_set": [
-          "geosite-cn"
-        ],
-        "action": "route",
-        "server": "local"
-      },
-EOF
 }
 
 random_token() {
@@ -913,6 +687,7 @@ ensure_api_env() {
       ;;
     *)
       valid_port "$configured_port" || die "invalid SBMAGIC_API_PORT '$configured_port': use auto or a port from 1 to 65535"
+      [ "$SBMAGIC_API_PORT" != "$configured_port" ] && rewrite_api_env=true
       SBMAGIC_API_PORT="$configured_port"
       ;;
   esac
@@ -1007,31 +782,6 @@ apply_oom_score_adj() {
   fi
 }
 
-package_field() {
-  mode="$SBMAGIC_PACKAGE_MODE"
-  case "$mode" in
-    white)
-      arr="$(json_array_from_file "$INCLUDE_FILE")"
-      printf ',\n      "include_uid": [%s],\n      "include_package": %s' "$WHITELIST_SENTINEL_UID" "$arr"
-      ;;
-    *)
-      arr="$(json_array_from_file "$EXCLUDE_FILE")"
-      printf ',\n      "exclude_package": %s' "$arr"
-      ;;
-  esac
-}
-
-tun_stack_fields() {
-  # endpoint_independent_nat (Full Cone) helps P2P/voice/gaming NAT traversal,
-  # but sing-box documents it as a slight throughput cost and it is gvisor-only.
-  # Default OFF for the performance-first always-on profile; enable only when a
-  # user actually needs Full Cone. Other stacks are endpoint-independent anyway.
-  if [ "$SBMAGIC_STACK" = "gvisor" ] && [ "$SBMAGIC_ENDPOINT_INDEPENDENT_NAT" = "true" ]; then
-    printf ',\n      "endpoint_independent_nat": true'
-  fi
-  printf ',\n      "udp_timeout": "%s"' "$SBMAGIC_UDP_TIMEOUT"
-}
-
 render_config() {
   mkdirs
   load_settings
@@ -1039,226 +789,11 @@ render_config() {
   ensure_api_env
 
   [ -x "$SING_BOX" ] || die "sing-box binary missing: $SING_BOX"
+  [ -x "$RENDERER" ] || die "magicctl-go missing: $RENDERER"
   [ -f "$OUTBOUNDS_FILE" ] || die "outbounds file missing: $OUTBOUNDS_FILE"
   ensure_no_strategy_conflicts
 
-  auto_route="$(json_bool "$SBMAGIC_AUTO_ROUTE")"
-  auto_redirect="$(json_bool "$SBMAGIC_AUTO_REDIRECT")"
-  strict_route="$(json_bool "$SBMAGIC_STRICT_ROUTE")"
-  dns_reverse_mapping="$(json_bool "$SBMAGIC_DNS_REVERSE_MAPPING")"
-  ipv6_enabled="$(json_bool "$SBMAGIC_IPV6")"
-  package_json="$(package_field)"
-  tun_stack_json="$(tun_stack_fields)"
-  dns_direct_domains="$(json_array_from_file "$DNS_DIRECT_FILE")"
-  proxy_packages="$(json_array_from_file "$PROXY_PACKAGES_FILE")"
-  free_flow_packages="$(json_array_from_file "$FREE_FLOW_PACKAGES_FILE")"
-  effective_proxy_packages="$(route_effective_proxy_packages "$proxy_packages")"
-  effective_free_flow_packages="$(route_effective_free_flow_packages "$free_flow_packages")"
-  forced_proxy_rules="$(route_proxy_rules "$effective_proxy_packages")"
-  forced_free_flow_rules="$(route_free_flow_rules "$effective_free_flow_packages")"
-  mixed_rules="$(route_mixed_rules)"
-  clash_global_quic_reject_rule="$(route_clash_global_quic_reject_rule)"
-  route_rule_sets="$(route_rule_set_block)"
-  dns_local_tls="$(dns_tls_block "$SBMAGIC_DNS_LOCAL_TYPE" "$SBMAGIC_DNS_LOCAL_TLS_SERVER_NAME")"
-  dns_remote_tls="$(dns_tls_block "$SBMAGIC_DNS_REMOTE_TYPE" "$SBMAGIC_DNS_REMOTE_TLS_SERVER_NAME")"
-  dns_geosite_cn_rule="$(dns_geosite_cn_rule)"
-  sniff_rule=""
-  if [ "$SBMAGIC_SNIFF" = "true" ]; then
-    sniff_rule=$(cat <<EOF
-,
-      {
-        "action": "sniff",
-        "timeout": "$SBMAGIC_SNIFF_TIMEOUT"
-      }
-EOF
-)
-  fi
-
-  # The tun interface always claims a (non-routable ULA) IPv6 address so
-  # auto_route grabs the IPv6 default route too -- even when SBMAGIC_IPV6 is
-  # off. Without this, a device with real IPv6 connectivity would let
-  # proxied apps' IPv6 traffic bypass the tun entirely and leak the real
-  # address over the carrier network instead of being blocked/proxied.
-  # See dns_reject_aaaa / route_ipv6_guard below for the "off" half of
-  # this leak-prevention pair.
-  tun_address='["172.19.0.1/30","fdfe:dcba:9876::1/126"]'
-
-  dns_reject_aaaa=""
-  route_ipv6_guard=""
-  if [ "$ipv6_enabled" != "true" ]; then
-    dns_reject_aaaa=$(cat <<'EOF'
-{
-        "query_type": [
-          "AAAA"
-        ],
-        "action": "reject"
-      },
-EOF
-)
-    route_ipv6_guard=$(cat <<'EOF'
-{
-        "ip_version": 6,
-        "action": "reject"
-      },
-EOF
-)
-  fi
-
-  # fake-ip is expressed as a DNS *server* of type "fakeip" in the 1.12+
-  # format (the old top-level dns.fakeip object was removed in 1.14). dns.final
-  # stays local/remote because sing-box rejects fakeip as the default server;
-  # instead, a catch-all A/AAAA rule routes non-direct queries to fakeip after
-  # the direct/CN rules below.
-  fakeip_server=""
-  fakeip_rule=""
-  # store_fakeip persists fake-ip<->domain mappings across restarts. Its
-  # default flipped between sing-box versions, so we set it explicitly (only
-  # in fake-ip mode) to keep behaviour predictable -- without it, every
-  # restart invalidates live fake-ip sessions.
-  store_fakeip_line=""
-  if [ "$SBMAGIC_DNS_MODE" = "fake-ip" ]; then
-    store_fakeip_line=',
-      "store_fakeip": true'
-    if [ "$ipv6_enabled" = "true" ]; then
-      fakeip_query_types='"A","AAAA"'
-      fakeip_server=$(cat <<EOF
-,
-      {
-        "type": "fakeip",
-        "tag": "fakeip",
-        "inet4_range": "$SBMAGIC_FAKEIP4",
-        "inet6_range": "$SBMAGIC_FAKEIP6"
-      }
-EOF
-)
-    else
-      fakeip_query_types='"A"'
-      fakeip_server=$(cat <<EOF
-,
-      {
-        "type": "fakeip",
-        "tag": "fakeip",
-        "inet4_range": "$SBMAGIC_FAKEIP4"
-      }
-EOF
-)
-    fi
-    fakeip_rule=$(cat <<EOF
-,
-      {
-        "query_type": [
-          $fakeip_query_types
-        ],
-        "action": "route",
-        "server": "fakeip"
-      }
-EOF
-)
-  fi
-
-  outbounds_json="$(cat "$OUTBOUNDS_FILE")"
-  # PID-suffixed temp so two concurrent renders (e.g. a manual restart racing
-  # the watchdog) can never clobber each other's half-written file -- each
-  # writes a complete file and the final atomic mv just picks a winner.
-  tmp="$CONFIG_FILE.tmp.$$"
-
-  cat > "$tmp" <<EOF
-{
-  "log": {
-    "level": "warn",
-    "output": "$LOG_DIR/box.log",
-    "timestamp": true
-  },
-  "dns": {
-    "servers": [
-      {
-        "type": "$SBMAGIC_DNS_LOCAL_TYPE",
-        "tag": "local",
-        "server": "$SBMAGIC_DNS_LOCAL_SERVER"$dns_local_tls
-      },
-      {
-        "type": "$SBMAGIC_DNS_REMOTE_TYPE",
-        "tag": "remote",
-        "server": "$SBMAGIC_DNS_REMOTE_SERVER",
-        "detour": "proxy"$dns_remote_tls
-      }$fakeip_server
-    ],
-    "reverse_mapping": $dns_reverse_mapping,
-    "rules": [
-      $dns_reject_aaaa{
-        "domain": $dns_direct_domains,
-        "action": "route",
-        "server": "local"
-      },
-${dns_geosite_cn_rule}
-      {
-        "domain_suffix": [
-          "cn"
-        ],
-        "action": "route",
-        "server": "local"
-      }$fakeip_rule
-    ],
-    "final": "$SBMAGIC_DNS_FINAL",
-    "strategy": "$SBMAGIC_DNS_STRATEGY"
-  },
-  "inbounds": [
-    {
-      "type": "tun",
-      "tag": "tun-in",
-      "interface_name": "$SBMAGIC_INTERFACE",
-      "address": $tun_address,
-      "mtu": $SBMAGIC_MTU,
-      "auto_route": $auto_route,
-      "auto_redirect": $auto_redirect,
-      "strict_route": $strict_route$tun_stack_json,
-      "stack": "$SBMAGIC_STACK"$package_json
-    }
-  ],
-  "outbounds": $outbounds_json,
-  "route": {
-${route_rule_sets}
-    "rules": [
-      {
-        "protocol": "dns",
-        "action": "hijack-dns"
-      }$sniff_rule,
-      $route_ipv6_guard{
-        "ip_is_private": true,
-        "outbound": "direct"
-      },
-      {
-        "clash_mode": "Direct",
-        "outbound": "direct"
-      }$clash_global_quic_reject_rule,
-      {
-        "clash_mode": "Global",
-        "outbound": "proxy"
-      }$forced_proxy_rules$forced_free_flow_rules$mixed_rules
-    ],
-    "final": "direct",
-    "auto_detect_interface": true,
-    "default_domain_resolver": {
-      "server": "local"
-    }
-  },
-  "experimental": {
-    "cache_file": {
-      "enabled": true,
-      "path": "$CACHE_DIR/cache.db"$store_fakeip_line
-    },
-    "clash_api": {
-      "external_controller": "$SBMAGIC_API_HOST:$SBMAGIC_API_PORT",
-      "secret": "$SBMAGIC_API_SECRET",
-      "default_mode": "$SBMAGIC_API_MODE"
-    }
-  }
-}
-EOF
-
-  mv -f "$tmp" "$CONFIG_FILE"
-  chmod 600 "$CONFIG_FILE"
-  echo "$CONFIG_FILE"
+  "$RENDERER" render --data-dir "$DATA_DIR" --output "$CONFIG_FILE"
 }
 
 check_config() {

@@ -5,6 +5,7 @@
 /bench/bin/
 /bench/artifacts/
 /module/bin/*/magic-fetch
+/module/bin/*/magicctl-go
 /module/bin/applist.dex
 /module/defaults/rulesets/*.srs
 .claude/

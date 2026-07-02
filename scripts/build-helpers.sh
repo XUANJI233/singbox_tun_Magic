@@ -43,9 +43,13 @@ X64_CC="$(clang_for x86_64)"
 
 CC="$ARM64_CC" CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build -trimpath -tags "netgo,osusergo" -ldflags "-s -w" \
   -o module/bin/arm64-v8a/magic-fetch ./tools/magic-fetch
+CC="$ARM64_CC" CGO_ENABLED=1 GOOS=android GOARCH=arm64 go build -trimpath -tags "netgo,osusergo" -ldflags "-s -w" \
+  -o module/bin/arm64-v8a/magicctl-go ./tools/magicctl-go
 
 CC="$X64_CC" CGO_ENABLED=1 GOOS=android GOARCH=amd64 go build -trimpath -tags "netgo,osusergo" -ldflags "-s -w" \
   -o module/bin/x86_64/magic-fetch ./tools/magic-fetch
+CC="$X64_CC" CGO_ENABLED=1 GOOS=android GOARCH=amd64 go build -trimpath -tags "netgo,osusergo" -ldflags "-s -w" \
+  -o module/bin/x86_64/magicctl-go ./tools/magicctl-go
 
 BUILD_DIR="$ROOT/build/applist"
 rm -rf "$BUILD_DIR"
